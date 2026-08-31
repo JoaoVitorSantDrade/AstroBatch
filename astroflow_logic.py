@@ -14,18 +14,47 @@ def load_fits_data(filepath: Path) -> np.ndarray:
                 return np.asarray(hdu.data, dtype=np.float32)
     raise ValueError(f"Imagem 2D não encontrada em {filepath.name}")
 
-def detect_stars(data: np.ndarray, fwhm: float, sigma: float, max_stars: int) -> tuple[np.ndarray, float]:
-    mean, median, std = sigma_clipped_stats(data, sigma=3.0)
-    daofind = DAOStarFinder(fwhm=fwhm, threshold=median + (sigma * std))
+def detect_stars(
+    data: np.ndarray,
+    fwhm: float,
+    sigma: float,
+    max_stars: int
+) -> tuple[np.ndarray, float]:
+
+    mean, median, std = sigma_clipped_stats(
+        data,
+        sigma=3.0
+    )
+
+    if not np.isfinite(std) or std <= 0:
+        return np.empty((0, 2), dtype=np.float32), 0.0
+
+    daofind = DAOStarFinder(
+        fwhm=fwhm,
+        threshold=sigma * std
+    )
+
     sources = daofind(data - median)
-    
+
     if sources is None or len(sources) < 3:
-        return np.array([]), 0.0
-        
+        return np.empty((0, 2), dtype=np.float32), 0.0
+
+    # Ordena pelas estrelas mais brilhantes
     sources.sort('flux', reverse=True)
     sources = sources[:max_stars]
-    pts = np.transpose((sources['x_centroid'], sources['y_centroid']))
-    return pts, float(np.mean(sources['fwhm']))
+
+    pts = np.column_stack((
+        np.asarray(sources['x_centroid'], dtype=np.float32),
+        np.asarray(sources['y_centroid'], dtype=np.float32)
+    ))
+
+    # DAOStarFinder não fornece sources['fwhm'].
+    #
+    # Neste estágio, o FWHM informado ao detector é usado
+    # apenas como estimativa operacional.
+    measured_fwhm = float(fwhm)
+
+    return pts, measured_fwhm
 
 def generate_debug_image(data: np.ndarray, stars: np.ndarray, output_path: Path):
     mean, median, std = sigma_clipped_stats(data, sigma=3.0)
@@ -53,13 +82,18 @@ def process_local_flow(batch_dir: Path, config: dict, app_print) -> dict:
     anchor_file = files[0]
     app_print(f"[{batch_dir.name}] Âncora definida: {anchor_file.name}\n")
     
-    # Uso de .get() com valores padrão de fallback para evitar KeyError
-    fwhm_val = config.get('fwhm', 4.0)
-    sigma_val = config.get('sigma', 5.0)
-    max_stars_val = config.get('max_stars', 150)
-    matching_radius = config.get('matching_radius', 15)
-    ransac_thresh = config.get('ransac', 3.0)
-    debug_flag = config.get('debug_images', False)
+    # --- BLINDAGEM DE CONFIGURAÇÕES ---
+    # Se o config vier como dicionário aninhado do registro ou vazio, extraímos com segurança
+    if not isinstance(config, dict):
+        config = {}
+        
+    fwhm_val = float(config.get('fwhm', 4.0))
+    sigma_val = float(config.get('sigma', 5.0))
+    max_stars_val = int(config.get('max_stars', 150))
+    matching_radius = float(config.get('matching_radius', 15.0))
+    ransac_thresh = float(config.get('ransac', 3.0))
+    debug_flag = bool(config.get('debug_images', False))
+    # ---------------------------------
 
     anchor_data = load_fits_data(anchor_file)
     anchor_stars, avg_fwhm = detect_stars(anchor_data, fwhm_val, sigma_val, max_stars_val)
@@ -96,16 +130,25 @@ def process_local_flow(batch_dir: Path, config: dict, app_print) -> dict:
                 m_anchor.append(anchor_stars[a_idx])
                 m_target.append(target_stars[idx])
                 
-        if len(m_anchor) < 3:
+        if len(m_anchor) < 6:
             continue
             
-        matrix_2x3, _ = cv2.estimateAffinePartial2D(
-            np.array(m_target), np.array(m_anchor), 
-            method=cv2.RANSAC, ransacReprojThreshold=ransac_thresh
+        matrix_2x3, inliers = cv2.estimateAffinePartial2D(
+        np.asarray(m_target, dtype=np.float32),
+        np.asarray(m_anchor, dtype=np.float32),
+        method=cv2.RANSAC,
+        ransacReprojThreshold=ransac_thresh
         )
-        
-        if matrix_2x3 is not None:
-            flow_data["frames"][filepath.name] = {"matrix": make_homogeneous(matrix_2x3).tolist()}
+
+        if matrix_2x3 is not None and inliers is not None:
+            inlier_count = int(inliers.sum())
+
+            if inlier_count >= 4:
+                flow_data["frames"][filepath.name] = {
+                    "matrix": make_homogeneous(matrix_2x3).tolist(),
+                    "matches": len(m_anchor),
+                    "inliers": inlier_count
+                }
             
     with open(batch_dir / "flow_local.json", "w") as f:
         json.dump(flow_data, f, indent=4)
@@ -148,11 +191,13 @@ def process_all_flows(base_dir: Path, config: dict, app_print, app_progress, can
         
     # 2. DEFINIR MASTER GLOBAL
     master_info = None
-    if global_master_cfg.lower() == "auto":
+    global_master_cfg = config.get('global_master', 'Auto') if isinstance(config, dict) else 'Auto'
+    
+    if str(global_master_cfg).lower() == "auto":
         master_info = min(anchors_info, key=lambda x: (x['fwhm'] / max(1, x['star_count'])))
         app_print(f"\n[GLOBAL] Master Automático eleito: {master_info['batch_name']} (FWHM: {master_info['fwhm']:.2f})\n")
     else:
-        master_info = next((a for a in anchors_info if a['batch_name'] == config['global_master']), None)
+        master_info = next((a for a in anchors_info if a['batch_name'] == global_master_cfg), None)
         if not master_info:
             master_info = anchors_info[0]
             app_print(f"\n[GLOBAL] Master especificado não encontrado. Usando: {master_info['batch_name']}\n")
