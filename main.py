@@ -5,12 +5,10 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
-# Importa APENAS do arquivo ultraleve que acabamos de criar
-from models import ProcessingConfig
 
 # Importações dos módulos lógicos
 from batch_logic import ProcessingConfig, RESAMPLE_MODES
-from astroflow_logic import process_all_flows
+from astroalign_logic import process_all_alignments, INTERPOLATION_MODES
 
 class AstroProcessManager(tk.Tk):
     def __init__(self):
@@ -57,6 +55,16 @@ class AstroProcessManager(tk.Tk):
         self.flow_matching_radius_var = tk.IntVar(value=15)
         self.flow_ransac_var = tk.DoubleVar(value=3.0)
         self.flow_debug_var = tk.BooleanVar(value=False)
+        self.flow_min_stars_var = tk.IntVar(value=4)
+        self.flow_min_inliers_var = tk.IntVar(value=4)
+        self.flow_min_ratio_var = tk.DoubleVar(value=0.15)
+
+        # Parâmetros AstroAlign
+        self.align_output_dir_var = tk.StringVar()
+        self.align_interpolation_var = tk.StringVar(value="Lanczos")
+        self.align_overwrite_var = tk.BooleanVar(value=False)
+        self.align_dry_run_var = tk.BooleanVar(value=False)
+        self.align_keep_header_var = tk.BooleanVar(value=True)
 
         self.config_registry = {
             "Global": {"batch_dir": self.batch_dir_var},
@@ -77,7 +85,17 @@ class AstroProcessManager(tk.Tk):
                 "sigma": self.flow_sigma_var,
                 "matching_radius": self.flow_matching_radius_var,
                 "ransac": self.flow_ransac_var,
+                "min_stars": self.flow_min_stars_var,
+                "min_inliers": self.flow_min_inliers_var,
+                "min_ratio": self.flow_min_ratio_var,
                 "debug_images": self.flow_debug_var
+            },
+            "AstroAlign": {
+                "output_dir": self.align_output_dir_var,
+                "interpolation": self.align_interpolation_var,
+                "overwrite": self.align_overwrite_var,
+                "dry_run": self.align_dry_run_var,
+                "keep_header": self.align_keep_header_var
             }
         }
 
@@ -108,12 +126,15 @@ class AstroProcessManager(tk.Tk):
 
         self.tab_batch = ttk.Frame(self.notebook, padding=10)
         self.tab_flow = ttk.Frame(self.notebook, padding=10)
+        self.tab_align = ttk.Frame(self.notebook, padding=10)
         
         self.notebook.add(self.tab_batch, text="1. AstroBatch")
         self.notebook.add(self.tab_flow, text="2. AstroFlow")
+        self.notebook.add(self.tab_align, text="3. AstroAlign")
 
         self._build_tab_batch()
         self._build_tab_flow()
+        self._build_tab_align()
 
         # --- ÁREA COMUM INFERIOR ---
         bottom_frame = ttk.Frame(self)
@@ -139,7 +160,7 @@ class AstroProcessManager(tk.Tk):
         self.console_text.grid(row=0, column=0, sticky="nsew")
         self.rowconfigure(1, weight=1)
 
-    def update_progress(self, current: int, total: int, phase_text: str = None):
+    def update_progress(self, current: int, total: int, phase_text: str = ""):
         """Callback genérico e thread-safe para atualizar a barra de progresso e o status."""
         if total > 0:
             pct = (current / total) * 100.0
@@ -243,6 +264,15 @@ class AstroProcessManager(tk.Tk):
 
         ttk.Label(param_frame, text="Tolerância de Reprojeção RANSAC:").grid(row=4, column=0, sticky="w", pady=(4,0))
         ttk.Entry(param_frame, textvariable=self.flow_ransac_var, width=15).grid(row=4, column=1, padx=6, sticky="w", pady=(4,0))
+        
+        ttk.Label(param_frame, text="Mínimo de Estrelas (Min Stars):").grid(row=5, column=0, sticky="w", pady=(4,0))
+        ttk.Entry(param_frame, textvariable=self.flow_min_stars_var, width=15).grid(row=5, column=1, padx=6, sticky="w", pady=(4,0))
+
+        ttk.Label(param_frame, text="Mínimo de Inliers RANSAC:").grid(row=6, column=0, sticky="w", pady=(4,0))
+        ttk.Entry(param_frame, textvariable=self.flow_min_inliers_var, width=15).grid(row=6, column=1, padx=6, sticky="w", pady=(4,0))
+
+        ttk.Label(param_frame, text="Ratio Mínimo de Inliers (ex: 0.15):").grid(row=7, column=0, sticky="w", pady=(4,0))
+        ttk.Entry(param_frame, textvariable=self.flow_min_ratio_var, width=15).grid(row=7, column=1, padx=6, sticky="w", pady=(4,0))
 
         ttk.Checkbutton(param_frame, text="Gerar Imagens de Diagnóstico (.jpg) nas âncoras", variable=self.flow_debug_var).grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
@@ -360,6 +390,9 @@ class AstroProcessManager(tk.Tk):
             "matching_radius": flow_reg["matching_radius"].get(),
             "ransac": flow_reg["ransac"].get(),
             "debug_images": flow_reg["debug_images"].get(),
+            "min_stars": flow_reg["min_stars"].get(),
+            "min_inliers": flow_reg["min_inliers"].get(),
+            "min_ratio": flow_reg["min_ratio"].get(),
             "max_stars": 150
         }
         
