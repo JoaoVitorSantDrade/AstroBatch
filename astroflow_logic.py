@@ -8,7 +8,6 @@ from photutils.detection import DAOStarFinder
 from scipy.spatial import cKDTree
 
 def load_fits_data(filepath: Path) -> np.ndarray:
-    """Lê a imagem FITS e retorna a matriz 2D de pixels."""
     with fits.open(filepath, memmap=False) as hdul:
         for hdu in hdul:
             if hdu.is_image and hdu.data is not None and hdu.data.ndim == 2:
@@ -16,7 +15,6 @@ def load_fits_data(filepath: Path) -> np.ndarray:
     raise ValueError(f"Imagem 2D não encontrada em {filepath.name}")
 
 def detect_stars(data: np.ndarray, fwhm: float, sigma: float, max_stars: int) -> tuple[np.ndarray, float]:
-    """Encontra os centroides das estrelas mais brilhantes usando DAOStarFinder."""
     mean, median, std = sigma_clipped_stats(data, sigma=3.0)
     daofind = DAOStarFinder(fwhm=fwhm, threshold=median + (sigma * std))
     sources = daofind(data - median)
@@ -26,11 +24,10 @@ def detect_stars(data: np.ndarray, fwhm: float, sigma: float, max_stars: int) ->
         
     sources.sort('flux', reverse=True)
     sources = sources[:max_stars]
-    pts = np.transpose((sources['xcentroid'], sources['ycentroid']))
+    pts = np.transpose((sources['x_centroid'], sources['y_centroid']))
     return pts, float(np.mean(sources['fwhm']))
 
 def generate_debug_image(data: np.ndarray, stars: np.ndarray, output_path: Path):
-    """Gera um JPG da imagem com círculos nas estrelas detectadas para calibração."""
     mean, median, std = sigma_clipped_stats(data, sigma=3.0)
     vmin, vmax = median, median + (10 * std)
     
@@ -44,13 +41,11 @@ def generate_debug_image(data: np.ndarray, stars: np.ndarray, output_path: Path)
     cv2.imwrite(str(output_path), img_color)
 
 def make_homogeneous(matrix_2x3: np.ndarray) -> np.ndarray:
-    """Converte matriz 2x3 para 3x3 para permitir multiplicação."""
     hom = np.eye(3, dtype=np.float64)
     hom[:2, :] = matrix_2x3
     return hom
 
 def process_local_flow(batch_dir: Path, config: dict, app_print) -> dict:
-    """Calcula a cinemática intra-batch e retorna metadados da âncora."""
     files = sorted([p for p in batch_dir.iterdir() if p.is_file() and p.suffix.lower() in {'.fit', '.fits'}])
     if not files:
         return {}
@@ -58,14 +53,22 @@ def process_local_flow(batch_dir: Path, config: dict, app_print) -> dict:
     anchor_file = files[0]
     app_print(f"[{batch_dir.name}] Âncora definida: {anchor_file.name}\n")
     
+    # Uso de .get() com valores padrão de fallback para evitar KeyError
+    fwhm_val = config.get('fwhm', 4.0)
+    sigma_val = config.get('sigma', 5.0)
+    max_stars_val = config.get('max_stars', 150)
+    matching_radius = config.get('matching_radius', 15)
+    ransac_thresh = config.get('ransac', 3.0)
+    debug_flag = config.get('debug_images', False)
+
     anchor_data = load_fits_data(anchor_file)
-    anchor_stars, avg_fwhm = detect_stars(anchor_data, config['fwhm'], config['sigma'], config['max_stars'])
+    anchor_stars, avg_fwhm = detect_stars(anchor_data, fwhm_val, sigma_val, max_stars_val)
     
     if len(anchor_stars) < 3:
         app_print(f"[{batch_dir.name}] ERRO: Estrelas insuficientes na âncora.\n")
         return {}
         
-    if config['debug_images']:
+    if debug_flag:
         generate_debug_image(anchor_data, anchor_stars, batch_dir / f"debug_{anchor_file.stem}.jpg")
 
     anchor_tree = cKDTree(anchor_stars)
@@ -80,7 +83,7 @@ def process_local_flow(batch_dir: Path, config: dict, app_print) -> dict:
         shift, _ = cv2.phaseCorrelate(anchor_data, target_data)
         dx, dy = shift
         
-        target_stars, _ = detect_stars(target_data, config['fwhm'], config['sigma'], config['max_stars'])
+        target_stars, _ = detect_stars(target_data, fwhm_val, sigma_val, max_stars_val)
         if len(target_stars) < 3:
             continue
             
@@ -88,7 +91,7 @@ def process_local_flow(batch_dir: Path, config: dict, app_print) -> dict:
         m_anchor, m_target = [], []
         
         for idx, pt in enumerate(shifted_target):
-            dist, a_idx = anchor_tree.query(pt, distance_upper_bound=config['matching_radius'])
+            dist, a_idx = anchor_tree.query(pt, distance_upper_bound=matching_radius)
             if dist != float('inf'):
                 m_anchor.append(anchor_stars[a_idx])
                 m_target.append(target_stars[idx])
@@ -98,7 +101,7 @@ def process_local_flow(batch_dir: Path, config: dict, app_print) -> dict:
             
         matrix_2x3, _ = cv2.estimateAffinePartial2D(
             np.array(m_target), np.array(m_anchor), 
-            method=cv2.RANSAC, ransacReprojThreshold=config['ransac']
+            method=cv2.RANSAC, ransacReprojThreshold=ransac_thresh
         )
         
         if matrix_2x3 is not None:
@@ -117,19 +120,22 @@ def process_local_flow(batch_dir: Path, config: dict, app_print) -> dict:
     }
 
 def process_all_flows(base_dir: Path, config: dict, app_print, app_progress, cancel_event):
-    """Orquestra o Flow Local de cada Batch e depois calcula o Flow Global."""
     batch_folders = sorted([d for d in base_dir.iterdir() if d.is_dir() and "batch" in d.name.lower()])
     total_batches = len(batch_folders)
     
     if not batch_folders:
         app_print(f"Nenhuma subpasta de Batch encontrada em {base_dir}\n")
         return
-        
+    
     anchors_info = []
     app_progress(0, total_batches, "Iniciando AstroFlow (0%)...")
     
+    matching_radius = config.get('matching_radius', 15)
+    ransac_thresh = config.get('ransac', 3.0)
+    global_master_cfg = config.get('global_master', 'Auto')
+    
     # 1. FLOW LOCAL
-    for b_folder in batch_folders:
+    for i, b_folder in enumerate(batch_folders):
         if cancel_event.is_set(): return
         app_progress(i, total_batches, f"Calculando Flow Local ({i+1}/{total_batches}): {b_folder.name}...")
         
@@ -142,8 +148,7 @@ def process_all_flows(base_dir: Path, config: dict, app_print, app_progress, can
         
     # 2. DEFINIR MASTER GLOBAL
     master_info = None
-    if config['global_master'].lower() == "auto":
-        # Elege a âncora com mais estrelas pontuais
+    if global_master_cfg.lower() == "auto":
         master_info = min(anchors_info, key=lambda x: (x['fwhm'] / max(1, x['star_count'])))
         app_print(f"\n[GLOBAL] Master Automático eleito: {master_info['batch_name']} (FWHM: {master_info['fwhm']:.2f})\n")
     else:
@@ -177,7 +182,7 @@ def process_all_flows(base_dir: Path, config: dict, app_print, app_progress, can
         m_master, m_target = [], []
         
         for idx, pt in enumerate(shifted_target):
-            dist, m_idx = master_tree.query(pt, distance_upper_bound=config['matching_radius'])
+            dist, m_idx = master_tree.query(pt, distance_upper_bound=matching_radius)
             if dist != float('inf'):
                 m_master.append(master_info['anchor_stars'][m_idx])
                 m_target.append(target_info['anchor_stars'][idx])
@@ -185,7 +190,7 @@ def process_all_flows(base_dir: Path, config: dict, app_print, app_progress, can
         if len(m_master) >= 3:
             matrix_2x3, _ = cv2.estimateAffinePartial2D(
                 np.array(m_target), np.array(m_master), 
-                method=cv2.RANSAC, ransacReprojThreshold=config['ransac']
+                method=cv2.RANSAC, ransacReprojThreshold=ransac_thresh
             )
             if matrix_2x3 is not None:
                 global_flow["batches"][target_info['batch_name']] = {"matrix": make_homogeneous(matrix_2x3).tolist()}

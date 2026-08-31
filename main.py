@@ -351,9 +351,19 @@ class AstroProcessManager(tk.Tk):
         batch_dir = Path(self.batch_dir_var.get()).expanduser().resolve()
         if not batch_dir.is_dir(): return messagebox.showerror("Erro", "Pasta Base não encontrada.")
         
-        config = {k: v.get() for k, v in self.config_registry["AstroFlow"].items()}
-        config['max_stars'] = 150 
+        # Cria um dicionário seguro mapeando explicitamente as chaves
+        flow_reg = self.config_registry["AstroFlow"]
+        config = {
+            "global_master": flow_reg["global_master"].get(),
+            "fwhm": flow_reg["fwhm"].get(),
+            "sigma": flow_reg["sigma"].get(),
+            "matching_radius": flow_reg["matching_radius"].get(),
+            "ransac": flow_reg["ransac"].get(),
+            "debug_images": flow_reg["debug_images"].get(),
+            "max_stars": 150
+        }
         
+        self.save_settings()
         self._lock_ui("Flow")
 
         self.worker = threading.Thread(target=self.run_flow_logic, args=(batch_dir, config), daemon=True)

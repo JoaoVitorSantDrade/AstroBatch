@@ -140,7 +140,7 @@ def file_mover_worker(move_queue: queue.Queue, app_print, cancel_event: threadin
             
             move_queue.task_done()
 
-def process_fits_logic(config: ProcessingConfig, app_print, cancel_event: threading.Event) -> tuple[int, int]:
+def process_fits_logic(config: ProcessingConfig, app_print, app_progress, cancel_event: threading.Event) -> tuple[int, int]:
     input_dir = config.input_dir
     output_dir = config.output_dir
 
@@ -150,10 +150,10 @@ def process_fits_logic(config: ProcessingConfig, app_print, cancel_event: thread
     if not files:
         app_print("Nenhum arquivo FITS encontrado no diretório.\n")
         return 0, 0
-        
-    app_progress(0, total_files, "Iniciando análise...")
 
-    app_print(f"Total de arquivos encontrados: {len(files)}\n")
+    app_progress(0, total_files, "Iniciando análise...")
+    app_print(f"Total de arquivos encontrados: {total_files}\n")
+    
     if not config.dry_run: output_dir.mkdir(parents=True, exist_ok=True)
 
     batch_num = 1
@@ -163,6 +163,7 @@ def process_fits_logic(config: ProcessingConfig, app_print, cancel_event: thread
     previous_data = None
     score_history = deque(maxlen=10)
     processed = 0
+    queued_for_move = 0
 
     worker_count = get_optimal_worker_count()
     prefetch_count = min(len(files), max(worker_count * 2, worker_count + 2))
@@ -171,8 +172,6 @@ def process_fits_logic(config: ProcessingConfig, app_print, cancel_event: thread
     move_queue = queue.Queue()
     mover_thread = threading.Thread(target=file_mover_worker, args=(move_queue, app_print, cancel_event, app_progress, move_state), daemon=True)
     if not config.dry_run: mover_thread.start()
-
-    queued_for_move = 0
 
     app_print(f"\nPipeline paralelo: {worker_count} workers leitura | 1 worker disco | prefetch: {prefetch_count}\n")
     app_print(f"Iniciando Batch {batch_num:03d}...\n")
@@ -205,6 +204,7 @@ def process_fits_logic(config: ProcessingConfig, app_print, cancel_event: thread
                 error_message = f"Erro inesperado no worker para {filepath.name}: {exc}"
 
             next_process += 1
+            app_progress(next_process, total_files, f"Analisando deriva ({next_process}/{total_files})...")
 
             if error_message:
                 app_print(error_message + "\n")
@@ -245,7 +245,6 @@ def process_fits_logic(config: ProcessingConfig, app_print, cancel_event: thread
 
             if not config.dry_run:
                 destination = current_batch_dir / filepath.name
-                
                 if destination.exists() and not config.overwrite:
                     app_print(f"ERRO: destino já existe, arquivo ignorado: {destination}\n")
                 else:
@@ -254,8 +253,6 @@ def process_fits_logic(config: ProcessingConfig, app_print, cancel_event: thread
                     queued_for_move += 1
 
             processed += 1
-            if next_process % 20 == 0 or next_process == len(files):
-                app_print(f"Processados {next_process}/{len(files)} arquivos...\n")
             submit_until_window_full()
 
     if not config.dry_run:
