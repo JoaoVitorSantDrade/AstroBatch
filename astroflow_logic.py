@@ -9,11 +9,51 @@ from astropy.stats import sigma_clipped_stats
 from photutils.detection import DAOStarFinder
 from scipy.spatial import KDTree
 
-def load_fits_data(filepath: Path) -> np.ndarray:
+
+# Insira estas funções no início de astroflow_logic.py
+
+def get_bayer_pattern(header: fits.Header) -> str | None:
+    for key in ['BAYERPAT', 'BAYERPATTERN', 'COLORTYP']:
+        if key in header:
+            val = str(header[key]).strip().upper().strip("'")
+            if val in ['RGGB', 'BGGR', 'GRBG', 'GBRG']:
+                return val
+    return None
+
+def split_cfa(data: np.ndarray, pattern: str):
+    if pattern == 'RGGB':
+        return data[0::2, 0::2], data[0::2, 1::2], data[1::2, 0::2], data[1::2, 1::2]
+    elif pattern == 'BGGR':
+        return data[1::2, 1::2], data[0::2, 1::2], data[1::2, 0::2], data[0::2, 0::2]
+    elif pattern == 'GRBG':
+        return data[0::2, 1::2], data[0::2, 0::2], data[1::2, 1::2], data[1::2, 0::2]
+    elif pattern == 'GBRG':
+        return data[1::2, 0::2], data[1::2, 1::2], data[0::2, 0::2], data[0::2, 1::2]
+    return data[0::2, 0::2], data[0::2, 1::2], data[1::2, 0::2], data[1::2, 1::2]
+
+def extract_luminance(data: np.ndarray, header: fits.Header) -> np.ndarray:
+    pattern = get_bayer_pattern(header)
+    if not pattern:
+        return data  # Mantém monocromático ou canais únicos puros
+        
+    r, g1, g2, b = split_cfa(data, pattern)
+    
+    # Aplica a ponderação visual humana padrão sem misturar pixels de posições diferentes
+    l_sub = 0.2126 * r + 0.3576 * g1 + 0.3576 * g2 + 0.0722 * b
+    
+    # Realiza up-scale com "Nearest Neighbor" purista (np.repeat) para 
+    # manter as coordenadas x,y das estrelas rigorosamente fiéis à escala do sensor original
+    l_full = np.repeat(np.repeat(l_sub, 2, axis=0), 2, axis=1)
+    
+    return l_full.astype(np.float32)
+
+def load_fits_data(filepath: Path) -> tuple[np.ndarray, fits.Header]:
     with fits.open(filepath, memmap=False) as hdul:
         for hdu in hdul:
             if hdu.is_image and hdu.data is not None and hdu.data.ndim == 2:
-                return np.asarray(hdu.data, dtype=np.float32)
+                header = hdu.header.copy()
+                data = np.asarray(hdu.data, dtype=np.float32)
+                return data, header
     raise ValueError(f"Imagem 2D não encontrada em {filepath.name}")
 
 def prepare_for_phase_correlation(data: np.ndarray) -> np.ndarray:
@@ -31,80 +71,93 @@ def calculate_anchor_quality(star_count: int, fwhm: float) -> float:
         return float(star_count)
     return float(star_count) / float(fwhm)
 
-def detect_stars(
-    data: np.ndarray,
-    fwhm: float,
-    sigma: float,
-    max_stars: int
-) -> tuple[np.ndarray, float, dict]:
+def detect_stars_opencv(data: np.ndarray, fwhm: float, sigma: float, max_stars: int) -> tuple[np.ndarray, float, dict]:
+    """Motor ultrarrápido utilizando Visão Computacional bruta do OpenCV e Momentos de Imagem."""
+    mean, median, std = sigma_clipped_stats(data, sigma=3.0)
+    
+    if not np.isfinite(std) or std <= 0:
+        return np.empty((0, 2), dtype=np.float32), 0.0, {"star_count": 0, "mean": 0.0, "median": 0.0, "std": 0.0, "fwhm": 0.0}
 
-    mean, median, std = sigma_clipped_stats(
-        data,
-        sigma=3.0
-    )
+    # Limiar rigoroso para isolar as fontes de luz
+    thresh_val = median + (sigma * std)
+    binary_mask = (data > thresh_val).astype(np.uint8)
+
+    # Identifica componentes conectados (muito mais rápido que findContours)
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_mask, connectivity=8)
+
+    pts = []
+    brightness = []
+    
+    # Raio da caixa limitadora para cálculo do centroide sub-pixel
+    r = int(max(2, fwhm))
+    h, w = data.shape
+
+    for i in range(1, num_labels):
+        area = stats[i, cv2.CC_STAT_AREA]
+        
+        # Filtra ruídos de 1 pixel e bolhas massivas
+        if 4 < area < (fwhm * fwhm * 15):
+            cx, cy = centroids[i]
+            ix, iy = int(cx), int(cy)
+            
+            # Recorta a vizinhança da estrela para calcular o centro de massa exato (precisão sub-pixel)
+            y0, y1 = max(0, iy - r), min(h, iy + r + 1)
+            x0, x1 = max(0, ix - r), min(w, ix + r + 1)
+            
+            patch = data[y0:y1, x0:x1] - median
+            patch[patch < 0] = 0
+            
+            M = cv2.moments(patch)
+            if M["m00"] > 0:
+                px = M["m10"] / M["m00"]
+                py = M["m01"] / M["m00"]
+                pts.append([x0 + px, y0 + py])
+                brightness.append(M["m00"]) # Usa o fluxo de massa como brilho
+            else:
+                pts.append([cx, cy])
+                brightness.append(area)
+
+    if len(pts) == 0:
+        return np.empty((0, 2), dtype=np.float32), float(fwhm), {"star_count": 0, "mean": float(mean), "median": float(median), "std": float(std), "fwhm": float(fwhm)}
+
+    pts = np.array(pts, dtype=np.float32)
+    brightness = np.array(brightness, dtype=np.float32)
+
+    # Ordena mantendo apenas as N estrelas mais brilhantes
+    sort_idx = np.argsort(brightness)[::-1][:max_stars]
+    pts = pts[sort_idx]
+
+    metrics = {"star_count": len(pts), "mean": float(mean), "median": float(median), "std": float(std), "fwhm": float(fwhm)}
+    return pts, float(fwhm), metrics
+
+
+def detect_stars_dao(data: np.ndarray, fwhm: float, sigma: float, max_stars: int) -> tuple[np.ndarray, float, dict]:
+    """Motor original altamente rigoroso utilizando Astropy/Photutils."""
+    mean, median, std = sigma_clipped_stats(data, sigma=3.0)
 
     if not np.isfinite(std) or std <= 0:
-        return (
-            np.empty((0, 2), dtype=np.float32),
-            0.0,
-            {
-                "star_count": 0,
-                "mean": float(mean) if np.isfinite(mean) else None,
-                "median": float(median) if np.isfinite(median) else None,
-                "std": 0.0,
-                "fwhm": 0.0
-            }
-        )
+        return np.empty((0, 2), dtype=np.float32), 0.0, {"star_count": 0, "mean": float(mean) if np.isfinite(mean) else None, "median": float(median) if np.isfinite(median) else None, "std": 0.0, "fwhm": 0.0}
 
-    daofind = DAOStarFinder(
-        fwhm=fwhm,
-        threshold=sigma * std
-    )
-
+    daofind = DAOStarFinder(fwhm=fwhm, threshold=sigma * std)
     sources = daofind(data - median)
 
     if sources is None or len(sources) < 3:
-        return (
-            np.empty((0, 2), dtype=np.float32),
-            float(fwhm),
-            {
-                "star_count": 0,
-                "mean": float(mean),
-                "median": float(median),
-                "std": float(std),
-                "fwhm": float(fwhm)
-            }
-        )
+        return np.empty((0, 2), dtype=np.float32), float(fwhm), {"star_count": 0, "mean": float(mean), "median": float(median), "std": float(std), "fwhm": float(fwhm)}
 
-    # Ordena pelas estrelas mais brilhantes
     sources.sort("flux", reverse=True)
     sources = sources[:max_stars]
 
-    pts = np.column_stack((
-        np.asarray(
-            sources["x_centroid"],
-            dtype=np.float32
-        ),
-        np.asarray(
-            sources["y_centroid"],
-            dtype=np.float32
-        )
-    ))
+    pts = np.column_stack((np.asarray(sources["x_centroid"], dtype=np.float32), np.asarray(sources["y_centroid"], dtype=np.float32)))
 
-    # DAOStarFinder não fornece FWHM medido.
-    # O FWHM configurado no detector é usado
-    # como estimativa operacional.
-    measured_fwhm = float(fwhm)
+    metrics = {"star_count": int(len(pts)), "mean": float(mean), "median": float(median), "std": float(std), "fwhm": float(fwhm)}
+    return pts, float(fwhm), metrics
 
-    metrics = {
-        "star_count": int(len(pts)),
-        "mean": float(mean),
-        "median": float(median),
-        "std": float(std),
-        "fwhm": measured_fwhm
-    }
 
-    return pts, measured_fwhm, metrics
+def detect_stars(data: np.ndarray, fwhm: float, sigma: float, max_stars: int, engine: str = "DAO") -> tuple[np.ndarray, float, dict]:
+    """Roteador principal que decide qual motor utilizar."""
+    if engine.upper() == "OPENCV":
+        return detect_stars_opencv(data, fwhm, sigma, max_stars)
+    return detect_stars_dao(data, fwhm, sigma, max_stars)
 
 def generate_debug_image(data: np.ndarray, stars: np.ndarray, output_path: Path):
     mean, median, std = sigma_clipped_stats(data, sigma=3.0)
@@ -129,7 +182,8 @@ def _process_single_frame(
     fwhm_val: float,
     sigma_val: float,
     max_stars_val: int,
-    min_stars: int
+    min_stars: int,
+    engine_val: str
 ) -> tuple[str, dict | None]:
     """
     Executada em paralelo.
@@ -147,9 +201,11 @@ def _process_single_frame(
     """
 
     try:
-        data = load_fits_data(filepath)
-
-        stars, measured_fwhm, metrics = detect_stars(data, fwhm_val, sigma_val, max_stars_val)
+        data, header = load_fits_data(filepath) 
+        
+        # A imagem que o algoritmo vai investigar passa a ser a representação pseudo-Luminância isolada:
+        working_data = extract_luminance(data, header)
+        stars, measured_fwhm, metrics = detect_stars(working_data, fwhm_val, sigma_val, max_stars_val, engine_val)
 
         if len(stars) < min_stars:
             return filepath.name, None
@@ -362,7 +418,14 @@ def process_local_flow(
     if not files:
         return {}
 
-    anchor_file = files[0]
+    anchor_mode = config.get("anchor_mode", "first") # Pode ser "first", "middle", "last"
+
+    if anchor_mode == "middle":
+        anchor_file = files[len(files) // 2]
+    elif anchor_mode == "last":
+        anchor_file = files[-1]
+    else:
+        anchor_file = files[0]
 
     app_print(
         f"[{batch_dir.name}] "
@@ -413,7 +476,9 @@ def process_local_flow(
     )
 
     prepared_frames = {}
-
+    
+    engine_val = config.get("engine", "DAO")
+    
     with ThreadPoolExecutor(
         max_workers=worker_count,
         thread_name_prefix="astroflow"
@@ -426,7 +491,8 @@ def process_local_flow(
                 fwhm_val,
                 sigma_val,
                 max_stars_val,
-                min_stars
+                min_stars,
+                engine_val
             ): filepath
             for filepath in files
         }
@@ -845,12 +911,13 @@ def process_all_flows(base_dir: Path, config: dict, app_print, app_progress, can
     anchors_info = []
     app_progress(0, total_batches, "Iniciando AstroFlow (0%)...")
     
-    matching_radius = config.get('matching_radius', 15)
-    ransac_thresh = config.get('ransac', 3.0)
+    matching_radius = config.get('matching_radius', 25.0)
+    ransac_thresh = config.get('ransac', 4.0)
     global_master_cfg = config.get('global_master', 'Auto')
     
+    # =========================================================================
     # 1. FLOW LOCAL (Executado em Paralelo para todas as Batches)
-    
+    # =========================================================================
     try:
         cpu_count = getattr(os, "process_cpu_count", os.cpu_count)() or 1
     except Exception:
@@ -886,7 +953,12 @@ def process_all_flows(base_dir: Path, config: dict, app_print, app_progress, can
     if not anchors_info:
         return
         
+    # Ordena as informações de âncora pela ordem nominal das batches
+    anchors_info.sort(key=lambda x: x['batch_name'])
+        
+    # =========================================================================
     # 2. DEFINIR MASTER GLOBAL
+    # =========================================================================
     master_info = None
     global_master_cfg = config.get('global_master', 'Auto') if isinstance(config, dict) else 'Auto'
     
@@ -897,55 +969,79 @@ def process_all_flows(base_dir: Path, config: dict, app_print, app_progress, can
         master_info = next((a for a in anchors_info if a['batch_name'] == global_master_cfg), None)
         if not master_info:
             master_info = anchors_info[0]
-            app_print(f"\n[GLOBAL] Master especificado não encontrado. Usando: {master_info['batch_name']}\n")
+            app_print(f"\n[GLOBAL] Master especificado não encontrado. Usando fallback: {master_info['batch_name']}\n")
 
-    # 3. FLOW GLOBAL
+    # =========================================================================
+    # 3. FLOW GLOBAL INCREMENTAL EM CADEIA (Batch N -> Batch N-1)
+    # =========================================================================
     global_flow = {"global_master_batch": master_info['batch_name'], "batches": {}}
-    master_tree = KDTree(master_info['anchor_stars'])
     
     total_global = len(anchors_info)
-    app_progress(0, total_global, "Iniciando alinhamento global das Batches...")
+    app_progress(0, total_global, "Calculando Cadeia Global das Batches...")
     
-    for i, target_info in enumerate(anchors_info):
-        if cancel_event.is_set(): 
-            return
-            
-        app_progress(i, total_global, f"Alinhando {target_info['batch_name']} ao Master Global ({i+1}/{total_global})...")
+    # Inicia a matriz da primeira Batch como Identidade (Origem Temporária)
+    temp_matrices = [np.eye(3, dtype=np.float64)]
+    
+    for i in range(1, total_global):
+        if cancel_event.is_set(): return
         
-        if target_info['batch_name'] == master_info['batch_name']:
-            global_flow["batches"][target_info['batch_name']] = {"matrix": np.eye(3).tolist()}
-            continue
-            
-        app_print(f"Alinhando {target_info['batch_name']} ao Master Global...\n")
-        shift, _ = cv2.phaseCorrelate(master_info['anchor_data'], target_info['anchor_data'])
+        ref_info = anchors_info[i-1]
+        tgt_info = anchors_info[i]
+        app_progress(i, total_global, f"Alinhando {tgt_info['batch_name']} ao vizinho...")
+        
+        shift, _ = cv2.phaseCorrelate(ref_info['anchor_data'], tgt_info['anchor_data'])
         dx, dy = shift
         
-        shifted_target = target_info['anchor_stars'] + np.array([dx, dy])
-        m_master, m_target = [], []
+        shifted_target = tgt_info['anchor_stars'] + np.array([dx, dy])
+        tree = KDTree(ref_info['anchor_stars'])
         
-        for idx, pt in enumerate(shifted_target):
-            dist, m_idx = master_tree.query(pt, distance_upper_bound=matching_radius)
+        m_ref, m_tgt = [], []
+        distances, indices = tree.query(shifted_target, distance_upper_bound=matching_radius)
+        
+        for idx, dist in enumerate(distances):
             if dist != float('inf'):
-                m_master.append(master_info['anchor_stars'][m_idx])
-                m_target.append(target_info['anchor_stars'][idx])
+                m_ref.append(ref_info['anchor_stars'][indices[idx]])
+                m_tgt.append(tgt_info['anchor_stars'][idx])
                 
-        if len(m_master) >= 3:
-            matrix_2x3, _ = cv2.estimateAffinePartial2D(
-                np.array(m_target), np.array(m_master), 
-                method=cv2.RANSAC, ransacReprojThreshold=ransac_thresh
+        if len(m_ref) >= 4:
+            matrix_2x3, inliers = cv2.estimateAffinePartial2D(
+                np.asarray(m_tgt, dtype=np.float32), 
+                np.asarray(m_ref, dtype=np.float32), 
+                method=cv2.RANSAC, 
+                ransacReprojThreshold=ransac_thresh
             )
-            if matrix_2x3 is not None:
-                global_flow["batches"][target_info['batch_name']] = {"matrix": make_homogeneous(matrix_2x3).tolist()}
+            
+            if matrix_2x3 is not None and inliers is not None and inliers.sum() >= 3:
+                step_matrix = make_homogeneous(matrix_2x3)
+                # Acumula a matriz: M_i = M_i-1 @ M_passo
+                accumulated = temp_matrices[i-1] @ step_matrix
+                temp_matrices.append(accumulated)
             else:
-                app_print(f"  -> Falha de RANSAC no Flow Global para {target_info['batch_name']}\n")
+                app_print(f"  -> Falha de RANSAC Global entre {tgt_info['batch_name']} e {ref_info['batch_name']}. Assumindo drift estático.\n")
+                temp_matrices.append(temp_matrices[i-1])
         else:
-            app_print(f"  -> Aviso: Pareamento insuficiente (<3 estrelas) entre {target_info['batch_name']} e o Master Global.\n")
+            app_print(f"  -> Pareamento insuficiente entre {tgt_info['batch_name']} e {ref_info['batch_name']}. Assumindo drift estático.\n")
+            temp_matrices.append(temp_matrices[i-1])
+
+    # =========================================================================
+    # 4. RE-CENTRALIZAÇÃO ABSOLUTA PELO MASTER
+    # =========================================================================
+    # Identifica o índice da Batch eleita como Master na lista sequencial
+    master_idx = anchors_info.index(master_info)
+    
+    # Pega a matriz temporária do Master e calcula sua inversa
+    master_matrix_inv = np.linalg.inv(temp_matrices[master_idx])
+    
+    for i, info in enumerate(anchors_info):
+        # A matriz final de cada Batch é deslocada para que o Master se torne a Identidade pura
+        final_matrix = master_matrix_inv @ temp_matrices[i]
+        global_flow["batches"][info['batch_name']] = {"matrix": final_matrix.tolist()}
                 
     with open(base_dir / "global_flow.json", "w") as f:
         json.dump(global_flow, f, indent=4)
         
     app_progress(total_global, total_global, "AstroFlow Finalizado.")
-    app_print("\n>>> Processamento Cinemático (AstroFlow) Concluído! <<<\n")
+    app_print("\n>>> Processamento Cinemático (AstroFlow) Concluído com Cadeia Total! <<<\n")
     
     
 def preview_star_detection(batch_dir: Path, config: dict) -> tuple[np.ndarray | None, int, float]:
@@ -958,13 +1054,16 @@ def preview_star_detection(batch_dir: Path, config: dict) -> tuple[np.ndarray | 
         return None, 0, 0.0
         
     anchor_file = files[0]
-    data = load_fits_data(anchor_file)
+    
+    data, header = load_fits_data(anchor_file)
+    working_data = extract_luminance(data, header)
     
     fwhm_val = float(config.get('fwhm', 4.0))
     sigma_val = float(config.get('sigma', 5.0))
     max_stars_val = int(config.get('max_stars', 250))
     
-    stars, measured_fwhm, metrics = detect_stars(data, fwhm_val, sigma_val, max_stars_val)
+    engine_val = config.get("engine", "DAO")
+    stars, measured_fwhm, metrics = detect_stars(working_data, fwhm_val, sigma_val, max_stars_val, engine_val)
     star_count = len(stars)
     
     # Normaliza a imagem para 8-bits para exibir no OpenCV/Matplotlib

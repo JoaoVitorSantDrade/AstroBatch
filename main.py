@@ -59,6 +59,7 @@ class AstroProcessManager(tk.Tk):
         self.flow_min_stars_var = tk.IntVar(value=4)
         self.flow_min_inliers_var = tk.IntVar(value=4)
         self.flow_min_ratio_var = tk.DoubleVar(value=0.15)
+        self.flow_engine_var = tk.StringVar(value="DAO")
 
         # Parâmetros AstroAlign
         self.align_output_dir_var = tk.StringVar()
@@ -96,7 +97,8 @@ class AstroProcessManager(tk.Tk):
                 "min_stars": self.flow_min_stars_var,
                 "min_inliers": self.flow_min_inliers_var,
                 "min_ratio": self.flow_min_ratio_var,
-                "debug_images": self.flow_debug_var
+                "debug_images": self.flow_debug_var,
+                "engine": self.flow_engine_var
             },
             "AstroAlign": {
                 "output_dir": self.align_output_dir_var,
@@ -248,7 +250,7 @@ class AstroProcessManager(tk.Tk):
         ttk.Entry(dir_frame, textvariable=self.batch_dir_var).grid(row=0, column=1, padx=6, sticky="ew")
         ttk.Button(dir_frame, text="Procurar...", command=lambda: self.browse_dir(self.batch_dir_var)).grid(row=0, column=2)
 
-        param_frame = ttk.LabelFrame(frame, text="Parâmetros Cinemáticos (DAOStarFinder & RANSAC)", padding=10)
+        param_frame = ttk.LabelFrame(frame, text="Parâmetros", padding=10)
         param_frame.grid(row=1, column=0, sticky="ew", pady=(0, 10))
         
         ttk.Label(param_frame, text="Global Master:").grid(row=0, column=0, sticky="w")
@@ -260,6 +262,9 @@ class AstroProcessManager(tk.Tk):
             state="readonly"
         )
         self.combo_global_master.grid(row=0, column=1, padx=6, sticky="w")
+        
+        ttk.Label(param_frame, text="Star Engine:").grid(row=0, column=2, sticky="w")
+        ttk.Combobox(param_frame, textvariable=self.flow_engine_var, values= ["DAO","OpenCV"], width=13, state="readonly").grid(row=0, column=3, sticky="w")
         
         ttk.Label(param_frame, text="FWHM Médio (px):").grid(row=1, column=0, sticky="w", pady=(4,0))
         ttk.Entry(param_frame, textvariable=self.flow_fwhm_var, width=15).grid(row=1, column=1, padx=6, sticky="w", pady=(4,0))
@@ -481,7 +486,8 @@ class AstroProcessManager(tk.Tk):
         config = {
             "fwhm": self.flow_fwhm_var.get(),
             "sigma": self.flow_sigma_var.get(),
-            "max_stars": 250
+            "max_stars": 250,
+            "engine": self.flow_engine_var.get(),
         }
         
         from astroflow_logic import preview_star_detection
@@ -500,7 +506,7 @@ class AstroProcessManager(tk.Tk):
         
         info_label = ttk.Label(
             prev_window, 
-            text=f"Batch: {target_batch.name} | Estrelas Detectadas: {count} | FWHM Base: {fwhm_measured:.1f}px", 
+            text=f"Batch: {target_batch.name} | Estrelas Detectadas: {count} | FWHM Base: {fwhm_measured:.1f}px | Engine: {self.flow_engine_var.get()}", 
             font=("Segoe UI", 10, "bold")
         )
         info_label.pack(pady=10)

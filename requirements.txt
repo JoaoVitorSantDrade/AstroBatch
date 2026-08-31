@@ -5,3 +5,4 @@ opencv-python-headless
 photutils 
 scipy
 matplotlib
+psutil
