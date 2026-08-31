@@ -1,4 +1,3 @@
-import math
 import json
 import cv2
 import numpy as np
@@ -16,148 +15,187 @@ def load_fits_data(filepath: Path) -> np.ndarray:
                 return np.asarray(hdu.data, dtype=np.float32)
     raise ValueError(f"Imagem 2D não encontrada em {filepath.name}")
 
-def detect_stars(data: np.ndarray, fwhm: float = 4.0, sigma: float = 5.0, max_stars: int = 150) -> np.ndarray:
+def detect_stars(data: np.ndarray, fwhm: float, sigma: float, max_stars: int) -> tuple[np.ndarray, float]:
     """Encontra os centroides das estrelas mais brilhantes usando DAOStarFinder."""
-    # Calcula o fundo da imagem para ignorar ruído
     mean, median, std = sigma_clipped_stats(data, sigma=3.0)
-    
-    # Procura estrelas que se destaquem X sigmas acima do fundo
     daofind = DAOStarFinder(fwhm=fwhm, threshold=median + (sigma * std))
     sources = daofind(data - median)
     
     if sources is None or len(sources) < 3:
-        return np.array([])
+        return np.array([]), 0.0
         
-    # Ordena pelo fluxo (brilho) e pega as 'max_stars' mais brilhantes
     sources.sort('flux', reverse=True)
     sources = sources[:max_stars]
-    
-    # Retorna uma matriz Nx2 com [x, y]
-    return np.transpose((sources['xcentroid'], sources['ycentroid']))
+    pts = np.transpose((sources['xcentroid'], sources['ycentroid']))
+    return pts, float(np.mean(sources['fwhm']))
 
-def estimate_global_shift(anchor_data: np.ndarray, target_data: np.ndarray) -> tuple[float, float]:
-    """Usa Transformada de Fourier para achar o deslocamento X, Y bruto."""
-    # cv2.phaseCorrelate exige float32 ou float64
-    shift, response = cv2.phaseCorrelate(anchor_data, target_data)
-    dx, dy = shift
-    return dx, dy
-
-def calculate_affine_matrix(anchor_pts: np.ndarray, target_pts: np.ndarray) -> list[list[float]]:
-    """Calcula matriz de Translação + Rotação ignorando falsos positivos (RANSAC)."""
-    # cv2.estimateAffinePartial2D descobre Translação, Rotação e Escala Uniforme
-    matrix, inliers = cv2.estimateAffinePartial2D(
-        target_pts, anchor_pts, method=cv2.RANSAC, ransacReprojThreshold=3.0
-    )
+def generate_debug_image(data: np.ndarray, stars: np.ndarray, output_path: Path):
+    """Gera um JPG da imagem com círculos nas estrelas detectadas para calibração."""
+    mean, median, std = sigma_clipped_stats(data, sigma=3.0)
+    vmin, vmax = median, median + (10 * std)
     
-    if matrix is None:
-        raise ValueError("Falha ao calcular matriz afim (RANSAC falhou).")
+    norm_data = np.clip((data - vmin) / (vmax - vmin), 0, 1) * 255
+    img_8u = norm_data.astype(np.uint8)
+    img_color = cv2.cvtColor(img_8u, cv2.COLOR_GRAY2BGR)
+    
+    for x, y in stars:
+        cv2.circle(img_color, (int(x), int(y)), 10, (0, 0, 255), 1)
         
-    return matrix.tolist()
+    cv2.imwrite(str(output_path), img_color)
 
-def process_batch_flow(batch_dir: Path, fwhm: float = 4.0, max_stars: int = 150) -> dict:
-    """Gera o arquivo flow_data.json contendo a cinemática da Batch."""
+def make_homogeneous(matrix_2x3: np.ndarray) -> np.ndarray:
+    """Converte matriz 2x3 para 3x3 para permitir multiplicação."""
+    hom = np.eye(3, dtype=np.float64)
+    hom[:2, :] = matrix_2x3
+    return hom
+
+def process_local_flow(batch_dir: Path, config: dict, app_print) -> dict:
+    """Calcula a cinemática intra-batch e retorna metadados da âncora."""
     files = sorted([p for p in batch_dir.iterdir() if p.is_file() and p.suffix.lower() in {'.fit', '.fits'}])
-    
     if not files:
-        raise FileNotFoundError(f"Nenhum FITS encontrado em {batch_dir}")
+        return {}
         
     anchor_file = files[0]
-    print(f"[{batch_dir.name}] Âncora definida: {anchor_file.name}")
+    app_print(f"[{batch_dir.name}] Âncora definida: {anchor_file.name}\n")
     
     anchor_data = load_fits_data(anchor_file)
-    anchor_stars = detect_stars(anchor_data, fwhm=fwhm, max_stars=max_stars)
+    anchor_stars, avg_fwhm = detect_stars(anchor_data, config['fwhm'], config['sigma'], config['max_stars'])
     
     if len(anchor_stars) < 3:
-        raise ValueError(f"Estrelas insuficientes na âncora {anchor_file.name}")
+        app_print(f"[{batch_dir.name}] ERRO: Estrelas insuficientes na âncora.\n")
+        return {}
         
-    # Árvore KD para busca ultra-rápida de vizinhos mais próximos
+    if config['debug_images']:
+        generate_debug_image(anchor_data, anchor_stars, batch_dir / f"debug_{anchor_file.stem}.jpg")
+
     anchor_tree = cKDTree(anchor_stars)
-    
-    flow_data = {
-        "batch_anchor": anchor_file.name,
-        "frames": {}
-    }
+    flow_data = {"batch_anchor": anchor_file.name, "frames": {}}
     
     for i, filepath in enumerate(files):
         if filepath == anchor_file:
-            # A matriz identidade significa que a âncora não se move em relação a ela mesma
-            flow_data["frames"][filepath.name] = {"matrix": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]}
+            flow_data["frames"][filepath.name] = {"matrix": np.eye(3).tolist()}
             continue
             
-        print(f"[{batch_dir.name}] Calculando flow: {filepath.name} ({i+1}/{len(files)})")
         target_data = load_fits_data(filepath)
+        shift, _ = cv2.phaseCorrelate(anchor_data, target_data)
+        dx, dy = shift
         
-        # 1. Deslocamento Bruto (Fourier)
-        dx, dy = estimate_global_shift(anchor_data, target_data)
-        
-        # 2. Detecção de Estrelas no alvo
-        target_stars = detect_stars(target_data, fwhm=fwhm, max_stars=max_stars)
+        target_stars, _ = detect_stars(target_data, config['fwhm'], config['sigma'], config['max_stars'])
         if len(target_stars) < 3:
-            print(f"  -> Aviso: Poucas estrelas em {filepath.name}. Posição pode ser imprecisa.")
             continue
             
-        # 3. Pareamento de Estrelas (Matching)
-        # Deslocamos os pontos alvo temporariamente pelo dx, dy bruto para que se alinhem com a âncora
-        shifted_target_stars = target_stars + np.array([dx, dy])
+        shifted_target = target_stars + np.array([dx, dy])
+        m_anchor, m_target = [], []
         
-        matched_anchor = []
-        matched_target = []
-        
-        for idx, target_pt in enumerate(shifted_target_stars):
-            # Procura a estrela âncora mais próxima dentro de um raio de 10 pixels
-            dist, anchor_idx = anchor_tree.query(target_pt, distance_upper_bound=10.0)
+        for idx, pt in enumerate(shifted_target):
+            dist, a_idx = anchor_tree.query(pt, distance_upper_bound=config['matching_radius'])
             if dist != float('inf'):
-                matched_anchor.append(anchor_stars[anchor_idx])
-                matched_target.append(target_stars[idx]) # Salva o alvo original (sem o shift)
+                m_anchor.append(anchor_stars[a_idx])
+                m_target.append(target_stars[idx])
                 
-        matched_anchor = np.array(matched_anchor)
-        matched_target = np.array(matched_target)
-        
-        if len(matched_anchor) < 3:
-            print(f"  -> Aviso: Falha ao parear estrelas suficientes em {filepath.name}")
+        if len(m_anchor) < 3:
             continue
             
-        # 4. Cálculo da Matriz Afim Final (Sub-pixel, Rotação e Translação)
-        try:
-            matrix = calculate_affine_matrix(matched_anchor, matched_target)
-            flow_data["frames"][filepath.name] = {"matrix": matrix}
-        except ValueError as e:
-            print(f"  -> {e}")
+        matrix_2x3, _ = cv2.estimateAffinePartial2D(
+            np.array(m_target), np.array(m_anchor), 
+            method=cv2.RANSAC, ransacReprojThreshold=config['ransac']
+        )
+        
+        if matrix_2x3 is not None:
+            flow_data["frames"][filepath.name] = {"matrix": make_homogeneous(matrix_2x3).tolist()}
             
-    # Salva o resultado
-    output_json = batch_dir / "flow_data.json"
-    with open(output_json, "w", encoding="utf-8") as f:
+    with open(batch_dir / "flow_local.json", "w") as f:
         json.dump(flow_data, f, indent=4)
         
-    print(f"[{batch_dir.name}] Flow calculado com sucesso e salvo em {output_json.name}\n")
-    return flow_data
+    return {
+        "batch_name": batch_dir.name,
+        "anchor_path": anchor_file,
+        "anchor_stars": anchor_stars,
+        "star_count": len(anchor_stars),
+        "fwhm": avg_fwhm,
+        "anchor_data": anchor_data
+    }
 
-def process_all_batches_flow(base_dir: Path, fwhm: float, max_stars: int, app_print, cancel_event):
-    """
-    Varre a pasta principal procurando por subpastas (ex: batch_001).
-    Roda o process_batch_flow em cada uma.
-    """
+def process_all_flows(base_dir: Path, config: dict, app_print, app_progress, cancel_event):
+    """Orquestra o Flow Local de cada Batch e depois calcula o Flow Global."""
     batch_folders = sorted([d for d in base_dir.iterdir() if d.is_dir() and "batch" in d.name.lower()])
+    total_batches = len(batch_folders)
     
     if not batch_folders:
         app_print(f"Nenhuma subpasta de Batch encontrada em {base_dir}\n")
         return
         
-    for i, b_folder in enumerate(batch_folders, start=1):
-        if cancel_event.is_set():
-            app_print("\nCancelamento solicitado pelo usuário.\n")
-            break
-            
-        app_print(f"=== Processando Batch {i}/{len(batch_folders)}: {b_folder.name} ===\n")
+    anchors_info = []
+    app_progress(0, total_batches, "Iniciando AstroFlow (0%)...")
+    
+    # 1. FLOW LOCAL
+    for b_folder in batch_folders:
+        if cancel_event.is_set(): return
+        app_progress(i, total_batches, f"Calculando Flow Local ({i+1}/{total_batches}): {b_folder.name}...")
         
-        try:
-            # Aqui você deve alterar os 'prints' do process_batch_flow original 
-            # para utilizar o 'app_print' fornecido pela interface.
-            process_batch_flow(b_folder, fwhm=fwhm, max_stars=max_stars) 
-        except Exception as e:
-            app_print(f"Erro na {b_folder.name}: {e}\n")
+        info = process_local_flow(b_folder, config, app_print)
+        if info:
+            anchors_info.append(info)
+            
+    if not anchors_info:
+        return
+        
+    # 2. DEFINIR MASTER GLOBAL
+    master_info = None
+    if config['global_master'].lower() == "auto":
+        # Elege a âncora com mais estrelas pontuais
+        master_info = min(anchors_info, key=lambda x: (x['fwhm'] / max(1, x['star_count'])))
+        app_print(f"\n[GLOBAL] Master Automático eleito: {master_info['batch_name']} (FWHM: {master_info['fwhm']:.2f})\n")
+    else:
+        master_info = next((a for a in anchors_info if a['batch_name'] == config['global_master']), None)
+        if not master_info:
+            master_info = anchors_info[0]
+            app_print(f"\n[GLOBAL] Master especificado não encontrado. Usando: {master_info['batch_name']}\n")
 
-# Bloco para testar o script isoladamente
-if __name__ == "__main__":
-    pasta_batch = Path(input("Caminho da pasta da Batch: ").strip())
-    process_batch_flow(pasta_batch)
+    # 3. FLOW GLOBAL
+    global_flow = {"global_master_batch": master_info['batch_name'], "batches": {}}
+    master_tree = cKDTree(master_info['anchor_stars'])
+    
+    total_global = len(anchors_info)
+    app_progress(0, total_global, "Iniciando alinhamento global das Batches...")
+    
+    for i, target_info in enumerate(anchors_info):
+        if cancel_event.is_set(): 
+            return
+            
+        app_progress(i, total_global, f"Alinhando {target_info['batch_name']} ao Master Global ({i+1}/{total_global})...")
+        
+        if target_info['batch_name'] == master_info['batch_name']:
+            global_flow["batches"][target_info['batch_name']] = {"matrix": np.eye(3).tolist()}
+            continue
+            
+        app_print(f"Alinhando {target_info['batch_name']} ao Master Global...\n")
+        shift, _ = cv2.phaseCorrelate(master_info['anchor_data'], target_info['anchor_data'])
+        dx, dy = shift
+        
+        shifted_target = target_info['anchor_stars'] + np.array([dx, dy])
+        m_master, m_target = [], []
+        
+        for idx, pt in enumerate(shifted_target):
+            dist, m_idx = master_tree.query(pt, distance_upper_bound=config['matching_radius'])
+            if dist != float('inf'):
+                m_master.append(master_info['anchor_stars'][m_idx])
+                m_target.append(target_info['anchor_stars'][idx])
+                
+        if len(m_master) >= 3:
+            matrix_2x3, _ = cv2.estimateAffinePartial2D(
+                np.array(m_target), np.array(m_master), 
+                method=cv2.RANSAC, ransacReprojThreshold=config['ransac']
+            )
+            if matrix_2x3 is not None:
+                global_flow["batches"][target_info['batch_name']] = {"matrix": make_homogeneous(matrix_2x3).tolist()}
+            else:
+                app_print(f"  -> Falha de RANSAC no Flow Global para {target_info['batch_name']}\n")
+        else:
+            app_print(f"  -> Aviso: Pareamento insuficiente (<3 estrelas) entre {target_info['batch_name']} e o Master Global.\n")
+                
+    with open(base_dir / "global_flow.json", "w") as f:
+        json.dump(global_flow, f, indent=4)
+        
+    app_progress(total_global, total_global, "AstroFlow Finalizado.")
+    app_print("\n>>> Processamento Cinemático (AstroFlow) Concluído! <<<\n")

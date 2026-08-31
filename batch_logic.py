@@ -29,6 +29,7 @@ class ProcessingConfig:
     crop_size: int
     dry_run: bool
     copy_files: bool
+    overwrite: bool
     opt_method: str
     downsample_method: str
     downsample_scale: float
@@ -106,17 +107,22 @@ def prepare_fits_file(filepath: Path, config: ProcessingConfig) -> tuple[Path, n
     except Exception as exc:
         return filepath, None, f"Erro ao processar {filepath.name}: {exc}"
 
-def file_mover_worker(move_queue: queue.Queue, app_print, cancel_event: threading.Event):
+def file_mover_worker(move_queue: queue.Queue, app_print, cancel_event: threading.Event, app_progress, move_state: dict):
     while True:
         item = move_queue.get()
         if item is None: break
             
-        src, dst, action = item
+        src, dst, action, overwrite = item  # Recebendo a flag overwrite
+        
         if cancel_event.is_set():
             move_queue.task_done()
             continue
             
         try:
+            # Se a flag estiver ativa e o arquivo já existir, remove o antigo primeiro
+            if dst.exists() and overwrite:
+                dst.unlink()
+                
             if action == 'copy':
                 shutil.copy2(str(src), str(dst))
             else:
@@ -125,6 +131,13 @@ def file_mover_worker(move_queue: queue.Queue, app_print, cancel_event: threadin
             verbo = "copiar" if action == 'copy' else "mover"
             app_print(f"Erro ao {verbo} {src.name}: {exc}\n")
         finally:
+            move_state["moved"] += 1
+            
+            # Atualiza a UI apenas a cada 20 arquivos ou quando for o último
+            if move_state["moved"] % 20 == 0 or move_state["moved"] == move_state['total']:
+                if move_state["total"] > 0 and app_progress:
+                    app_progress(move_state["moved"], move_state["total"], f"Salvando no disco ({move_state['moved']}/{move_state['total']})...")
+            
             move_queue.task_done()
 
 def process_fits_logic(config: ProcessingConfig, app_print, cancel_event: threading.Event) -> tuple[int, int]:
@@ -133,9 +146,12 @@ def process_fits_logic(config: ProcessingConfig, app_print, cancel_event: thread
 
     app_print(f"Lendo arquivos de: {input_dir}\n")
     files = find_fits_files(input_dir)
+    total_files = len(files)
     if not files:
         app_print("Nenhum arquivo FITS encontrado no diretório.\n")
         return 0, 0
+        
+    app_progress(0, total_files, "Iniciando análise...")
 
     app_print(f"Total de arquivos encontrados: {len(files)}\n")
     if not config.dry_run: output_dir.mkdir(parents=True, exist_ok=True)
@@ -151,9 +167,12 @@ def process_fits_logic(config: ProcessingConfig, app_print, cancel_event: thread
     worker_count = get_optimal_worker_count()
     prefetch_count = min(len(files), max(worker_count * 2, worker_count + 2))
 
+    move_state = {"moved": 0, "total": total_files}
     move_queue = queue.Queue()
-    mover_thread = threading.Thread(target=file_mover_worker, args=(move_queue, app_print, cancel_event), daemon=True)
+    mover_thread = threading.Thread(target=file_mover_worker, args=(move_queue, app_print, cancel_event, app_progress, move_state), daemon=True)
     if not config.dry_run: mover_thread.start()
+
+    queued_for_move = 0
 
     app_print(f"\nPipeline paralelo: {worker_count} workers leitura | 1 worker disco | prefetch: {prefetch_count}\n")
     app_print(f"Iniciando Batch {batch_num:03d}...\n")
@@ -226,11 +245,13 @@ def process_fits_logic(config: ProcessingConfig, app_print, cancel_event: thread
 
             if not config.dry_run:
                 destination = current_batch_dir / filepath.name
-                if destination.exists():
+                
+                if destination.exists() and not config.overwrite:
                     app_print(f"ERRO: destino já existe, arquivo ignorado: {destination}\n")
                 else:
                     action = 'copy' if config.copy_files else 'move'
-                    move_queue.put((filepath, destination, action))
+                    move_queue.put((filepath, destination, action, config.overwrite))
+                    queued_for_move += 1
 
             processed += 1
             if next_process % 20 == 0 or next_process == len(files):
@@ -238,9 +259,11 @@ def process_fits_logic(config: ProcessingConfig, app_print, cancel_event: thread
             submit_until_window_full()
 
     if not config.dry_run:
+        move_state["total"] = queued_for_move
         app_print("\nAguardando finalização das movimentações de disco...\n")
         move_queue.put(None)
         mover_thread.join()
 
+    app_progress(100, 100, "Concluído.")
     app_print(f"\nFinalizado! {processed} arquivos processados em {batch_num} batches.\n")
     return processed, batch_num

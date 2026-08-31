@@ -4,3 +4,4 @@ pillow
 opencv-python-headless 
 photutils 
 scipy
+matplotlib
