@@ -403,35 +403,24 @@ def process_local_flow(
     app_print
 ) -> dict:
 
-    files = sorted([
-        p
-        for p in batch_dir.iterdir()
-        if (
-            p.is_file()
-            and p.suffix.lower() in {
-                ".fit",
-                ".fits"
-            }
-        )
-    ])
+    files = sorted([p for p in batch_dir.iterdir() if p.is_file() and p.suffix.lower() in {".fit", ".fits"}])
+    if not files: return {}
 
-    if not files:
-        return {}
+    if not isinstance(config, dict): config = {}
 
     anchor_mode = config.get("anchor_mode", "first") # Pode ser "first", "middle", "last"
 
-    if anchor_mode == "middle":
-        anchor_file = files[len(files) // 2]
-    elif anchor_mode == "last":
-        anchor_file = files[-1]
-    else:
-        anchor_file = files[0]
+    # Extrai o dicionário de âncoras personalizadas injetado pela interface
+    custom_anchors = config.get("custom_anchors", {})
+    chosen_anchor_name = custom_anchors.get(batch_dir.name)
 
-    app_print(
-        f"[{batch_dir.name}] "
-        f"Âncora definida: "
-        f"{anchor_file.name}\n"
-    )
+    anchor_file = files[0]
+    
+    if chosen_anchor_name:
+        app_print(f"[{batch_dir.name}] Frame Central (Batch Reference): {chosen_anchor_name}\n")
+    else:
+        chosen_anchor_name = anchor_file.name
+        app_print(f"[{batch_dir.name}] Nenhuma referência manual. Centralizando no 1º frame.\n")
 
     if not isinstance(config, dict):
         config = {}
@@ -453,27 +442,14 @@ def process_local_flow(
     # ========================================================
 
     try:
-        cpu_count = (
-            getattr(
-                os,
-                "process_cpu_count",
-                os.cpu_count
-            )()
-            or 1
-        )
+        cpu_count = (getattr(os,"process_cpu_count",os.cpu_count)()or 1)
     except Exception:
         cpu_count = os.cpu_count() or 1
 
-    worker_count = max(
-        1,
-        min(16, cpu_count)
+    worker_count = max(1, min(4, cpu_count)
     )
 
-    app_print(
-        f"[{batch_dir.name}] "
-        f"Pré-processamento paralelo: "
-        f"{worker_count} workers\n"
-    )
+    app_print(f"[{batch_dir.name}] Pré-processamento paralelo: {worker_count} workers\n")
 
     prepared_frames = {}
     
@@ -484,43 +460,29 @@ def process_local_flow(
         thread_name_prefix="astroflow"
     ) as executor:
 
-        futures = {
-            executor.submit(
-                _process_single_frame,
-                filepath,
-                fwhm_val,
-                sigma_val,
-                max_stars_val,
-                min_stars,
-                engine_val
-            ): filepath
-            for filepath in files
-        }
+        futures = { executor.submit(
+                    _process_single_frame,
+                    filepath,
+                    fwhm_val,
+                    sigma_val,
+                    max_stars_val,
+                    min_stars,
+                    engine_val): filepath
+                        for filepath in files}
 
         for future in as_completed(futures):
 
             filepath = futures[future]
-
             try:
                 fname, result = future.result()
 
             except Exception as exc:
 
-                app_print(
-                    f"  [{filepath.name}] "
-                    f"Erro no worker: "
-                    f"{exc}\n"
-                )
-
+                app_print(f"[{filepath.name}] Erro no worker: {exc}\n")
                 continue
 
             if result is None:
-
-                app_print(
-                    f"  [{fname}] "
-                    f"Estrelas insuficientes.\n"
-                )
-
+                app_print(f"[{fname}] Estrelas insuficientes.\n")
                 continue
 
             prepared_frames[fname] = result
@@ -529,34 +491,18 @@ def process_local_flow(
     # 2. VALIDAR ÂNCORA
     # ========================================================
 
-    anchor = prepared_frames.get(
-        anchor_file.name
-    )
-
+    anchor = prepared_frames.get(anchor_file.name)
     if anchor is None:
-
-        app_print(
-            f"[{batch_dir.name}] "
-            f"ERRO: Não foi possível "
-            f"processar a âncora.\n"
-        )
-
+        app_print(f"[{batch_dir.name}] ERRO: Não foi possível processar a âncora.\n")
         return {}
 
     anchor_stars = anchor["stars"]
     anchor_data = anchor["data"]
-
     anchor_fwhm = anchor["fwhm"]
 
     if len(anchor_stars) < min_stars:
 
-        app_print(
-            f"[{batch_dir.name}] "
-            f"ERRO: Estrelas insuficientes "
-            f"na âncora "
-            f"({len(anchor_stars)}).\n"
-        )
-
+        app_print(f"[{batch_dir.name}] ERRO: Estrelas insuficientes na âncora ({len(anchor_stars)}).\n")
         return {}
 
     anchor_quality = calculate_anchor_quality(
@@ -564,20 +510,12 @@ def process_local_flow(
         anchor_fwhm
     )
 
-    app_print(
-        f"[{batch_dir.name}] "
-        f"Âncora: {len(anchor_stars)} estrelas | "
-        f"FWHM={anchor_fwhm:.2f}px | "
-        f"qualidade={anchor_quality:.4f}\n"
-    )
-
+    app_print(f"[{batch_dir.name}] Âncora: {len(anchor_stars)} estrelas | FWHM={anchor_fwhm:.2f}px | qualidade={anchor_quality:.4f}\n")
     if debug_flag:
-
         generate_debug_image(
             anchor_data,
             anchor_stars,
-            batch_dir
-            / f"debug_{anchor_file.stem}.jpg"
+            batch_dir / f"debug_{anchor_file.stem}.jpg"
         )
 
     # ========================================================
@@ -660,12 +598,7 @@ def process_local_flow(
 
         if current_frame is None:
 
-            app_print(
-                f"  [{current_name}] "
-                f"REJEITADO na detecção. "
-                f"Cadeia interrompida neste ponto.\n"
-            )
-
+            app_print(f"[{current_name}] REJEITADO na detecção. Cadeia interrompida neste ponto.\n")
             continue
 
         previous_stars = previous_frame[
@@ -702,15 +635,8 @@ def process_local_flow(
 
         if len(m_previous) < min_stars:
 
-            app_print(
-                f"  [{current_name}] "
-                f"REJEITADO: apenas "
-                f"{len(m_previous)} matches "
-                f"com {previous_name}.\n"
-            )
-
+            app_print(f"[{current_name}] REJEITADO: apenas {len(m_previous)} matches com {previous_name}.\n")
             # Mantemos previous_frame como está.
-            #
             # Isso permite que o próximo frame ainda seja
             # comparado ao último frame VÁLIDO.
             continue
@@ -753,34 +679,17 @@ def process_local_flow(
         #     T_current_previous
         # ----------------------------------------------------
 
-        cumulative_matrix = (
-            cumulative_matrix
-            @ relative_matrix
-        )
+        cumulative_matrix = (cumulative_matrix @ relative_matrix)
 
         # ----------------------------------------------------
         # RMS acumulado aproximado
         # ----------------------------------------------------
 
-        previous_cumulative_rms = (
-            flow_data["frames"][
-                previous_name
-            ].get(
-                "cumulative_rms",
-                0.0
-            )
-        )
+        previous_cumulative_rms = (flow_data["frames"][previous_name].get("cumulative_rms",0.0))
         
-        current_rms = metrics[
-            "rms"
-        ] or 0.0
+        current_rms = metrics["rms"] or 0.0
 
-        cumulative_rms = float(
-            np.sqrt(
-                previous_cumulative_rms ** 2
-                + current_rms ** 2
-            )
-        )
+        cumulative_rms = float(np.sqrt(previous_cumulative_rms ** 2 + current_rms ** 2))
 
         # ----------------------------------------------------
         # Salva frame
@@ -821,11 +730,7 @@ def process_local_flow(
                 current_stars
             )
         }
-        app_print(
-            f"  [{current_name}] "
-            f"OK ← {previous_name} | "
-            f"{metrics['inliers']}/"
-            f"{metrics['matches']} inliers "
+        app_print(f"[{current_name}] OK ← {previous_name} | {metrics['inliers']}/{metrics['matches']} inliers "
             f"({metrics['inlier_ratio']:.1%}) | "
             f"RMS={metrics['rms']:.3f}px\n"
         )
@@ -840,43 +745,49 @@ def process_local_flow(
         previous_frame = current_frame
 
     # ========================================================
-    # 5. GARANTIA / DIAGNÓSTICO DO ÚLTIMO FRAME
+    # 5. RE-CENTRALIZAÇÃO NA BATCH REFERENCE (Álgebra Reversa)
+    # ========================================================
+    if chosen_anchor_name in flow_data["frames"]:
+        # Extrai a matriz cumulativa que a referência sofreu desde a origem F0
+        anchor_matrix = np.array(flow_data["frames"][chosen_anchor_name]["matrix"], dtype=np.float64)
+        try:
+            # Calcula o inverso da trajetória da referência
+            inv_anchor = np.linalg.inv(anchor_matrix)
+            
+            # Desloca a cinemática do "universo da Batch" para que a referência vire [0,0,0]
+            for fname, fdata in flow_data["frames"].items():
+                old_mat = np.array(fdata["matrix"], dtype=np.float64)
+                new_mat = inv_anchor @ old_mat
+                fdata["matrix"] = new_mat.tolist()
+            
+            # Atualiza o cabeçalho do JSON informando quem governa a centralização final
+            flow_data["batch_anchor"] = chosen_anchor_name
+            app_print(f"[{batch_dir.name}] Todas as matrizes foram re-centralizadas na Referência: {chosen_anchor_name}\n")
+            
+        except np.linalg.LinAlgError:
+            app_print(f"[{batch_dir.name}] ERRO: Matriz da referência é singular. Mantendo origem no frame F0.\n")
+    else:
+        app_print(f"[{batch_dir.name}] AVISO: A Referência escolhida ({chosen_anchor_name}) não possui matriz. Mantendo origem em F0.\n")
+        
+    # ========================================================
+    # 6. GARANTIA / DIAGNÓSTICO DO ÚLTIMO FRAME
     # ========================================================
 
     last_file = files[-1]
 
     if last_file.name not in flow_data["frames"]:
-
-        app_print(
-            f"\n[{batch_dir.name}] "
-            f"AVISO: último frame "
-            f"{last_file.name} "
-            f"NÃO entrou no Flow.\n"
-        )
+        app_print(f"\n[{batch_dir.name}] AVISO: último frame {last_file.name} NÃO entrou no Flow.\n")
 
     else:
-
-        app_print(
-            f"\n[{batch_dir.name}] "
-            f"Último frame garantido no Flow: "
-            f"{last_file.name}\n"
-        )
+        app_print(f"\n[{batch_dir.name}] Último frame garantido no Flow: {last_file.name}\n")
 
     # ========================================================
-    # 6. SALVA
+    # 7. SALVA
     # ========================================================
 
     with open(
-        batch_dir / "flow_local.json",
-        "w",
-        encoding="utf-8"
-    ) as f:
-
-        json.dump(
-            flow_data,
-            f,
-            indent=4
-        )
+        batch_dir / "flow_local.json", "w", encoding="utf-8") as f:
+            json.dump(flow_data,f,indent=4)
 
     valid_frames = len(
         flow_data["frames"]

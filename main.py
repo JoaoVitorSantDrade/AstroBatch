@@ -34,6 +34,7 @@ class AstroProcessManager(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _init_variables(self):
+        self.custom_anchors = {}
         self.batch_dir_var = tk.StringVar()
         self.status_var = tk.StringVar(value="Pronto.")
         self.progress_var = tk.DoubleVar(value=0.0)
@@ -293,17 +294,20 @@ class AstroProcessManager(tk.Tk):
         action_frame.grid(row=2, column=0, sticky="ew", pady=(0, 10))
         action_frame.columnconfigure(0, weight=1)
         
-        self.btn_preview_flow = ttk.Button(action_frame, text="🔍 PREVIEW DA ÂNCORA", command=self.show_astroflow_preview)
-        self.btn_preview_flow.grid(row=0, column=0, sticky="ew", ipady=6)
+        self.btn_select_anchor = ttk.Button(action_frame, text="🖼️ DEFINIR REFERÊNCIA", command=self.open_anchor_selector)
+        self.btn_select_anchor.grid(row=0, column=0, sticky="ew", ipady=6)
+        
+        self.btn_preview_flow = ttk.Button(action_frame, text="🔍 PREVIEW DETECÇÃO", command=self.show_astroflow_preview)
+        self.btn_preview_flow.grid(row=0, column=1, padx=6, sticky="ew", ipady=6)
         
         self.btn_run_flow = ttk.Button(action_frame, text="▶ INICIAR ASTROFLOW", command=self.start_flow_processing)
-        self.btn_run_flow.grid(row=0, column=1, sticky="ew", ipady=6)
+        self.btn_run_flow.grid(row=0, column=2, sticky="ew", ipady=6)
         
-        self.btn_viz_flow = ttk.Button(action_frame, text="📈 VISUALIZAR FLOW", command=self.show_flow_visualization)
-        self.btn_viz_flow.grid(row=0, column=2, padx=8, sticky="ew", ipady=6)
+        self.btn_viz_flow = ttk.Button(action_frame, text="📈 VISUALIZAR", command=self.show_flow_visualization)
+        self.btn_viz_flow.grid(row=0, column=3, padx=6, sticky="ew", ipady=6)
 
         self.btn_cancel_flow = ttk.Button(action_frame, text="■ CANCELAR", command=self.cancel_processing, state="disabled")
-        self.btn_cancel_flow.grid(row=0, column=3, padx=(0, 0), ipady=6)
+        self.btn_cancel_flow.grid(row=0, column=4, padx=(0, 0), ipady=6)
 
     def _build_tab_align(self):
         """Constrói a interface da aba AstroAlign."""
@@ -450,6 +454,7 @@ class AstroProcessManager(tk.Tk):
         # Cria um dicionário seguro mapeando explicitamente as chaves
         flow_reg = self.config_registry["AstroFlow"]
         config = {
+            "custom_anchors": getattr(self, "custom_anchors", {}),
             "global_master": flow_reg["global_master"].get(),
             "fwhm": flow_reg["fwhm"].get(),
             "sigma": flow_reg["sigma"].get(),
@@ -520,7 +525,7 @@ class AstroProcessManager(tk.Tk):
         
         # OpenCV usa BGR, convertemos para RGB para o Matplotlib exibir corretamente
         ax.imshow(cv2.cvtColor(img_preview, cv2.COLOR_BGR2RGB))
-        ax.set_title("Detecção de Estrelas (DAOStarFinder)", color='white', fontsize=10)
+        ax.set_title("Detecção de Estrelas", color='white', fontsize=10)
         ax.axis("off")
         fig.tight_layout(pad=0.5)
         
@@ -618,6 +623,146 @@ class AstroProcessManager(tk.Tk):
         canvas = FigureCanvasTkAgg(fig, master=viz_window)
         canvas.draw()
         canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+    
+    def open_anchor_selector(self):
+        import functools
+        import cv2
+        import numpy as np
+        import threading
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+        from matplotlib.figure import Figure
+        from astroflow_logic import load_fits_data, extract_luminance
+
+        base_dir_str = self.batch_dir_var.get()
+        if not base_dir_str:
+            return messagebox.showerror("Erro", "Selecione a Pasta Base das Batches primeiro.")
+            
+        base_dir = Path(base_dir_str).expanduser().resolve()
+        batch_folders = sorted([d for d in base_dir.iterdir() if d.is_dir() and "batch" in d.name.lower()])
+        
+        if not batch_folders:
+            return messagebox.showerror("Erro", "Nenhuma pasta de Batch encontrada na pasta base.")
+            
+        win = tk.Toplevel(self)
+        win.title("Visualizador e Seletor de Batch Reference")
+        win.geometry("900x750")
+        
+        top_frame = ttk.Frame(win, padding=10)
+        top_frame.pack(fill=tk.X)
+        
+        ttk.Label(top_frame, text="Batch:").pack(side=tk.LEFT)
+        batch_combo = ttk.Combobox(top_frame, values=[b.name for b in batch_folders], state="readonly", width=15)
+        batch_combo.pack(side=tk.LEFT, padx=5)
+        
+        ttk.Label(top_frame, text="Frame:").pack(side=tk.LEFT, padx=(15, 0))
+        frame_combo = ttk.Combobox(top_frame, state="readonly", width=30)
+        frame_combo.pack(side=tk.LEFT, padx=5)
+        
+        # OTIMIZAÇÃO: Criação da figura com DPI otimizado e reuso de eixos
+        fig = Figure(figsize=(7, 5), dpi=80)
+        ax = fig.add_subplot(111)
+        fig.patch.set_facecolor('#1e1e1e')
+        ax.set_facecolor('#1e1e1e')
+        ax.axis("off")
+        
+        # OTIMIZAÇÃO: Inicializa o objeto AxesImage vazio com cmap='gray' (Evita RGB conversion)
+        ax_img = ax.imshow(np.zeros((10, 10)), cmap='gray', interpolation='nearest', rasterized=True, vmin=0, vmax=255)
+        title_obj = ax.set_title("Stretched Preview", color='white', fontsize=10)
+        
+        canvas = FigureCanvasTkAgg(fig, master=win)
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        
+        # OTIMIZAÇÃO: Cache LRU (Mantém os últimos 40 frames cacheados na RAM em resolução reduzida)
+        @functools.lru_cache(maxsize=40)
+        def get_preview_data(filepath):
+            data, header = load_fits_data(filepath)
+            l_data = extract_luminance(data, header)
+            # Downsampling imediato para acelerar a estatística e a renderização na GUI
+            return cv2.resize(l_data, (l_data.shape[1]//3, l_data.shape[0]//3), interpolation=cv2.INTER_NEAREST)
+        
+        def update_frames(event=None):
+            b_name = batch_combo.get()
+            b_path = base_dir / b_name
+            fits_files = sorted([f.name for f in b_path.iterdir() if f.is_file() and f.suffix.lower() in {'.fit', '.fits'}])
+            frame_combo.config(values=fits_files)
+            if fits_files:
+                pre_sel = self.custom_anchors.get(b_name, fits_files[len(fits_files)//2])
+                if pre_sel in fits_files: frame_combo.set(pre_sel)
+                else: frame_combo.set(fits_files[0])
+                update_image()
+                
+        def update_image(event=None):
+            b_name = batch_combo.get()
+            f_name = frame_combo.get()
+            if not b_name or not f_name: return
+            
+            # Trava o combobox temporariamente para evitar cliques encavalados (Thrashing de thread)
+            frame_combo.config(state="disabled")
+            batch_combo.config(state="disabled")
+            
+            def worker():
+                try:
+                    f_path = base_dir / b_name / f_name
+                    small_data = get_preview_data(f_path)
+                    
+                    # OTIMIZAÇÃO: Estatística ultra-rápida (Substitui sigma_clipped_stats)
+                    # Usa percentis no array redimensionado para achar o desvio padrão aproximado instantaneamente
+                    median = np.median(small_data)
+                    p25, p75 = np.percentile(small_data, [25, 75])
+                    std = max((p75 - p25) / 1.35, 1e-5) # Fator 1.35 aproxima IQR de StdDev
+                    
+                    vmin = median - (0.5 * std)
+                    vmax = median + (6.0 * std)
+                    
+                    norm = np.clip((small_data - vmin) / vmax, 0, 1) * 255
+                    img_8u = norm.astype(np.uint8)
+                    
+                    def update_gui():
+                        # OTIMIZAÇÃO: Injeção direta nos dados da imagem e renderização idle
+                        ax_img.set_data(img_8u)
+                        ax_img.set_extent((0, img_8u.shape[1], img_8u.shape[0], 0)) # Atualiza bordas geométricas
+                        title_obj.set_text(f"Stretched Preview: {f_name}")
+                        canvas.draw_idle() 
+                        
+                        frame_combo.config(state="readonly")
+                        batch_combo.config(state="readonly")
+                        
+                    self.after(0, update_gui)
+                except Exception as exc:
+                    self.after(0, lambda: frame_combo.config(state="readonly"))
+                    self.after(0, lambda: batch_combo.config(state="readonly"))
+                    self.print_to_console(f"Erro no preview: {exc}\n")
+
+            # OTIMIZAÇÃO: Executa o carregamento e matemática em Thread assíncrona
+            threading.Thread(target=worker, daemon=True).start()
+            
+        batch_combo.bind("<<ComboboxSelected>>", update_frames)
+        frame_combo.bind("<<ComboboxSelected>>", update_image)
+        
+        if batch_folders:
+            batch_combo.set(batch_folders[0].name)
+            update_frames()
+            
+        def save_selection():
+            b_name = batch_combo.get()
+            f_name = frame_combo.get()
+            if b_name and f_name:
+                self.custom_anchors[b_name] = f_name
+                self.print_to_console(f"Referência central da {b_name} travada em: {f_name}\n")
+                messagebox.showinfo(
+                    "Referência Salva", 
+                    f"A referência da {b_name} foi atualizada com sucesso para o frame:\n\n{f_name}", 
+                    parent=win
+                )
+            
+        btn_frame = ttk.Frame(win)
+        btn_frame.pack(pady=10, padx=20, fill=tk.X)
+        
+        btn_save = ttk.Button(btn_frame, text="✅ Definir Frame como Referência (Manter Aberto)", command=save_selection)
+        btn_save.pack(side=tk.LEFT, padx=5, expand=True, fill=tk.X, ipady=6)
+        
+        btn_close = ttk.Button(btn_frame, text="🚪Fechar", command=win.destroy)
+        btn_close.pack(side=tk.LEFT, padx=5, expand=True, fill=tk.X, ipady=6)
         
     def _update_global_master_options(self, *args):
         """Varre a pasta selecionada e atualiza o Dropdown do Global Master."""
