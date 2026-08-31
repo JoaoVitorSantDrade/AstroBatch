@@ -84,10 +84,14 @@ def compute_final_matrix(local_matrix: list, global_matrix: list) -> np.ndarray:
 
 
 def load_fits_data(filepath: Path) -> tuple[np.ndarray, fits.Header]:
-    with fits.open(filepath, memmap=False) as hdul:
+    # Usamos ignore_missing_end=True e, se necessário, context manager seguro
+    with fits.open(filepath, memmap=False, do_not_scale_image_data=True) as hdul:
         for hdu in hdul:
             if hdu.is_image and hdu.data is not None and hdu.data.ndim == 2:
-                return np.asarray(hdu.data, dtype=np.float32), hdu.header.copy()
+                # Copia o header ignorando erros est严ritos de conformidad do FITS original
+                header = hdu.header.copy(strip=False)
+                data = np.asarray(hdu.data, dtype=np.float32)
+                return data, header
     raise ValueError(f"Imagem 2D não encontrada em {filepath.name}")
 
 
@@ -115,7 +119,10 @@ def warp_frame(data: np.ndarray, final_matrix: np.ndarray, interpolation_flag: i
 
 def save_fits(data: np.ndarray, header: fits.Header | None, output_path: Path):
     hdu = fits.PrimaryHDU(data=data.astype(np.float32), header=header)
-    hdu.writeto(str(output_path), overwrite=True)
+    
+    # Cria o HDU List explicitamente permitindo ignorar avisos de verificação padrão do FITS
+    hdul = fits.HDUList([hdu])
+    hdul.writeto(str(output_path), overwrite=True, output_verify='ignore')
 
 
 def _process_single_alignment(

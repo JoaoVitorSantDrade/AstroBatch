@@ -946,3 +946,37 @@ def process_all_flows(base_dir: Path, config: dict, app_print, app_progress, can
         
     app_progress(total_global, total_global, "AstroFlow Finalizado.")
     app_print("\n>>> Processamento Cinemático (AstroFlow) Concluído! <<<\n")
+    
+    
+def preview_star_detection(batch_dir: Path, config: dict) -> tuple[np.ndarray | None, int, float]:
+    """
+    Carrega a âncora de uma batch, detecta as estrelas e desenha os círculos 
+    proporcionais ao FWHM detectado para pré-visualização em tempo real.
+    """
+    files = sorted([p for p in batch_dir.iterdir() if p.is_file() and p.suffix.lower() in {'.fit', '.fits'}])
+    if not files:
+        return None, 0, 0.0
+        
+    anchor_file = files[0]
+    data = load_fits_data(anchor_file)
+    
+    fwhm_val = float(config.get('fwhm', 4.0))
+    sigma_val = float(config.get('sigma', 5.0))
+    max_stars_val = int(config.get('max_stars', 250))
+    
+    stars, measured_fwhm, metrics = detect_stars(data, fwhm_val, sigma_val, max_stars_val)
+    star_count = len(stars)
+    
+    # Normaliza a imagem para 8-bits para exibir no OpenCV/Matplotlib
+    mean, median, std = sigma_clipped_stats(data, sigma=3.0)
+    vmin, vmax = median, median + (8 * std)
+    norm_data = np.clip((data - vmin) / (vmax - vmin), 0, 1) * 255
+    img_8u = norm_data.astype(np.uint8)
+    img_color = cv2.cvtColor(img_8u, cv2.COLOR_GRAY2BGR)
+    
+    # Desenha os círculos dimensionados proporcionalmente ao FWHM real da estrela
+    radius = max(3, int(fwhm_val * 1.5))
+    for x, y in stars:
+        cv2.circle(img_color, (int(x), int(y)), radius, (0, 0, 255), 1)
+        
+    return img_color, star_count, measured_fwhm

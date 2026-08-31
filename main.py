@@ -4,6 +4,7 @@ import threading
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
+import cv2
 
 
 # Importações dos módulos lógicos
@@ -59,6 +60,13 @@ class AstroProcessManager(tk.Tk):
         self.flow_min_inliers_var = tk.IntVar(value=4)
         self.flow_min_ratio_var = tk.DoubleVar(value=0.15)
 
+        # Parâmetros AstroAlign
+        self.align_output_dir_var = tk.StringVar()
+        self.align_interpolation_var = tk.StringVar(value="Lanczos")
+        self.align_overwrite_var = tk.BooleanVar(value=False)
+        self.align_dry_run_var = tk.BooleanVar(value=False)
+        self.align_keep_header_var = tk.BooleanVar(value=True)
+        
         # Parâmetros AstroAlign
         self.align_output_dir_var = tk.StringVar()
         self.align_interpolation_var = tk.StringVar(value="Lanczos")
@@ -274,21 +282,68 @@ class AstroProcessManager(tk.Tk):
         ttk.Label(param_frame, text="Ratio Mínimo de Inliers (ex: 0.15):").grid(row=7, column=0, sticky="w", pady=(4,0))
         ttk.Entry(param_frame, textvariable=self.flow_min_ratio_var, width=15).grid(row=7, column=1, padx=6, sticky="w", pady=(4,0))
 
-        ttk.Checkbutton(param_frame, text="Gerar Imagens de Diagnóstico (.jpg) nas âncoras", variable=self.flow_debug_var).grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Checkbutton(param_frame, text="Gerar Imagens de Diagnóstico (.jpg) nas âncoras", variable=self.flow_debug_var).grid(row=8, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+        action_frame = ttk.Frame(frame)
+        action_frame.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        action_frame.columnconfigure(0, weight=1)
+        
+        self.btn_preview_flow = ttk.Button(action_frame, text="🔍 PREVIEW DA ÂNCORA", command=self.show_astroflow_preview)
+        self.btn_preview_flow.grid(row=0, column=0, sticky="ew", ipady=6)
+        
+        self.btn_run_flow = ttk.Button(action_frame, text="▶ INICIAR ASTROFLOW", command=self.start_flow_processing)
+        self.btn_run_flow.grid(row=0, column=1, sticky="ew", ipady=6)
+        
+        self.btn_viz_flow = ttk.Button(action_frame, text="📈 VISUALIZAR FLOW", command=self.show_flow_visualization)
+        self.btn_viz_flow.grid(row=0, column=2, padx=8, sticky="ew", ipady=6)
+
+        self.btn_cancel_flow = ttk.Button(action_frame, text="■ CANCELAR", command=self.cancel_processing, state="disabled")
+        self.btn_cancel_flow.grid(row=0, column=3, padx=(0, 0), ipady=6)
+
+    def _build_tab_align(self):
+        """Constrói a interface da aba AstroAlign."""
+        frame = self.tab_align
+        frame.columnconfigure(0, weight=1)
+
+        dir_frame = ttk.LabelFrame(frame, text="Diretórios de Alinhamento", padding=10)
+        dir_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        dir_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(dir_frame, text="Pasta Base (Onde está o global_flow.json):").grid(row=0, column=0, sticky="w")
+        ttk.Entry(dir_frame, textvariable=self.batch_dir_var).grid(row=0, column=1, padx=6, sticky="ew")
+        ttk.Button(dir_frame, text="Procurar...", command=lambda: self.browse_dir(self.batch_dir_var)).grid(row=0, column=2)
+
+        ttk.Label(dir_frame, text="Pasta Destino (Frames Alinhados):").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(dir_frame, textvariable=self.align_output_dir_var).grid(row=1, column=1, padx=6, pady=(8, 0), sticky="ew")
+        ttk.Button(dir_frame, text="Procurar...", command=lambda: self.browse_dir(self.align_output_dir_var)).grid(row=1, column=2, pady=(8, 0))
+
+        param_frame = ttk.LabelFrame(frame, text="Parâmetros de Warping", padding=10)
+        param_frame.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        param_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(param_frame, text="Método de Interpolação:").grid(row=0, column=0, sticky="w")
+        interp_combo = ttk.Combobox(
+            param_frame, 
+            textvariable=self.align_interpolation_var, 
+            values=["Nearest", "Bilinear", "Bicubic", "Lanczos"], 
+            width=15, 
+            state="readonly"
+        )
+        interp_combo.grid(row=0, column=1, padx=6, sticky="w")
+
+        ttk.Checkbutton(param_frame, text="Preservar Header FITS original", variable=self.align_keep_header_var).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Checkbutton(param_frame, text="Sobrescrever arquivos alinhados existentes no destino", variable=self.align_overwrite_var).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Checkbutton(param_frame, text="Dry-Run (simular alinhamento sem gravar no disco)", variable=self.align_dry_run_var).grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         action_frame = ttk.Frame(frame)
         action_frame.grid(row=2, column=0, sticky="ew", pady=(0, 10))
         action_frame.columnconfigure(0, weight=1)
 
-        self.btn_run_flow = ttk.Button(action_frame, text="▶ INICIAR ASTROFLOW", command=self.start_flow_processing)
-        self.btn_run_flow.grid(row=0, column=0, sticky="ew", ipady=6)
+        self.btn_run_align = ttk.Button(action_frame, text="▶ INICIAR ASTROALIGN", command=self.start_align_processing)
+        self.btn_run_align.grid(row=0, column=0, sticky="ew", ipady=6)
+        self.btn_cancel_align = ttk.Button(action_frame, text="■ CANCELAR", command=self.cancel_processing, state="disabled")
+        self.btn_cancel_align.grid(row=0, column=1, padx=(8, 0), ipady=6)
         
-        self.btn_viz_flow = ttk.Button(action_frame, text="📈 VISUALIZAR FLOW", command=self.show_flow_visualization)
-        self.btn_viz_flow.grid(row=0, column=1, padx=8, sticky="ew", ipady=6)
-
-        self.btn_cancel_flow = ttk.Button(action_frame, text="■ CANCELAR", command=self.cancel_processing, state="disabled")
-        self.btn_cancel_flow.grid(row=0, column=2, padx=(0, 0), ipady=6)
-
     def browse_dir(self, var: tk.StringVar):
         folder = filedialog.askdirectory()
         if folder: var.set(folder)
@@ -322,6 +377,7 @@ class AstroProcessManager(tk.Tk):
         
         self.btn_run_batch.configure(state="disabled")
         self.btn_run_flow.configure(state="disabled")
+        self.btn_run_align.configure(state="disabled")
         
         if module_name == "Batch":
             self.btn_cancel_batch.configure(state="normal")
@@ -329,12 +385,17 @@ class AstroProcessManager(tk.Tk):
         elif module_name == "Flow":
             self.btn_cancel_flow.configure(state="normal")
             self.status_var.set("Processando AstroFlow...")
+        elif module_name == "Align":
+            self.btn_cancel_align.configure(state="normal") 
+            self.status_var.set("Processando AstroAlign...")
 
     def _unlock_ui(self):
         self.btn_run_batch.configure(state="normal")
         self.btn_run_flow.configure(state="normal")
+        self.btn_run_align.configure(state="normal")
         self.btn_cancel_batch.configure(state="disabled")
         self.btn_cancel_flow.configure(state="disabled")
+        self.btn_cancel_align.configure(state="disabled")
 
     def start_batch_processing(self):
         if self.worker and self.worker.is_alive(): return
@@ -401,7 +462,77 @@ class AstroProcessManager(tk.Tk):
 
         self.worker = threading.Thread(target=self.run_flow_logic, args=(batch_dir, config), daemon=True)
         self.worker.start()
-
+    
+    def show_astroflow_preview(self):
+        """Abre uma janela pop-up com a pré-visualização da detecção de estrelas na âncora."""
+        base_dir_str = self.batch_dir_var.get()
+        if not base_dir_str:
+            return messagebox.showerror("Erro", "Selecione a Pasta Base das Batches primeiro.")
+            
+        base_dir = Path(base_dir_str).expanduser().resolve()
+        batch_folders = sorted([d for d in base_dir.iterdir() if d.is_dir() and "batch" in d.name.lower()])
+        
+        if not batch_folders:
+            return messagebox.showerror("Erro", "Nenhuma pasta de Batch encontrada na pasta base.")
+            
+        # Pega a primeira batch como referência para o preview
+        target_batch = batch_folders[0]
+        
+        config = {
+            "fwhm": self.flow_fwhm_var.get(),
+            "sigma": self.flow_sigma_var.get(),
+            "max_stars": 250
+        }
+        
+        from astroflow_logic import preview_star_detection
+        
+        try:
+            img_preview, count, fwhm_measured = preview_star_detection(target_batch, config)
+            if img_preview is None:
+                return messagebox.showwarning("Aviso", "Não foi possível carregar a imagem âncora para preview.")
+        except Exception as exc:
+            return messagebox.showerror("Erro", f"Falha ao gerar preview: {exc}")
+            
+        # Cria a janela Toplevel para exibir o resultado
+        prev_window = tk.Toplevel(self)
+        prev_window.title(f"Preview da Âncora ({target_batch.name})")
+        prev_window.geometry("650x600")
+        
+        info_label = ttk.Label(
+            prev_window, 
+            text=f"Batch: {target_batch.name} | Estrelas Detectadas: {count} | FWHM Base: {fwhm_measured:.1f}px", 
+            font=("Segoe UI", 10, "bold")
+        )
+        info_label.pack(pady=10)
+        
+        # Exibe a imagem usando Matplotlib embutido no Tkinter para facilitar o zoom/pan se necessário
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+        from matplotlib.figure import Figure
+        
+        fig = Figure(figsize=(5, 4), dpi=80)
+        ax = fig.add_subplot(111)
+        
+        # OpenCV usa BGR, convertemos para RGB para o Matplotlib exibir corretamente
+        ax.imshow(cv2.cvtColor(img_preview, cv2.COLOR_BGR2RGB))
+        ax.set_title("Detecção de Estrelas (DAOStarFinder)", color='white', fontsize=10)
+        ax.axis("off")
+        fig.tight_layout(pad=0.5)
+        
+        # Fundo escuro nativo para combinar com a UI sem overhead de reestilização complexa
+        fig.patch.set_facecolor('#1e1e1e')
+        ax.set_facecolor('#1e1e1e')
+        
+        canvas = FigureCanvasTkAgg(fig, master=prev_window)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        hint_label = ttk.Label(
+            prev_window, 
+            text="Dica: Feche esta janela, ajuste os valores de FWHM ou Sigma na aba e clique em Preview novamente para refinar.", 
+            font=("Segoe UI", 8, "italic")
+        )
+        hint_label.pack(pady=5)
+        
     def run_flow_logic(self, batch_dir: Path, config: dict):
         from astroflow_logic import process_all_flows
         try:
@@ -457,19 +588,19 @@ class AstroProcessManager(tk.Tk):
         viz_window.title("AstroFlow: Trajetória da Abóbada Celeste")
         viz_window.geometry("700x500")
         
-        fig = Figure(figsize=(6, 4), dpi=100)
+        fig = Figure(figsize=(6, 4), dpi=80)
         ax = fig.add_subplot(111)
-        ax.plot(points_x, points_y, marker='o', markersize=2, linestyle='-', color='cyan', alpha=0.6)
-        ax.scatter(points_x[0], points_y[0], color='green', s=50, label='Início', zorder=5)
-        ax.scatter(points_x[-1], points_y[-1], color='red', s=50, label='Fim', zorder=5)
+        ax.plot(points_x, points_y, marker='o', markersize=2, linestyle='-', color='cyan', alpha=0.6, rasterized=True)
+        ax.scatter(points_x[0], points_y[0], color='green', s=40, label='Início', zorder=5)
+        ax.scatter(points_x[-1], points_y[-1], color='red', s=40, label='Fim', zorder=5)
         
-        ax.set_title("Drift Analisado pelo AstroFlow")
-        ax.set_xlabel("Deslocamento X (pixels)")
-        ax.set_ylabel("Deslocamento Y (pixels)")
+        ax.set_title("Drift Analisado pelo AstroFlow", fontsize=10)
+        ax.set_xlabel("Deslocamento X (pixels)", fontsize=9)
+        ax.set_ylabel("Deslocamento Y (pixels)", fontsize=9)
         ax.invert_yaxis() 
-        ax.grid(True, linestyle='--', alpha=0.3)
-        ax.legend()
-        fig.tight_layout()
+        ax.grid(True, linestyle='--', alpha=0.2)
+        ax.legend(fontsize=8)
+        fig.tight_layout(pad=1.0)
 
         fig.patch.set_facecolor('#1e1e1e')
         ax.set_facecolor('#2d2d2d')
@@ -506,6 +637,53 @@ class AstroProcessManager(tk.Tk):
         if self.flow_global_master_var.get() not in valores_dropdown:
             self.flow_global_master_var.set("Auto")
 
+    def start_align_processing(self):
+        if self.worker and self.worker.is_alive(): return
+        
+        try:
+            base_dir = Path(self.batch_dir_var.get()).expanduser().resolve()
+            output_dir = Path(self.align_output_dir_var.get()).expanduser().resolve()
+            
+            if not base_dir.is_dir(): raise ValueError("A pasta base de batches não existe.")
+            if base_dir == output_dir: raise ValueError("A pasta de destino deve ser diferente da pasta base.")
+            
+            overwrite = self.align_overwrite_var.get()
+        except Exception as exc:
+            messagebox.showerror("Parâmetros inválidos", str(exc))
+            return
+            
+        self._lock_ui("Align")
+        self.worker = threading.Thread(target=self.run_align_logic, args=(base_dir, output_dir, overwrite), daemon=True)
+        self.worker.start()
+
+    def run_align_logic(self, base_dir: Path, output_dir: Path, overwrite: bool):
+        # Importação tardia (Lazy Import) para manter o startup instantâneo
+        from astroalign_logic import process_all_alignments
+        
+        config_dict = {
+            "interpolation": self.align_interpolation_var.get(),
+            "overwrite": overwrite,
+            "dry_run": self.align_dry_run_var.get(),
+            "keep_header": self.align_keep_header_var.get()
+        }
+        
+        try:
+            process_all_alignments(
+                base_dir, 
+                output_dir, 
+                config_dict, 
+                self.print_to_console, 
+                self.update_progress, 
+                self.cancel_event
+            )
+            status = "Cancelado." if self.cancel_event.is_set() else "AstroAlign Concluído com Sucesso!"
+            self.after(0, lambda: self.status_var.set(status))
+        except Exception as exc:
+            self.print_to_console(f"\nERRO FATAL NO ASTROALIGN: {exc}\n")
+            self.after(0, lambda: self.status_var.set("Erro no AstroAlign."))
+        finally:
+            self.after(0, self._unlock_ui)
+            
     def _on_close(self):
         if self.worker and self.worker.is_alive():
             if not messagebox.askyesno("Processamento ativo", "Processamento ativo. Sair mesmo assim?"):
