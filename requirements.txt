@@ -1,3 +1,6 @@
 numpy
 astropy
 pillow
+opencv-python-headless 
+photutils 
+scipy
