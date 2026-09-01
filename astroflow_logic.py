@@ -32,29 +32,47 @@ def split_cfa(data: np.ndarray, pattern: str):
     return data[0::2, 0::2], data[0::2, 1::2], data[1::2, 0::2], data[1::2, 1::2]
 
 def extract_luminance(data: np.ndarray, header: fits.Header) -> np.ndarray:
-    pattern = get_bayer_pattern(header)
-    if not pattern:
-        return data  # Mantém monocromático ou canais únicos puros
+    """Extrai luminância unificada. Suporta RGB, RAW CFA (Bayer) e Monocromático (BW)."""
+    
+    # CASO 1: Imagem já é RGB ou multi-canal (ndim == 3)
+    if data.ndim == 3:
+        # Se os canais estão no primeiro eixo (formato padrão FITS: Canais, H, W)
+        if data.shape[0] in (3, 4):
+            img_hwc = np.moveaxis(data, 0, -1)
+        else:
+            img_hwc = data
+            
+        # Ponderação Rec. 709 para gerar Luminância em tons de cinza a partir do RGB
+        l_sub = 0.2126 * img_hwc[:, :, 0] + 0.7152 * img_hwc[:, :, 1] + 0.0722 * img_hwc[:, :, 2]
+        return l_sub.astype(np.float32)
         
-    r, g1, g2, b = split_cfa(data, pattern)
-    
-    # Aplica a ponderação visual humana padrão sem misturar pixels de posições diferentes
-    l_sub = 0.2126 * r + 0.3576 * g1 + 0.3576 * g2 + 0.0722 * b
-    
-    # Realiza up-scale com "Nearest Neighbor" purista (np.repeat) para 
-    # manter as coordenadas x,y das estrelas rigorosamente fiéis à escala do sensor original
-    l_full = np.repeat(np.repeat(l_sub, 2, axis=0), 2, axis=1)
-    
-    return l_full.astype(np.float32)
+    # CASO 2: Imagem é 2D
+    elif data.ndim == 2:
+        pattern = get_bayer_pattern(header)
+        
+        # É uma imagem RAW Bayer CFA (ainda não demosaicizada)
+        if pattern:
+            r, g1, g2, b = split_cfa(data, pattern)
+            # Ponderação sem destruir as coordenadas físicas
+            l_sub = 0.2126 * r + 0.3576 * g1 + 0.3576 * g2 + 0.0722 * b
+            l_full = np.repeat(np.repeat(l_sub, 2, axis=0), 2, axis=1)
+            return l_full.astype(np.float32)
+            
+        # É uma imagem Monocromática pura (BW) sem filtro Bayer
+        else:
+            return data.astype(np.float32)
+            
+    raise ValueError(f"Dimensões de imagem não suportadas para luminância: {data.shape}")
 
 def load_fits_data(filepath: Path) -> tuple[np.ndarray, fits.Header]:
     with fits.open(filepath, memmap=False) as hdul:
         for hdu in hdul:
-            if hdu.is_image and hdu.data is not None and hdu.data.ndim == 2:
+            # Agora aceita ndim == 2 (RAW/Mono) ou ndim == 3 (RGB)
+            if hdu.is_image and hdu.data is not None and hdu.data.ndim in (2, 3):
                 header = hdu.header.copy()
                 data = np.asarray(hdu.data, dtype=np.float32)
                 return data, header
-    raise ValueError(f"Imagem 2D não encontrada em {filepath.name}")
+    raise ValueError(f"Imagem válida (2D ou 3D) não encontrada em {filepath.name}")
 
 def prepare_for_phase_correlation(data: np.ndarray) -> np.ndarray:
     """Prepara a imagem normalizada para o cv2.phaseCorrelate."""
