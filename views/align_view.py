@@ -1,7 +1,6 @@
 from tkinter import ttk
 
-from astroalign_logic import INTERPOLATION_MODES
-from views.base_view import BaseAstroView
+from .base_view import BaseAstroView
 
 
 class AlignView(BaseAstroView):
@@ -11,6 +10,7 @@ class AlignView(BaseAstroView):
         self._build_ui()
 
     def _build_ui(self):
+        # 1. Diretórios
         dirs = ttk.LabelFrame(
             self,
             text="Diretórios de alinhamento",
@@ -27,7 +27,6 @@ class AlignView(BaseAstroView):
             self.app.batch_dir_var,
             lambda: self.app.browse_dir(self.app.batch_dir_var),
         )
-
         self._path_row(
             dirs,
             1,
@@ -36,24 +35,140 @@ class AlignView(BaseAstroView):
             lambda: self.app.browse_dir(self.app.align_output_dir_var),
         )
 
-        params = ttk.LabelFrame(
+        # 2. Configurações de Debayer
+        debayer = ttk.LabelFrame(
             self,
-            text="Warping",
+            text="Debayer (Processamento In-Memory)",
             style="Section.TLabelframe",
             padding=12,
         )
-        params.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        debayer.grid(
+            row=1,
+            column=0,
+            sticky="ew",
+            pady=(0, 10),
+        )
 
-        ttk.Label(params, text="Interpolação:").grid(row=0, column=0, sticky="w")
+        debayer.columnconfigure(2, weight=1)
 
-        interp_values = list(INTERPOLATION_MODES)
-        if not interp_values:
-            interp_values = ["Nearest", "Bilinear", "Bicubic", "Lanczos"]
+        # --------------------------------------------------------
+        # Padrão Bayer
+        # --------------------------------------------------------
 
+        ttk.Label(
+            debayer,
+            text="Padrão Bayer:",
+        ).grid(
+            row=0,
+            column=0,
+            sticky="w",
+        )
+
+        ttk.Combobox(
+            debayer,
+            textvariable=self.app.align_debayer_pattern_var,
+            values=[
+                "Auto",
+                "RGGB",
+                "BGGR",
+                "GRBG",
+                "GBRG",
+                "Nenhum",
+            ],
+            state="readonly",
+            width=16,
+        ).grid(
+            row=0,
+            column=1,
+            sticky="w",
+            padx=8,
+        )
+
+        ttk.Label(
+            debayer,
+            text="Auto lê o padrão do Header FITS.",
+            style="Muted.TLabel",
+        ).grid(
+            row=0,
+            column=2,
+            sticky="w",
+        )
+
+        # --------------------------------------------------------
+        # Método de Debayer
+        # --------------------------------------------------------
+
+        ttk.Label(
+            debayer,
+            text="Método:",
+        ).grid(
+            row=1,
+            column=0,
+            sticky="w",
+            pady=(10, 0),
+        )
+
+        self.debayer_method_combo = ttk.Combobox(
+            debayer,
+            textvariable=self.app.align_debayer_method_var,
+            values=[
+                "Bilinear",
+                "VNG",
+                "Edge-Aware",
+            ],
+            state="readonly",
+            width=16,
+        )
+
+        self.debayer_method_combo.grid(
+            row=1,
+            column=1,
+            sticky="w",
+            padx=8,
+            pady=(10, 0),
+        )
+
+        def _update_debayer_controls(self, *_):
+            disabled = self.app.align_debayer_pattern_var.get() == "Nenhum"
+
+            self.debayer_method_combo.configure(
+                state="disabled" if disabled else "readonly"
+            )
+
+        self.app.align_debayer_pattern_var.trace_add(
+            "write",
+            _update_debayer_controls,
+        )
+
+        _update_debayer_controls(self)
+
+        ttk.Label(
+            debayer,
+            text="VNG/Edge-Aware preservam melhor detalhes, mas são mais lentos.",
+            style="Muted.TLabel",
+        ).grid(
+            row=1,
+            column=2,
+            sticky="w",
+            pady=(10, 0),
+        )
+
+        # 3. Warping e Armazenamento
+        params = ttk.LabelFrame(
+            self,
+            text="Warping e Armazenamento",
+            style="Section.TLabelframe",
+            padding=12,
+        )
+        params.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+
+        ttk.Label(params, text="Interpolação geométrica:").grid(
+            row=0, column=0, sticky="w"
+        )
         ttk.Combobox(
             params,
             textvariable=self.app.align_interpolation_var,
-            values=interp_values,
+            values=["Nearest", "Bilinear", "Bicubic", "Lanczos"],
             state="readonly",
             width=16,
         ).grid(row=0, column=1, sticky="w", padx=8)
@@ -66,23 +181,30 @@ class AlignView(BaseAstroView):
 
         ttk.Checkbutton(
             params,
-            text="Sobrescrever arquivos existentes",
+            text="Sobrescrever arquivos existentes no destino",
             variable=self.app.align_overwrite_var,
         ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(7, 0))
 
         ttk.Checkbutton(
             params,
-            text="Dry-Run (não gravar no disco)",
-            variable=self.app.align_dry_run_var,
+            text="Apagar batches CFA intermediários após alinhar (Limpeza de Disco)",
+            variable=self.app.align_delete_intermediates_var,
         ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(7, 0))
 
-        actions = ttk.Frame(self)
-        actions.grid(row=2, column=0, sticky="ew")
+        ttk.Checkbutton(
+            params,
+            text="Dry-Run (Simular processamento sem gravar no disco)",
+            variable=self.app.align_dry_run_var,
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(7, 0))
 
-        self.btn_run_align, self.btn_cancel_align = self._action_bar(
+        # 4. Ações
+        actions = ttk.Frame(self)
+        actions.grid(row=3, column=0, sticky="ew")
+
+        self.app.btn_run_align, self.app.btn_cancel_align = self._action_bar(
             actions,
             0,
             self.app.start_align_processing,
             self.app.cancel_processing,
-            "▶  INICIAR ASTROALIGN",
+            "▶ ALINHAMENTO",
         )
