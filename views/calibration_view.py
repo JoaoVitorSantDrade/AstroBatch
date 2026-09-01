@@ -1,6 +1,6 @@
 from tkinter import ttk
 
-from views.base_view import BaseAstroView
+from .base_view import BaseAstroView
 
 
 class CalibrationView(BaseAstroView):
@@ -19,7 +19,7 @@ class CalibrationView(BaseAstroView):
         self._description(
             intro,
             0,
-            "Calibre os LIGHTS antes do Debayer. Darks e Flats podem ser "
+            "Calibre os LIGHTS antes do Batch. Darks e Flats podem ser "
             "informados como uma pasta de frames ou como um Master já pronto.",
         )
 
@@ -30,6 +30,7 @@ class CalibrationView(BaseAstroView):
             self.app.calib_input_var,
             lambda: self.app.browse_dir(self.app.calib_input_var),
         )
+
         self._path_row(
             intro,
             2,
@@ -47,14 +48,17 @@ class CalibrationView(BaseAstroView):
         ttk.Checkbutton(
             dark, text="Aplicar Dark", variable=self.app.apply_dark_var
         ).grid(row=0, column=0, sticky="w")
+
         ttk.Entry(dark, textvariable=self.app.dark_path_var).grid(
             row=0, column=1, sticky="ew", padx=8
         )
+
         ttk.Button(
             dark,
             text="Arquivo...",
             command=lambda: self.app.browse_file_or_dir(self.app.dark_path_var),
         ).grid(row=0, column=2)
+
         ttk.Label(
             dark,
             text="Pasta = gerar Master Dark   •   Arquivo = usar como Master Dark",
@@ -70,14 +74,17 @@ class CalibrationView(BaseAstroView):
         ttk.Checkbutton(
             flat, text="Aplicar Flat", variable=self.app.apply_flat_var
         ).grid(row=0, column=0, sticky="w")
+
         ttk.Entry(flat, textvariable=self.app.flat_path_var).grid(
             row=0, column=1, sticky="ew", padx=8
         )
+
         ttk.Button(
             flat,
             text="Arquivo...",
             command=lambda: self.app.browse_file_or_dir(self.app.flat_path_var),
         ).grid(row=0, column=2)
+
         ttk.Label(
             flat,
             text="Pasta = gerar Master Flat   •   Arquivo = usar como Master Flat",
@@ -94,6 +101,7 @@ class CalibrationView(BaseAstroView):
             text="Gerar Masters automaticamente quando receber uma pasta",
             variable=self.app.calib_create_master_var,
         ).grid(row=0, column=0, sticky="w", pady=2)
+
         ttk.Checkbutton(
             options,
             text="Sobrescrever arquivos existentes",
@@ -103,11 +111,11 @@ class CalibrationView(BaseAstroView):
         actions = ttk.Frame(self)
         actions.grid(row=4, column=0, sticky="ew")
 
-        # As referências de botão vão para o app para que ele possa gerenciar o bloqueio de UI (lock/unlock)
+        # Correção Crítica: O retorno do botão agora é ancorado no self.app
         self.app.btn_run_calib, self.app.btn_cancel_calib = self._action_bar(
             actions,
             0,
             self.app.start_calibration,
             self.app.cancel_processing,
-            "▶  INICIAR CALIBRATION",
+            "▶  INICIAR CALIBRAÇÃO",
         )

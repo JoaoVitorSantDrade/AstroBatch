@@ -515,3 +515,8 @@ class FlowView(BaseAstroView):
 
         for column in range(4):
             self.reference_preview_inner.columnconfigure(column, weight=1)
+
+    def on_theme_changed(self, is_dark: bool):
+        """Atualiza widgets nativos do Tkinter que não herdam o ttk.Style automaticamente."""
+        if hasattr(self, "reference_preview_canvas") and self.reference_preview_canvas:
+            self.reference_preview_canvas.configure(background=self.app.BG)

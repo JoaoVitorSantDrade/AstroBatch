@@ -1,7 +1,8 @@
 from tkinter import ttk
 
 from batch_logic import RESAMPLE_MODES
-from views.base_view import BaseAstroView
+
+from .base_view import BaseAstroView
 
 
 class BatchView(BaseAstroView):
@@ -10,13 +11,13 @@ class BatchView(BaseAstroView):
         self.columnconfigure(0, weight=1)
         self._build_ui()
 
-    def _build_ui(self):
+        # Garante que os campos de Crop/Downsample iniciem com o estado correto
+        # assim que a UI for desenhada.
+        self.after(100, self.app.toggle_opt_options)
 
+    def _build_ui(self):
         dirs = ttk.LabelFrame(
-            self,
-            text="Diretórios",
-            style="Section.TLabelframe",
-            padding=12,
+            self, text="Diretórios", style="Section.TLabelframe", padding=12
         )
         dirs.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         dirs.columnconfigure(1, weight=1)
@@ -58,10 +59,10 @@ class BatchView(BaseAstroView):
         self.crop_frame.grid(row=0, column=1, sticky="w", padx=20)
 
         ttk.Label(self.crop_frame, text="Tamanho (px):").pack(side="left")
+
+        # Referência necessária pelo toggle_opt_options no main.py
         self.crop_entry = ttk.Entry(
-            self.crop_frame,
-            textvariable=self.app.crop_size_var,
-            width=10,
+            self.crop_frame, textvariable=self.app.crop_size_var, width=10
         )
         self.crop_entry.pack(side="left", padx=(7, 0))
 
@@ -78,10 +79,17 @@ class BatchView(BaseAstroView):
 
         ttk.Label(self.down_frame, text="Método:").pack(side="left")
 
+        # Lê os modos disponíveis dinamicamente do batch_logic
+        resample_values = (
+            list(RESAMPLE_MODES.keys())
+            if hasattr(RESAMPLE_MODES, "keys")
+            else list(RESAMPLE_MODES)
+        )
+
         self.down_combo = ttk.Combobox(
             self.down_frame,
             textvariable=self.app.downsample_method_var,
-            values=list(RESAMPLE_MODES),
+            values=resample_values,
             state="readonly",
             width=13,
         )
@@ -90,13 +98,9 @@ class BatchView(BaseAstroView):
         ttk.Label(self.down_frame, text="Escala:").pack(side="left", padx=(8, 0))
 
         self.down_scale_entry = ttk.Entry(
-            self.down_frame,
-            textvariable=self.app.downsample_scale_var,
-            width=8,
+            self.down_frame, textvariable=self.app.downsample_scale_var, width=8
         )
         self.down_scale_entry.pack(side="left", padx=7)
-
-        self.app.toggle_opt_options()
 
         params = ttk.LabelFrame(
             self,
@@ -107,16 +111,12 @@ class BatchView(BaseAstroView):
         params.grid(row=2, column=0, sticky="ew", pady=(0, 10))
 
         ttk.Label(params, text="Threshold (fator):").grid(row=0, column=0, sticky="w")
-        ttk.Entry(
-            params,
-            textvariable=self.app.threshold_var,
-            width=10,
-        ).grid(row=0, column=1, sticky="w", padx=8)
+        ttk.Entry(params, textvariable=self.app.threshold_var, width=10).grid(
+            row=0, column=1, sticky="w", padx=8
+        )
 
         ttk.Checkbutton(
-            params,
-            text="Copiar em vez de mover",
-            variable=self.app.copy_files_var,
+            params, text="Copiar em vez de mover", variable=self.app.copy_files_var
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         ttk.Checkbutton(
@@ -126,15 +126,14 @@ class BatchView(BaseAstroView):
         ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         ttk.Checkbutton(
-            params,
-            text="Dry-Run (não alterar arquivos)",
-            variable=self.app.dry_run_var,
+            params, text="Dry-Run (não alterar arquivos)", variable=self.app.dry_run_var
         ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         actions = ttk.Frame(self)
         actions.grid(row=3, column=0, sticky="ew")
 
-        self.btn_run_batch, self.btn_cancel_batch = self._action_bar(
+        # Correção Crítica: O retorno do botão agora é ancorado no self.app
+        self.app.btn_run_batch, self.app.btn_cancel_batch = self._action_bar(
             actions,
             0,
             self.app.start_batch_processing,

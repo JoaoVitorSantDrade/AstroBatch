@@ -8,6 +8,8 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
+import numpy as np
+
 # ============================================================
 # Imports da lógica de processamento
 # ============================================================
@@ -254,7 +256,7 @@ class AstroProcessManager(tk.Tk):
         )
         ttk.Label(
             header,
-            text="Calibração  →  Batch  →  Flow  →  Align (Debayer Integrado)",
+            text="Calibração  →  Batch  →  Flow  →  Align + Debayer",
             style="Subtitle.TLabel",
         ).grid(row=1, column=0, sticky="w", pady=(2, 0))
 
@@ -730,17 +732,376 @@ class AstroProcessManager(tk.Tk):
     # Funções de GUI Auxiliares (Preview, Chart, Combo Global Master)
     # --------------------------------------------------------
     def show_astroflow_preview(self):
-        # [Conteúdo idêntico mantido para brevidade]
-        pass
+        import cv2
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+        from matplotlib.figure import Figure
+
+        from astroflow_logic import preview_star_detection
+
+        base_dir_str = self.batch_dir_var.get()
+
+        if not base_dir_str:
+            messagebox.showerror(
+                "Erro", "Selecione a Pasta Base das Batches primeiro.", parent=self
+            )
+            return
+
+        base_dir = Path(base_dir_str).expanduser().resolve()
+
+        if not base_dir.is_dir():
+            messagebox.showerror("Erro", "A Pasta Base não existe.", parent=self)
+            return
+
+        batch_folders = sorted(
+            [d for d in base_dir.iterdir() if d.is_dir() and "batch" in d.name.lower()]
+        )
+
+        if not batch_folders:
+            messagebox.showerror(
+                "Erro", "Nenhuma pasta de Batch encontrada.", parent=self
+            )
+            return
+
+        target_batch = batch_folders[0]
+
+        config = {
+            "fwhm": self.flow_fwhm_var.get(),
+            "sigma": self.flow_sigma_var.get(),
+            "max_stars": 250,
+            "engine": self.flow_engine_var.get(),
+        }
+
+        try:
+            img_preview, count, fwhm_measured = preview_star_detection(
+                target_batch, config
+            )
+
+            if img_preview is None:
+                messagebox.showwarning(
+                    "Aviso",
+                    "Não foi possível carregar a imagem para preview.",
+                    parent=self,
+                )
+                return
+
+        except Exception as exc:
+            messagebox.showerror("Erro", f"Falha ao gerar preview:\n{exc}", parent=self)
+            return
+
+        prev_window = tk.Toplevel(self)
+        prev_window.title(f"AstroFlow — Preview — {target_batch.name}")
+        prev_window.geometry("850x700")
+        prev_window.minsize(650, 500)
+
+        info = ttk.Frame(prev_window, padding=12)
+        info.pack(fill=tk.X)
+
+        ttk.Label(
+            info,
+            text=(
+                f"{target_batch.name}   •   {count} estrelas   •   FWHM {fwhm_measured:.1f}px   •   Engine: {self.flow_engine_var.get()}"
+            ),
+            font=("Segoe UI Semibold", 10),
+        ).pack(anchor="w")
+
+        fig = Figure(figsize=(8, 5), dpi=90)
+        ax = fig.add_subplot(111)
+
+        if img_preview.ndim == 3:
+            ax.imshow(cv2.cvtColor(img_preview, cv2.COLOR_BGR2RGB))
+        else:
+            ax.imshow(img_preview, cmap="gray")
+
+        ax.set_title("Detecção de estrelas")
+        ax.axis("off")
+        fig.tight_layout(pad=0.5)
+
+        canvas = FigureCanvasTkAgg(fig, master=prev_window)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=12, pady=5)
+
+        ttk.Label(
+            prev_window,
+            text="Ajuste FWHM/Sigma na aba Flow e execute o preview novamente.",
+            style="Muted.TLabel",
+        ).pack(pady=(0, 10))
 
     def show_flow_visualization(self):
-        pass
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+        from matplotlib.figure import Figure
+
+        base_dir = Path(self.batch_dir_var.get()).expanduser().resolve()
+        global_json = base_dir / "global_flow.json"
+
+        if not global_json.exists():
+            messagebox.showerror(
+                "Erro",
+                "Execute o AstroFlow primeiro. global_flow.json não encontrado.",
+                parent=self,
+            )
+            return
+
+        try:
+            with global_json.open("r", encoding="utf-8") as f:
+                global_data = json.load(f)
+
+            points_x, points_y = [], []
+            center_pt = np.array([0, 0, 1])
+
+            for batch_name, g_info in global_data["batches"].items():
+                g_matrix = np.array(g_info["matrix"])
+                local_json = base_dir / batch_name / "flow_local.json"
+
+                if not local_json.exists():
+                    continue
+
+                with local_json.open("r", encoding="utf-8") as f:
+                    local_data = json.load(f)
+
+                for _, l_info in local_data["frames"].items():
+                    if l_info.get("status") == "rejected":
+                        continue
+
+                    l_matrix = np.array(l_info["matrix"])
+                    abs_matrix = np.dot(g_matrix, l_matrix)
+                    transformed_pt = np.dot(abs_matrix, center_pt)
+
+                    points_x.append(transformed_pt[0])
+                    points_y.append(transformed_pt[1])
+
+        except Exception as exc:
+            messagebox.showerror(
+                "Erro", f"Falha ao carregar os dados do Flow:\n{exc}", parent=self
+            )
+            return
+
+        if not points_x:
+            messagebox.showwarning(
+                "Aviso", "Nenhum ponto de trajetória foi encontrado.", parent=self
+            )
+            return
+
+        win = tk.Toplevel(self)
+        win.title("AstroFlow — Trajetória")
+        win.geometry("850x600")
+
+        fig = Figure(figsize=(8, 5), dpi=90)
+        ax = fig.add_subplot(111)
+
+        ax.plot(
+            points_x,
+            points_y,
+            marker="o",
+            markersize=2,
+            linestyle="-",
+            alpha=0.6,
+            rasterized=True,
+        )
+        ax.scatter(points_x[0], points_y[0], s=40, label="Início", zorder=5)
+        ax.scatter(points_x[-1], points_y[-1], s=40, label="Fim", zorder=5)
+
+        ax.set_title("Drift analisado pelo AstroFlow")
+        ax.set_xlabel("Deslocamento X (pixels)")
+        ax.set_ylabel("Deslocamento Y (pixels)")
+        ax.invert_yaxis()
+        ax.grid(True, linestyle="--", alpha=0.2)
+        ax.legend(fontsize=8)
+
+        fig.tight_layout()
+        canvas = FigureCanvasTkAgg(fig, master=win)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
     def open_anchor_selector(self, target_batch=None):
-        pass
+        import functools
+        import threading
+
+        import cv2
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+        from matplotlib.figure import Figure
+
+        from astroflow_logic import extract_luminance, load_fits_data
+
+        base_dir_str = self.batch_dir_var.get()
+        if not base_dir_str:
+            messagebox.showerror(
+                "Erro", "Selecione a Pasta Base primeiro.", parent=self
+            )
+            return
+
+        base_dir = Path(base_dir_str).expanduser().resolve()
+        if not base_dir.is_dir():
+            messagebox.showerror("Erro", "A Pasta Base não existe.", parent=self)
+            return
+
+        batch_folders = sorted(
+            [d for d in base_dir.iterdir() if d.is_dir() and "batch" in d.name.lower()]
+        )
+        if not batch_folders:
+            messagebox.showerror(
+                "Erro", "Nenhuma pasta de Batch encontrada.", parent=self
+            )
+            return
+
+        win = tk.Toplevel(self)
+        win.title("AstroFlow — Selecionar referência")
+        win.geometry("1000x800")
+        win.minsize(750, 600)
+
+        top = ttk.Frame(win, padding=12)
+        top.pack(fill=tk.X)
+        ttk.Label(top, text="Batch:").pack(side=tk.LEFT)
+
+        batch_combo = ttk.Combobox(
+            top, values=[b.name for b in batch_folders], state="readonly", width=18
+        )
+        batch_combo.pack(side=tk.LEFT, padx=(7, 15))
+
+        ttk.Label(top, text="Frame:").pack(side=tk.LEFT)
+        frame_combo = ttk.Combobox(top, state="readonly", width=34)
+        frame_combo.pack(side=tk.LEFT, padx=7)
+
+        image_frame = ttk.Frame(win, padding=(12, 0))
+        image_frame.pack(fill=tk.BOTH, expand=True)
+
+        fig = Figure(figsize=(8, 6), dpi=85)
+        ax = fig.add_subplot(111)
+        ax.axis("off")
+
+        ax_img = ax.imshow(
+            np.zeros((10, 10)),
+            cmap="gray",
+            interpolation="nearest",
+            rasterized=True,
+            vmin=0,
+            vmax=255,
+        )
+        title_obj = ax.set_title("Stretched Preview", fontsize=10)
+
+        canvas = FigureCanvasTkAgg(fig, master=image_frame)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        @functools.lru_cache(maxsize=40)
+        def get_preview_data(filepath):
+            data, header = load_fits_data(filepath)
+            l_data = extract_luminance(data, header)
+            h, w = l_data.shape[:2]
+            small_w, small_h = max(w // 3, 1), max(h // 3, 1)
+            return cv2.resize(
+                l_data, (small_w, small_h), interpolation=cv2.INTER_NEAREST
+            )
+
+        generation = {"id": 0}
+
+        def update_frames(event=None):
+            b_name = batch_combo.get()
+            if not b_name:
+                return
+            b_path = base_dir / b_name
+            fits_files = sorted(
+                [
+                    f.name
+                    for f in b_path.iterdir()
+                    if f.is_file() and f.suffix.lower() in {".fit", ".fits", ".fts"}
+                ]
+            )
+            frame_combo.configure(values=fits_files)
+            if fits_files:
+                selected = self.custom_anchors.get(
+                    b_name, fits_files[len(fits_files) // 2]
+                )
+                if selected not in fits_files:
+                    selected = fits_files[0]
+                frame_combo.set(selected)
+                update_image()
+
+        def update_image(event=None):
+            b_name = batch_combo.get()
+            f_name = frame_combo.get()
+            if not b_name or not f_name:
+                return
+
+            generation["id"] += 1
+            current_id = generation["id"]
+            batch_combo.configure(state="disabled")
+            frame_combo.configure(state="disabled")
+
+            def worker():
+                try:
+                    f_path = base_dir / b_name / f_name
+                    small_data = get_preview_data(f_path)
+                    median = np.median(small_data)
+                    p25, p75 = np.percentile(small_data, [25, 75])
+                    std = max((p75 - p25) / 1.35, 1e-5)
+                    vmin, vmax = median - 0.5 * std, median + 6.0 * std
+                    norm = (
+                        np.clip((small_data - vmin) / max(vmax - vmin, 1e-5), 0, 1)
+                        * 255
+                    )
+                    img_8u = norm.astype(np.uint8)
+
+                    def update_gui():
+                        if current_id != generation["id"]:
+                            return
+                        ax_img.set_data(img_8u)
+                        ax_img.set_extent((0, img_8u.shape[1], img_8u.shape[0], 0))
+                        title_obj.set_text(f"Stretched Preview — {b_name} / {f_name}")
+                        canvas.draw_idle()
+                        batch_combo.configure(state="readonly")
+                        frame_combo.configure(state="readonly")
+
+                    self.after(0, update_gui)
+                except Exception:
+
+                    def handle_error():
+                        batch_combo.configure(state="readonly")
+                        frame_combo.configure(state="readonly")
+                        self.print_to_console(f"[Preview] Erro: {exc}\n")
+
+                    self.after(0, handle_error)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        batch_combo.bind("<<ComboboxSelected>>", update_frames)
+        frame_combo.bind("<<ComboboxSelected>>", update_image)
+
+        if batch_folders:
+            if target_batch and target_batch in [b.name for b in batch_folders]:
+                batch_combo.set(target_batch)
+            else:
+                batch_combo.set(batch_folders[0].name)
+            update_frames()
+
+        buttons = ttk.Frame(win, padding=12)
+        buttons.pack(fill=tk.X)
+
+        def save_selection():
+            b_name, f_name = batch_combo.get(), frame_combo.get()
+            if not b_name or not f_name:
+                return
+            self.custom_anchors[b_name] = f_name
+            self.save_settings()
+            self.print_to_console(f"[AstroFlow] Referência da {b_name}: {f_name}\n")
+            self.refresh_flow_reference_preview()
+            messagebox.showinfo(
+                "Referência salva",
+                f"Frame definido como referência da {b_name}:\n\n{f_name}",
+                parent=win,
+            )
+
+        ttk.Button(
+            buttons,
+            text="✓  Definir como referência",
+            style="Accent.TButton",
+            command=save_selection,
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5), ipady=5)
+        ttk.Button(buttons, text="Fechar", command=win.destroy).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 0), ipady=5
+        )
 
     def _open_anchor_selector_for_batch(self, batch_name):
-        pass
+        self.open_anchor_selector(target_batch=batch_name)
 
     def _update_global_master_options(self, *args):
         if not hasattr(self, "tab_flow") or not hasattr(
