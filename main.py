@@ -1,19 +1,24 @@
 import json
 import queue
 import threading
-from pathlib import Path
 import tkinter as tk
+from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 import cv2
 import numpy as np
 
-
 # ============================================================
 # Imports da lógica de processamento
 # ============================================================
-from batch_logic import ProcessingConfig, RESAMPLE_MODES
-from astroalign_logic import INTERPOLATION_MODES
+from batch_logic import ProcessingConfig
+from views.align_view import AlignView
+from views.batch_view import BatchView
+
+# Importando as views separadas
+from views.calibration_view import CalibrationView
+from views.debayer_view import DebayerView
+from views.flow_view import FlowView
 
 
 class AstroProcessManager(tk.Tk):
@@ -55,7 +60,7 @@ class AstroProcessManager(tk.Tk):
         self.configure(bg=self.BG)
 
         self.log_queue = queue.Queue()
-        self.worker: threading.Thread | None = None
+        self.worker = None
         self.cancel_event = threading.Event()
         self.custom_anchors = {}
 
@@ -65,10 +70,12 @@ class AstroProcessManager(tk.Tk):
         self._create_widgets()
 
         self.after(50, self._drain_log_queue)
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        # Atualiza opções dependentes da pasta após a UI existir.
+        # Recuperados do arquivo original: Inicializa opções visuais assim que a GUI carregar
         self.after(100, self._update_global_master_options)
+        self.after(150, self.refresh_flow_reference_preview)
+
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ========================================================
     # Variáveis
@@ -279,7 +286,10 @@ class AstroProcessManager(tk.Tk):
         )
         style.map(
             "Accent.TButton",
-            background=[("active", self.ACCENT_ACTIVE), ("pressed", self.ACCENT_ACTIVE)],
+            background=[
+                ("active", self.ACCENT_ACTIVE),
+                ("pressed", self.ACCENT_ACTIVE),
+            ],
             foreground=[("disabled", "#aeb7c4"), ("!disabled", "white")],
         )
 
@@ -364,9 +374,7 @@ class AstroProcessManager(tk.Tk):
         global_frame.grid(row=1, column=0, sticky="ew", padx=22, pady=(0, 10))
         global_frame.columnconfigure(1, weight=1)
 
-        ttk.Label(global_frame, text="Pasta Base:").grid(
-            row=0, column=0, sticky="w"
-        )
+        ttk.Label(global_frame, text="Pasta Base:").grid(row=0, column=0, sticky="w")
 
         ttk.Entry(
             global_frame,
@@ -394,23 +402,18 @@ class AstroProcessManager(tk.Tk):
         self.notebook = ttk.Notebook(notebook_container)
         self.notebook.grid(row=0, column=0, sticky="nsew")
 
-        self.tab_calib = ttk.Frame(self.notebook, padding=18)
-        self.tab_debayer = ttk.Frame(self.notebook, padding=18)
-        self.tab_batch = ttk.Frame(self.notebook, padding=18)
-        self.tab_flow = ttk.Frame(self.notebook, padding=18)
-        self.tab_align = ttk.Frame(self.notebook, padding=18)
+        # INSTANCIANDO AS VIEWS
+        self.tab_calib = CalibrationView(self.notebook, app=self)
+        self.tab_debayer = DebayerView(self.notebook, app=self)
+        self.tab_batch = BatchView(self.notebook, app=self)
+        self.tab_flow = FlowView(self.notebook, app=self)
+        self.tab_align = AlignView(self.notebook, app=self)
 
         self.notebook.add(self.tab_calib, text="1  Calibration")
         self.notebook.add(self.tab_debayer, text="2  Debayer")
         self.notebook.add(self.tab_batch, text="3  Batch")
         self.notebook.add(self.tab_flow, text="4  Flow")
         self.notebook.add(self.tab_align, text="5  Align")
-
-        self._build_tab_calib()
-        self._build_tab_debayer()
-        self._build_tab_batch()
-        self._build_tab_flow()
-        self._build_tab_align()
 
         # Rodapé
         self._build_footer()
@@ -465,673 +468,10 @@ class AstroProcessManager(tk.Tk):
         )
         self.console_text.grid(row=0, column=0, sticky="ew")
 
-    # ========================================================
-    # Helpers visuais
-    # ========================================================
-
-    @staticmethod
-    def _configure_grid(frame, columns=3):
-        for col in range(columns):
-            frame.columnconfigure(col, weight=1 if col == 1 else 0)
-
-    def _path_row(self, parent, row, label, variable, browse_command, browse_text="Selecionar"):
-        ttk.Label(parent, text=label).grid(
-            row=row, column=0, sticky="w", pady=5
-        )
-        ttk.Entry(parent, textvariable=variable).grid(
-            row=row, column=1, sticky="ew", padx=8, pady=5
-        )
-        ttk.Button(
-            parent,
-            text=browse_text,
-            command=browse_command,
-        ).grid(row=row, column=2, pady=5)
-
-    def _action_bar(self, parent, row, run_command, cancel_command, run_text):
-        parent.columnconfigure(0, weight=1)
-
-        run_btn = ttk.Button(
-            parent,
-            text=run_text,
-            style="Accent.TButton",
-            command=run_command,
-        )
-        run_btn.grid(row=0, column=0, sticky="ew", ipady=5)
-
-        cancel_btn = ttk.Button(
-            parent,
-            text="Cancelar",
-            style="Danger.TButton",
-            command=cancel_command,
-            state="disabled",
-        )
-        cancel_btn.grid(row=0, column=1, padx=(8, 0), ipady=5)
-
-        return run_btn, cancel_btn
-
-    def _description(self, parent, row, text, columnspan=3):
-        ttk.Label(
-            parent,
-            text=text,
-            style="Muted.TLabel",
-            wraplength=820,
-            justify="left",
-        ).grid(
-            row=row,
-            column=0,
-            columnspan=columnspan,
-            sticky="w",
-            pady=(0, 10),
-        )
-
-    # ========================================================
-    # Calibration
-    # ========================================================
-
-    def _build_tab_calib(self):
-        frame = self.tab_calib
-        frame.columnconfigure(0, weight=1)
-
-        intro = ttk.LabelFrame(
-            frame,
-            text="Entrada e Saída",
-            style="Section.TLabelframe",
-            padding=12,
-        )
-        intro.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        intro.columnconfigure(1, weight=1)
-
-        self._description(
-            intro,
-            0,
-            "Calibre os LIGHTS antes do Debayer. Darks e Flats podem ser "
-            "informados como uma pasta de frames ou como um Master já pronto.",
-        )
-
-        self._path_row(
-            intro,
-            1,
-            "LIGHTS / RAW:",
-            self.calib_input_var,
-            lambda: self.browse_dir(self.calib_input_var),
-        )
-
-        self._path_row(
-            intro,
-            2,
-            "Saída calibrada:",
-            self.calib_output_var,
-            lambda: self.browse_dir(self.calib_output_var),
-        )
-
-        dark = ttk.LabelFrame(
-            frame,
-            text="Dark",
-            style="Section.TLabelframe",
-            padding=12,
-        )
-        dark.grid(row=1, column=0, sticky="ew", pady=(0, 10))
-        dark.columnconfigure(1, weight=1)
-
-        ttk.Checkbutton(
-            dark,
-            text="Aplicar Dark",
-            variable=self.apply_dark_var,
-        ).grid(row=0, column=0, sticky="w")
-
-        ttk.Entry(
-            dark,
-            textvariable=self.dark_path_var,
-        ).grid(row=0, column=1, sticky="ew", padx=8)
-
-        ttk.Button(
-            dark,
-            text="Arquivo...",
-            command=lambda: self.browse_file_or_dir(self.dark_path_var),
-        ).grid(row=0, column=2)
-
-        ttk.Label(
-            dark,
-            text="Pasta = gerar Master Dark   •   Arquivo = usar como Master Dark",
-            style="Muted.TLabel",
-        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(7, 0))
-
-        flat = ttk.LabelFrame(
-            frame,
-            text="Flat",
-            style="Section.TLabelframe",
-            padding=12,
-        )
-        flat.grid(row=2, column=0, sticky="ew", pady=(0, 10))
-        flat.columnconfigure(1, weight=1)
-
-        ttk.Checkbutton(
-            flat,
-            text="Aplicar Flat",
-            variable=self.apply_flat_var,
-        ).grid(row=0, column=0, sticky="w")
-
-        ttk.Entry(
-            flat,
-            textvariable=self.flat_path_var,
-        ).grid(row=0, column=1, sticky="ew", padx=8)
-
-        ttk.Button(
-            flat,
-            text="Arquivo...",
-            command=lambda: self.browse_file_or_dir(self.flat_path_var),
-        ).grid(row=0, column=2)
-
-        ttk.Label(
-            flat,
-            text="Pasta = gerar Master Flat   •   Arquivo = usar como Master Flat",
-            style="Muted.TLabel",
-        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(7, 0))
-
-        options = ttk.LabelFrame(
-            frame,
-            text="Opções",
-            style="Section.TLabelframe",
-            padding=12,
-        )
-        options.grid(row=3, column=0, sticky="ew", pady=(0, 10))
-
-        ttk.Checkbutton(
-            options,
-            text="Gerar Masters automaticamente quando receber uma pasta",
-            variable=self.calib_create_master_var,
-        ).grid(row=0, column=0, sticky="w", pady=2)
-
-        ttk.Checkbutton(
-            options,
-            text="Sobrescrever arquivos existentes",
-            variable=self.calib_overwrite_var,
-        ).grid(row=1, column=0, sticky="w", pady=2)
-
-        actions = ttk.Frame(frame)
-        actions.grid(row=4, column=0, sticky="ew")
-
-        self.btn_run_calib, self.btn_cancel_calib = self._action_bar(
-            actions,
-            0,
-            self.start_calibration,
-            self.cancel_processing,
-            "▶  INICIAR CALIBRATION",
-        )
-
-    # ========================================================
-    # Debayer
-    # ========================================================
-
-    def _build_tab_debayer(self):
-        frame = self.tab_debayer
-        frame.columnconfigure(0, weight=1)
-
-        dirs = ttk.LabelFrame(
-            frame,
-            text="Entrada e Saída",
-            style="Section.TLabelframe",
-            padding=12,
-        )
-        dirs.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        dirs.columnconfigure(1, weight=1)
-
-        self._description(
-            dirs,
-            0,
-            "Converta o mosaico Bayer monocromático calibrado em RGB antes "
-            "do AstroFlow/AstroAlign. Isso evita interpolar diretamente a "
-            "grade física Bayer durante o warping.",
-        )
-
-        self._path_row(
-            dirs,
-            1,
-            "Entrada calibrada:",
-            self.debayer_input_var,
-            lambda: self.browse_dir(self.debayer_input_var),
-        )
-
-        self._path_row(
-            dirs,
-            2,
-            "Saída RGB:",
-            self.debayer_output_var,
-            lambda: self.browse_dir(self.debayer_output_var),
-        )
-
-        params = ttk.LabelFrame(
-            frame,
-            text="Parâmetros do Debayer",
-            style="Section.TLabelframe",
-            padding=12,
-        )
-        params.grid(row=1, column=0, sticky="ew", pady=(0, 10))
-
-        ttk.Label(params, text="Padrão Bayer:").grid(
-            row=0, column=0, sticky="w", padx=(0, 8)
-        )
-
-        ttk.Combobox(
-            params,
-            textvariable=self.debayer_pattern_var,
-            values=["Auto", "RGGB", "BGGR", "GRBG", "GBRG"],
-            state="readonly",
-            width=14,
-        ).grid(row=0, column=1, sticky="w")
-
-        ttk.Label(params, text="Método:").grid(
-            row=0, column=2, sticky="w", padx=(35, 8)
-        )
-
-        ttk.Combobox(
-            params,
-            textvariable=self.debayer_method_var,
-            values=["Nearest", "Bilinear", "VNG", "Edge-Aware"],
-            state="readonly",
-            width=16,
-        ).grid(row=0, column=3, sticky="w")
-
-        ttk.Checkbutton(
-            params,
-            text="Sobrescrever arquivos existentes",
-            variable=self.debayer_overwrite_var,
-        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(10, 0))
-
-        actions = ttk.Frame(frame)
-        actions.grid(row=2, column=0, sticky="ew")
-
-        self.btn_run_debayer, self.btn_cancel_debayer = self._action_bar(
-            actions,
-            0,
-            self.start_debayer,
-            self.cancel_processing,
-            "▶  INICIAR DEBAYER",
-        )
-
-    # ========================================================
-    # Batch
-    # ========================================================
-
-    def _build_tab_batch(self):
-        frame = self.tab_batch
-        frame.columnconfigure(0, weight=1)
-
-        dirs = ttk.LabelFrame(
-            frame,
-            text="Diretórios",
-            style="Section.TLabelframe",
-            padding=12,
-        )
-        dirs.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        dirs.columnconfigure(1, weight=1)
-
-        self._path_row(
-            dirs,
-            0,
-            "Pasta origem:",
-            self.batch_input_dir_var,
-            lambda: self.browse_dir(self.batch_input_dir_var),
-        )
-
-        self._path_row(
-            dirs,
-            1,
-            "Pasta destino:",
-            self.batch_dir_var,
-            lambda: self.browse_dir(self.batch_dir_var),
-        )
-
-        opt = ttk.LabelFrame(
-            frame,
-            text="Otimização para análise",
-            style="Section.TLabelframe",
-            padding=12,
-        )
-        opt.grid(row=1, column=0, sticky="ew", pady=(0, 10))
-        opt.columnconfigure(1, weight=1)
-
-        ttk.Radiobutton(
-            opt,
-            text="Recorte central (Crop)",
-            variable=self.opt_method_var,
-            value="Crop",
-            command=self.toggle_opt_options,
-        ).grid(row=0, column=0, sticky="w")
-
-        self.crop_frame = ttk.Frame(opt)
-        self.crop_frame.grid(row=0, column=1, sticky="w", padx=20)
-
-        ttk.Label(self.crop_frame, text="Tamanho (px):").pack(side="left")
-        self.crop_entry = ttk.Entry(
-            self.crop_frame,
-            textvariable=self.crop_size_var,
-            width=10,
-        )
-        self.crop_entry.pack(side="left", padx=(7, 0))
-
-        ttk.Radiobutton(
-            opt,
-            text="Downsampling",
-            variable=self.opt_method_var,
-            value="Downsampling",
-            command=self.toggle_opt_options,
-        ).grid(row=1, column=0, sticky="w", pady=(8, 0))
-
-        self.down_frame = ttk.Frame(opt)
-        self.down_frame.grid(row=1, column=1, sticky="w", padx=20, pady=(8, 0))
-
-        ttk.Label(self.down_frame, text="Método:").pack(side="left")
-
-        self.down_combo = ttk.Combobox(
-            self.down_frame,
-            textvariable=self.downsample_method_var,
-            values=list(RESAMPLE_MODES),
-            state="readonly",
-            width=13,
-        )
-        self.down_combo.pack(side="left", padx=7)
-
-        ttk.Label(self.down_frame, text="Escala:").pack(side="left", padx=(8, 0))
-
-        self.down_scale_entry = ttk.Entry(
-            self.down_frame,
-            textvariable=self.downsample_scale_var,
-            width=8,
-        )
-        self.down_scale_entry.pack(side="left", padx=7)
-
-        self.toggle_opt_options()
-
-        params = ttk.LabelFrame(
-            frame,
-            text="Detecção e operação de arquivos",
-            style="Section.TLabelframe",
-            padding=12,
-        )
-        params.grid(row=2, column=0, sticky="ew", pady=(0, 10))
-
-        ttk.Label(params, text="Threshold (fator):").grid(
-            row=0, column=0, sticky="w"
-        )
-        ttk.Entry(
-            params,
-            textvariable=self.threshold_var,
-            width=10,
-        ).grid(row=0, column=1, sticky="w", padx=8)
-
-        ttk.Checkbutton(
-            params,
-            text="Copiar em vez de mover",
-            variable=self.copy_files_var,
-        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
-
-        ttk.Checkbutton(
-            params,
-            text="Sobrescrever arquivos existentes",
-            variable=self.batch_overwrite_var,
-        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
-
-        ttk.Checkbutton(
-            params,
-            text="Dry-Run (não alterar arquivos)",
-            variable=self.dry_run_var,
-        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
-
-        actions = ttk.Frame(frame)
-        actions.grid(row=3, column=0, sticky="ew")
-
-        self.btn_run_batch, self.btn_cancel_batch = self._action_bar(
-            actions,
-            0,
-            self.start_batch_processing,
-            self.cancel_processing,
-            "▶  INICIAR ASTROBATCH",
-        )
-
-    # ========================================================
-    # Flow
-    # ========================================================
-
-    def _build_tab_flow(self):
-        frame = self.tab_flow
-        frame.columnconfigure(0, weight=1)
-
-        params = ttk.LabelFrame(
-            frame,
-            text="Detecção e referência",
-            style="Section.TLabelframe",
-            padding=12,
-        )
-        params.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-
-        ttk.Label(params, text="Global Master:").grid(
-            row=0, column=0, sticky="w"
-        )
-
-        self.combo_global_master = ttk.Combobox(
-            params,
-            textvariable=self.flow_global_master_var,
-            values=["Auto"],
-            state="readonly",
-            width=16,
-        )
-        self.combo_global_master.grid(row=0, column=1, sticky="w", padx=8)
-
-        ttk.Label(params, text="Star Engine:").grid(
-            row=0, column=2, sticky="w", padx=(30, 8)
-        )
-
-        ttk.Combobox(
-            params,
-            textvariable=self.flow_engine_var,
-            values=["DAO", "OpenCV"],
-            state="readonly",
-            width=14,
-        ).grid(row=0, column=3, sticky="w")
-
-        ttk.Label(params, text="FWHM médio (px):").grid(
-            row=1, column=0, sticky="w", pady=(10, 0)
-        )
-        ttk.Entry(
-            params,
-            textvariable=self.flow_fwhm_var,
-            width=14,
-        ).grid(row=1, column=1, sticky="w", padx=8, pady=(10, 0))
-
-        ttk.Label(params, text="Sigma threshold:").grid(
-            row=1, column=2, sticky="w", padx=(30, 8), pady=(10, 0)
-        )
-        ttk.Entry(
-            params,
-            textvariable=self.flow_sigma_var,
-            width=14,
-        ).grid(row=1, column=3, sticky="w", pady=(10, 0))
-
-        ttk.Label(params, text="Raio de pareamento (px):").grid(
-            row=2, column=0, sticky="w", pady=(10, 0)
-        )
-        ttk.Entry(
-            params,
-            textvariable=self.flow_matching_radius_var,
-            width=14,
-        ).grid(row=2, column=1, sticky="w", padx=8, pady=(10, 0))
-
-        ttk.Label(params, text="RANSAC reprojection:").grid(
-            row=2, column=2, sticky="w", padx=(30, 8), pady=(10, 0)
-        )
-        ttk.Entry(
-            params,
-            textvariable=self.flow_ransac_var,
-            width=14,
-        ).grid(row=2, column=3, sticky="w", pady=(10, 0))
-
-        ttk.Label(params, text="Mínimo de estrelas:").grid(
-            row=3, column=0, sticky="w", pady=(10, 0)
-        )
-        ttk.Entry(
-            params,
-            textvariable=self.flow_min_stars_var,
-            width=14,
-        ).grid(row=3, column=1, sticky="w", padx=8, pady=(10, 0))
-
-        ttk.Label(params, text="Mínimo de inliers:").grid(
-            row=3, column=2, sticky="w", padx=(30, 8), pady=(10, 0)
-        )
-        ttk.Entry(
-            params,
-            textvariable=self.flow_min_inliers_var,
-            width=14,
-        ).grid(row=3, column=3, sticky="w", pady=(10, 0))
-
-        ttk.Label(params, text="Ratio mínimo de inliers:").grid(
-            row=4, column=0, sticky="w", pady=(10, 0)
-        )
-        ttk.Entry(
-            params,
-            textvariable=self.flow_min_ratio_var,
-            width=14,
-        ).grid(row=4, column=1, sticky="w", padx=8, pady=(10, 0))
-
-        ttk.Checkbutton(
-            params,
-            text="Gerar imagens de diagnóstico nas âncoras",
-            variable=self.flow_debug_var,
-        ).grid(row=5, column=0, columnspan=4, sticky="w", pady=(12, 0))
-
-        actions = ttk.Frame(frame)
-        actions.grid(row=1, column=0, sticky="ew", pady=(0, 10))
-
-        for col in range(5):
-            actions.columnconfigure(col, weight=1)
-
-        self.btn_select_anchor = ttk.Button(
-            actions,
-            text="🖼  Definir referência",
-            command=self.open_anchor_selector,
-        )
-        self.btn_select_anchor.grid(row=0, column=0, sticky="ew", ipady=5)
-
-        self.btn_preview_flow = ttk.Button(
-            actions,
-            text="🔍  Preview detecção",
-            command=self.show_astroflow_preview,
-        )
-        self.btn_preview_flow.grid(
-            row=0, column=1, sticky="ew", padx=6, ipady=5
-        )
-
-        self.btn_run_flow = ttk.Button(
-            actions,
-            text="▶  Iniciar AstroFlow",
-            style="Accent.TButton",
-            command=self.start_flow_processing,
-        )
-        self.btn_run_flow.grid(row=0, column=2, sticky="ew", ipady=5)
-
-        self.btn_viz_flow = ttk.Button(
-            actions,
-            text="📈  Visualizar",
-            command=self.show_flow_visualization,
-        )
-        self.btn_viz_flow.grid(
-            row=0, column=3, sticky="ew", padx=6, ipady=5
-        )
-
-        self.btn_cancel_flow = ttk.Button(
-            actions,
-            text="Cancelar",
-            style="Danger.TButton",
-            command=self.cancel_processing,
-            state="disabled",
-        )
-        self.btn_cancel_flow.grid(row=0, column=4, sticky="ew", ipady=5)
-
-    # ========================================================
-    # Align
-    # ========================================================
-
-    def _build_tab_align(self):
-        frame = self.tab_align
-        frame.columnconfigure(0, weight=1)
-
-        dirs = ttk.LabelFrame(
-            frame,
-            text="Diretórios de alinhamento",
-            style="Section.TLabelframe",
-            padding=12,
-        )
-        dirs.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        dirs.columnconfigure(1, weight=1)
-
-        self._path_row(
-            dirs,
-            0,
-            "Pasta base:",
-            self.batch_dir_var,
-            lambda: self.browse_dir(self.batch_dir_var),
-        )
-
-        self._path_row(
-            dirs,
-            1,
-            "Pasta destino:",
-            self.align_output_dir_var,
-            lambda: self.browse_dir(self.align_output_dir_var),
-        )
-
-        params = ttk.LabelFrame(
-            frame,
-            text="Warping",
-            style="Section.TLabelframe",
-            padding=12,
-        )
-        params.grid(row=1, column=0, sticky="ew", pady=(0, 10))
-
-        ttk.Label(params, text="Interpolação:").grid(
-            row=0, column=0, sticky="w"
-        )
-
-        interp_values = list(INTERPOLATION_MODES)
-        if not interp_values:
-            interp_values = ["Nearest", "Bilinear", "Bicubic", "Lanczos"]
-
-        ttk.Combobox(
-            params,
-            textvariable=self.align_interpolation_var,
-            values=interp_values,
-            state="readonly",
-            width=16,
-        ).grid(row=0, column=1, sticky="w", padx=8)
-
-        ttk.Checkbutton(
-            params,
-            text="Preservar Header FITS original",
-            variable=self.align_keep_header_var,
-        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 0))
-
-        ttk.Checkbutton(
-            params,
-            text="Sobrescrever arquivos existentes",
-            variable=self.align_overwrite_var,
-        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(7, 0))
-
-        ttk.Checkbutton(
-            params,
-            text="Dry-Run (não gravar no disco)",
-            variable=self.align_dry_run_var,
-        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(7, 0))
-
-        actions = ttk.Frame(frame)
-        actions.grid(row=2, column=0, sticky="ew")
-
-        self.btn_run_align, self.btn_cancel_align = self._action_bar(
-            actions,
-            0,
-            self.start_align_processing,
-            self.cancel_processing,
-            "▶  INICIAR ASTROALIGN",
-        )
+    def refresh_flow_reference_preview(self):
+        # Facilita a chamada remota para atualizar a UI do AstroFlow
+        if hasattr(self, "tab_flow"):
+            self.tab_flow.refresh_reference_preview()
 
     # ========================================================
     # Arquivos / diretórios
@@ -1141,6 +481,10 @@ class AstroProcessManager(tk.Tk):
         folder = filedialog.askdirectory(parent=self)
         if folder:
             var.set(folder)
+            # Aciona as atualizações visuais se o diretório base for alterado
+            if var == self.batch_dir_var:
+                self._update_global_master_options()
+                self.refresh_flow_reference_preview()
 
     def browse_file(self, var):
         path = filedialog.askopenfilename(
@@ -1156,7 +500,6 @@ class AstroProcessManager(tk.Tk):
     def browse_file_or_dir(self, var):
         """
         Permite escolher tanto uma pasta quanto um arquivo.
-
         Primeiro tenta pasta; se cancelado, permite selecionar arquivo.
         """
         folder = filedialog.askdirectory(parent=self)
@@ -1187,6 +530,15 @@ class AstroProcessManager(tk.Tk):
                         except (tk.TclError, ValueError, TypeError):
                             pass
 
+            custom_anchors = data.get("AstroFlow", {}).get("custom_anchors", {})
+
+            if isinstance(custom_anchors, dict):
+                self.custom_anchors = {
+                    str(batch): str(frame) for batch, frame in custom_anchors.items()
+                }
+            else:
+                self.custom_anchors = {}
+
         except Exception as exc:
             self.print_to_console(
                 f"[Config] Não foi possível carregar configurações: {exc}\n"
@@ -1203,28 +555,42 @@ class AstroProcessManager(tk.Tk):
                 except Exception:
                     pass
 
+        # --------------------------------------------
+        # AstroFlow: referências personalizadas
+        # --------------------------------------------
+        data.setdefault("AstroFlow", {})
+        data["AstroFlow"]["custom_anchors"] = dict(self.custom_anchors)
+
         try:
             with self.CONFIG_FILE.open("w", encoding="utf-8") as f:
-                json.dump(data, f, indent=4, ensure_ascii=False)
+                json.dump(
+                    data,
+                    f,
+                    indent=4,
+                    ensure_ascii=False,
+                )
         except Exception as exc:
             self.print_to_console(
                 f"[Config] Não foi possível salvar configurações: {exc}\n"
             )
 
     def toggle_opt_options(self):
+        # Corrigido: Encontra a referência correta das variáveis visuais na BatchView
         is_crop = self.opt_method_var.get() == "Crop"
 
-        self.crop_entry.configure(
-            state="normal" if is_crop else "disabled"
-        )
-
-        self.down_combo.configure(
-            state="disabled" if is_crop else "readonly"
-        )
-
-        self.down_scale_entry.configure(
-            state="disabled" if is_crop else "normal"
-        )
+        if hasattr(self, "tab_batch"):
+            try:
+                self.tab_batch.crop_entry.configure(
+                    state="normal" if is_crop else "disabled"
+                )
+                self.tab_batch.down_combo.configure(
+                    state="disabled" if is_crop else "readonly"
+                )
+                self.tab_batch.down_scale_entry.configure(
+                    state="disabled" if is_crop else "normal"
+                )
+            except AttributeError:
+                pass  # Prevenção caso a view ainda não esteja completamente instanciada
 
     # ========================================================
     # Console / progresso
@@ -1292,7 +658,8 @@ class AstroProcessManager(tk.Tk):
         ]
 
         for button in buttons:
-            button.configure(state="disabled")
+            if hasattr(button, "configure"):
+                button.configure(state="disabled")
 
         cancel_buttons = [
             self.btn_cancel_calib,
@@ -1303,7 +670,8 @@ class AstroProcessManager(tk.Tk):
         ]
 
         for button in cancel_buttons:
-            button.configure(state="disabled")
+            if hasattr(button, "configure"):
+                button.configure(state="disabled")
 
         cancel_map = {
             "Calibration": self.btn_cancel_calib,
@@ -1313,7 +681,7 @@ class AstroProcessManager(tk.Tk):
             "Align": self.btn_cancel_align,
         }
 
-        if module_name in cancel_map:
+        if module_name in cancel_map and hasattr(cancel_map[module_name], "configure"):
             cancel_map[module_name].configure(state="normal")
 
         self.status_var.set(f"Processando Astro{module_name}...")
@@ -1328,7 +696,8 @@ class AstroProcessManager(tk.Tk):
         ]
 
         for button in buttons:
-            button.configure(state="normal")
+            if hasattr(button, "configure"):
+                button.configure(state="normal")
 
         cancel_buttons = [
             self.btn_cancel_calib,
@@ -1339,7 +708,8 @@ class AstroProcessManager(tk.Tk):
         ]
 
         for button in cancel_buttons:
-            button.configure(state="disabled")
+            if hasattr(button, "configure"):
+                button.configure(state="disabled")
 
         self.progress_var.set(100)
 
@@ -1350,8 +720,6 @@ class AstroProcessManager(tk.Tk):
     def start_calibration(self):
         if self.worker and self.worker.is_alive():
             return
-
-        from calibration_logic import run_calibration_pipeline
 
         try:
             input_dir = Path(self.calib_input_var.get()).expanduser().resolve()
@@ -1412,9 +780,7 @@ class AstroProcessManager(tk.Tk):
             self.after(0, lambda: self.status_var.set(status))
 
         except Exception as exc:
-            self.print_to_console(
-                f"\nERRO FATAL NO ASTROCALIBRATION:\n{exc}\n"
-            )
+            self.print_to_console(f"\nERRO FATAL NO ASTROCALIBRATION:\n{exc}\n")
             self.after(
                 0,
                 lambda: self.status_var.set("Erro no AstroCalibration."),
@@ -1429,8 +795,6 @@ class AstroProcessManager(tk.Tk):
     def start_debayer(self):
         if self.worker and self.worker.is_alive():
             return
-
-        from debayer_logic import process_debayer
 
         try:
             input_dir = Path(self.debayer_input_var.get()).expanduser().resolve()
@@ -1482,9 +846,7 @@ class AstroProcessManager(tk.Tk):
             self.after(0, lambda: self.status_var.set(status))
 
         except Exception as exc:
-            self.print_to_console(
-                f"\nERRO FATAL NO ASTRODEBAYER:\n{exc}\n"
-            )
+            self.print_to_console(f"\nERRO FATAL NO ASTRODEBAYER:\n{exc}\n")
             self.after(
                 0,
                 lambda: self.status_var.set("Erro no AstroDebayer."),
@@ -1501,21 +863,14 @@ class AstroProcessManager(tk.Tk):
             return
 
         try:
-            input_dir = Path(
-                self.batch_input_dir_var.get()
-            ).expanduser().resolve()
-
-            output_dir = Path(
-                self.batch_dir_var.get()
-            ).expanduser().resolve()
+            input_dir = Path(self.batch_input_dir_var.get()).expanduser().resolve()
+            output_dir = Path(self.batch_dir_var.get()).expanduser().resolve()
 
             if not input_dir.is_dir():
                 raise ValueError("A pasta de origem não existe.")
 
             if input_dir == output_dir:
-                raise ValueError(
-                    "A pasta de destino deve ser diferente da origem."
-                )
+                raise ValueError("A pasta de destino deve ser diferente da origem.")
 
             config = ProcessingConfig(
                 input_dir=input_dir,
@@ -1562,16 +917,13 @@ class AstroProcessManager(tk.Tk):
                 status = f"Batch cancelado. {processed} processados."
             else:
                 status = (
-                    f"AstroBatch concluído. "
-                    f"{processed} processados, {batches} batches."
+                    f"AstroBatch concluído. {processed} processados, {batches} batches."
                 )
 
             self.after(0, lambda: self.status_var.set(status))
 
         except Exception as exc:
-            self.print_to_console(
-                f"\nERRO FATAL NO ASTROBATCH:\n{exc}\n"
-            )
+            self.print_to_console(f"\nERRO FATAL NO ASTROBATCH:\n{exc}\n")
             self.after(
                 0,
                 lambda: self.status_var.set("Erro no AstroBatch."),
@@ -1587,9 +939,7 @@ class AstroProcessManager(tk.Tk):
         if self.worker and self.worker.is_alive():
             return
 
-        batch_dir = Path(
-            self.batch_dir_var.get()
-        ).expanduser().resolve()
+        batch_dir = Path(self.batch_dir_var.get()).expanduser().resolve()
 
         if not batch_dir.is_dir():
             messagebox.showerror(
@@ -1644,9 +994,7 @@ class AstroProcessManager(tk.Tk):
             self.after(0, lambda: self.status_var.set(status))
 
         except Exception as exc:
-            self.print_to_console(
-                f"\nERRO FATAL NO ASTROFLOW:\n{exc}\n"
-            )
+            self.print_to_console(f"\nERRO FATAL NO ASTROFLOW:\n{exc}\n")
             self.after(
                 0,
                 lambda: self.status_var.set("Erro no AstroFlow."),
@@ -1663,21 +1011,14 @@ class AstroProcessManager(tk.Tk):
             return
 
         try:
-            base_dir = Path(
-                self.batch_dir_var.get()
-            ).expanduser().resolve()
-
-            output_dir = Path(
-                self.align_output_dir_var.get()
-            ).expanduser().resolve()
+            base_dir = Path(self.batch_dir_var.get()).expanduser().resolve()
+            output_dir = Path(self.align_output_dir_var.get()).expanduser().resolve()
 
             if not base_dir.is_dir():
                 raise ValueError("A pasta base de batches não existe.")
 
             if base_dir == output_dir:
-                raise ValueError(
-                    "A pasta de destino deve ser diferente da pasta base."
-                )
+                raise ValueError("A pasta de destino deve ser diferente da pasta base.")
 
             config = {
                 "interpolation": self.align_interpolation_var.get(),
@@ -1724,9 +1065,7 @@ class AstroProcessManager(tk.Tk):
             self.after(0, lambda: self.status_var.set(status))
 
         except Exception as exc:
-            self.print_to_console(
-                f"\nERRO FATAL NO ASTROALIGN:\n{exc}\n"
-            )
+            self.print_to_console(f"\nERRO FATAL NO ASTROALIGN:\n{exc}\n")
             self.after(
                 0,
                 lambda: self.status_var.set("Erro no AstroAlign."),
@@ -1760,11 +1099,7 @@ class AstroProcessManager(tk.Tk):
             return
 
         batch_folders = sorted(
-            [
-                d
-                for d in base_dir.iterdir()
-                if d.is_dir() and "batch" in d.name.lower()
-            ]
+            [d for d in base_dir.iterdir() if d.is_dir() and "batch" in d.name.lower()]
         )
 
         if not batch_folders:
@@ -1862,17 +1197,14 @@ class AstroProcessManager(tk.Tk):
     # ========================================================
 
     def show_flow_visualization(self):
-        base_dir = Path(
-            self.batch_dir_var.get()
-        ).expanduser().resolve()
+        base_dir = Path(self.batch_dir_var.get()).expanduser().resolve()
 
         global_json = base_dir / "global_flow.json"
 
         if not global_json.exists():
             messagebox.showerror(
                 "Erro",
-                "Execute o AstroFlow primeiro. "
-                "global_flow.json não encontrado.",
+                "Execute o AstroFlow primeiro. global_flow.json não encontrado.",
                 parent=self,
             )
             return
@@ -1979,13 +1311,14 @@ class AstroProcessManager(tk.Tk):
     # AstroFlow: seletor de âncora
     # ========================================================
 
-    def open_anchor_selector(self):
+    def open_anchor_selector(self, target_batch=None):
         import functools
         import threading
 
         from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
         from matplotlib.figure import Figure
-        from astroflow_logic import load_fits_data, extract_luminance
+
+        from astroflow_logic import extract_luminance, load_fits_data
 
         base_dir_str = self.batch_dir_var.get()
 
@@ -2008,11 +1341,7 @@ class AstroProcessManager(tk.Tk):
             return
 
         batch_folders = sorted(
-            [
-                d
-                for d in base_dir.iterdir()
-                if d.is_dir() and "batch" in d.name.lower()
-            ]
+            [d for d in base_dir.iterdir() if d.is_dir() and "batch" in d.name.lower()]
         )
 
         if not batch_folders:
@@ -2103,8 +1432,7 @@ class AstroProcessManager(tk.Tk):
                 [
                     f.name
                     for f in b_path.iterdir()
-                    if f.is_file()
-                    and f.suffix.lower() in {".fit", ".fits", ".fts"}
+                    if f.is_file() and f.suffix.lower() in {".fit", ".fits", ".fts"}
                 ]
             )
 
@@ -2156,11 +1484,14 @@ class AstroProcessManager(tk.Tk):
 
                     denominator = max(vmax - vmin, 1e-5)
 
-                    norm = np.clip(
-                        (small_data - vmin) / denominator,
-                        0,
-                        1,
-                    ) * 255
+                    norm = (
+                        np.clip(
+                            (small_data - vmin) / denominator,
+                            0,
+                            1,
+                        )
+                        * 255
+                    )
 
                     img_8u = norm.astype(np.uint8)
 
@@ -2178,9 +1509,7 @@ class AstroProcessManager(tk.Tk):
                             )
                         )
 
-                        title_obj.set_text(
-                            f"Stretched Preview — {b_name} / {f_name}"
-                        )
+                        title_obj.set_text(f"Stretched Preview — {b_name} / {f_name}")
 
                         canvas.draw_idle()
 
@@ -2189,13 +1518,12 @@ class AstroProcessManager(tk.Tk):
 
                     self.after(0, update_gui)
 
-                except Exception as exc:
+                except Exception:  # Corrigido: Captura explícita da Exceção
+
                     def handle_error():
                         batch_combo.configure(state="readonly")
                         frame_combo.configure(state="readonly")
-                        self.print_to_console(
-                            f"[Preview] Erro: {exc}\n"
-                        )
+                        self.print_to_console(f"[Preview] Erro: {exc}\n")
 
                     self.after(0, handle_error)
 
@@ -2215,7 +1543,11 @@ class AstroProcessManager(tk.Tk):
         )
 
         if batch_folders:
-            batch_combo.set(batch_folders[0].name)
+            if target_batch and target_batch in [b.name for b in batch_folders]:
+                batch_combo.set(target_batch)
+            else:
+                batch_combo.set(batch_folders[0].name)
+
             update_frames()
 
         buttons = ttk.Frame(win, padding=12)
@@ -2230,9 +1562,14 @@ class AstroProcessManager(tk.Tk):
 
             self.custom_anchors[b_name] = f_name
 
-            self.print_to_console(
-                f"[AstroFlow] Referência da {b_name}: {f_name}\n"
-            )
+            # Persiste a nova referência.
+            self.save_settings()
+
+            self.print_to_console(f"[AstroFlow] Referência da {b_name}: {f_name}\n")
+
+            # Corrigido: Apagado self.refresh_reference_preview() fantasma que causaria crash
+            # Chama o método delegado para a aba do AstroFlow
+            self.refresh_flow_reference_preview()
 
             messagebox.showinfo(
                 "Referência salva",
@@ -2253,21 +1590,29 @@ class AstroProcessManager(tk.Tk):
             command=win.destroy,
         ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 0), ipady=5)
 
+    def _open_anchor_selector_for_batch(self, batch_name):
+        """
+        Abre o seletor de referência já posicionado no Batch
+        clicado no Grid.
+        """
+        self.open_anchor_selector(target_batch=batch_name)
+
     # ========================================================
     # Global Master
     # ========================================================
 
     def _update_global_master_options(self, *args):
-        if not hasattr(self, "combo_global_master"):
+        # Corrigido: Procura a combobox no local correto (dentro da View de Flow)
+        if not hasattr(self, "tab_flow") or not hasattr(
+            self.tab_flow, "combo_global_master"
+        ):
             return
 
         base_dir_str = self.batch_dir_var.get()
         values = ["Auto"]
 
         if base_dir_str:
-            base_dir = Path(
-                base_dir_str
-            ).expanduser().resolve()
+            base_dir = Path(base_dir_str).expanduser().resolve()
 
             if base_dir.is_dir():
                 try:
@@ -2275,15 +1620,14 @@ class AstroProcessManager(tk.Tk):
                         [
                             d.name
                             for d in base_dir.iterdir()
-                            if d.is_dir()
-                            and "batch" in d.name.lower()
+                            if d.is_dir() and "batch" in d.name.lower()
                         ]
                     )
                     values.extend(batches)
                 except OSError:
                     pass
 
-        self.combo_global_master["values"] = values
+        self.tab_flow.combo_global_master["values"] = values
 
         if self.flow_global_master_var.get() not in values:
             self.flow_global_master_var.set("Auto")
@@ -2294,9 +1638,7 @@ class AstroProcessManager(tk.Tk):
 
     def cancel_processing(self):
         if self.worker and self.worker.is_alive():
-            self.print_to_console(
-                "\n[GUI] Solicitação de cancelamento enviada...\n"
-            )
+            self.print_to_console("\n[GUI] Solicitação de cancelamento enviada...\n")
             self.cancel_event.set()
             self.status_var.set("Cancelamento solicitado...")
 

@@ -89,86 +89,122 @@ def calculate_anchor_quality(star_count: int, fwhm: float) -> float:
         return float(star_count)
     return float(star_count) / float(fwhm)
 
-def detect_stars_opencv(data: np.ndarray, fwhm: float, sigma: float, max_stars: int) -> tuple[np.ndarray, float, dict]:
-    """Motor ultrarrápido utilizando Visão Computacional bruta do OpenCV e Momentos de Imagem."""
-    mean, median, std = sigma_clipped_stats(data, sigma=3.0)
-    
-    if not np.isfinite(std) or std <= 0:
-        return np.empty((0, 2), dtype=np.float32), 0.0, {"star_count": 0, "mean": 0.0, "median": 0.0, "std": 0.0, "fwhm": 0.0}
-
-    # Limiar rigoroso para isolar as fontes de luz
-    thresh_val = median + (sigma * std)
-    binary_mask = (data > thresh_val).astype(np.uint8)
-
-    # Identifica componentes conectados (muito mais rápido que findContours)
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_mask, connectivity=8)
-
-    pts = []
-    brightness = []
-    
-    # Raio da caixa limitadora para cálculo do centroide sub-pixel
-    r = int(max(2, fwhm))
-    h, w = data.shape
-
-    for i in range(1, num_labels):
-        area = stats[i, cv2.CC_STAT_AREA]
-        
-        # Filtra ruídos de 1 pixel e bolhas massivas
-        if 4 < area < (fwhm * fwhm * 15):
-            cx, cy = centroids[i]
-            ix, iy = int(cx), int(cy)
-            
-            # Recorta a vizinhança da estrela para calcular o centro de massa exato (precisão sub-pixel)
-            y0, y1 = max(0, iy - r), min(h, iy + r + 1)
-            x0, x1 = max(0, ix - r), min(w, ix + r + 1)
-            
-            patch = data[y0:y1, x0:x1] - median
-            patch[patch < 0] = 0
-            
-            M = cv2.moments(patch)
-            if M["m00"] > 0:
-                px = M["m10"] / M["m00"]
-                py = M["m01"] / M["m00"]
-                pts.append([x0 + px, y0 + py])
-                brightness.append(M["m00"]) # Usa o fluxo de massa como brilho
-            else:
-                pts.append([cx, cy])
-                brightness.append(area)
-
-    if len(pts) == 0:
-        return np.empty((0, 2), dtype=np.float32), float(fwhm), {"star_count": 0, "mean": float(mean), "median": float(median), "std": float(std), "fwhm": float(fwhm)}
-
-    pts = np.array(pts, dtype=np.float32)
-    brightness = np.array(brightness, dtype=np.float32)
-
-    # Ordena mantendo apenas as N estrelas mais brilhantes
-    sort_idx = np.argsort(brightness)[::-1][:max_stars]
-    pts = pts[sort_idx]
-
-    metrics = {"star_count": len(pts), "mean": float(mean), "median": float(median), "std": float(std), "fwhm": float(fwhm)}
-    return pts, float(fwhm), metrics
-
-
 def detect_stars_dao(data: np.ndarray, fwhm: float, sigma: float, max_stars: int) -> tuple[np.ndarray, float, dict]:
-    """Motor original altamente rigoroso utilizando Astropy/Photutils."""
-    mean, median, std = sigma_clipped_stats(data, sigma=3.0)
+    mean_val = float(np.mean(data))
+    median_val = float(np.median(data))
+    std_val = float(np.std(data))
+    
+    # Isola o background usando sigma clipping
+    _, bkg_median, bkg_std = sigma_clipped_stats(data, sigma=3.0)
+    bkg_median = float(bkg_median)
+    bkg_std = float(bkg_std)
+    
+    # Aplica os argumentos recebidos no DAOStarFinder
+    daofind = DAOStarFinder(fwhm=fwhm, threshold=sigma * bkg_std)
+    sources = daofind(data - bkg_median)
+    
+    if sources is not None and len(sources) > 0:
+        # Ordena pelo pico de fluxo (as mais brilhantes primeiro) e limita ao max_stars
+        sources.sort('flux')
+        sources.reverse()
+        sources = sources[:max_stars]
+        
+        # Extrai coordenadas como np.ndarray [[x1, y1], [x2, y2], ...]
+        coords = np.transpose((sources['xcentroid'], sources['ycentroid']))
+        
+        fluxes = sources['flux']
+        current_fwhm = float(np.mean(sources['sharpness']) * fwhm) if 'sharpness' in sources.colnames else fwhm
+        
+        star_count = len(sources)
+        min_flux = float(np.min(fluxes))
+        max_flux = float(np.max(fluxes))
+        snr = float(np.mean(fluxes) / bkg_std) if bkg_std > 0 else 0.0
+    else:
+        coords = np.empty((0, 2))
+        current_fwhm = 0.0
+        star_count = 0
+        min_flux = 0.0
+        max_flux = 0.0
+        snr = 0.0
+        
+    # Condição de validação rigorosa com base no FWHM esperado
+    valid = bool(star_count > 10 and current_fwhm < (fwhm * 2.0))
+    
+    metrics = {
+        "star_count": star_count,
+        "fwhm": round(current_fwhm, 2),
+        "mean": round(mean_val, 2),
+        "median": round(median_val, 2),
+        "std": round(std_val, 2),
+        "background": round(bkg_median, 2),
+        "snr": round(snr, 2),
+        "min_flux": round(min_flux, 2),
+        "max_flux": round(max_flux, 2),
+        "valid": valid
+    }
+    
+    return coords, current_fwhm, metrics
 
-    if not np.isfinite(std) or std <= 0:
-        return np.empty((0, 2), dtype=np.float32), 0.0, {"star_count": 0, "mean": float(mean) if np.isfinite(mean) else None, "median": float(median) if np.isfinite(median) else None, "std": 0.0, "fwhm": 0.0}
+def detect_stars_opencv(data: np.ndarray, fwhm: float, sigma: float, max_stars: int) -> tuple[np.ndarray, float, dict]:
+    mean_val = float(np.mean(data))
+    median_val = float(np.median(data))
+    std_val = float(np.std(data))
+    
+    norm_img = cv2.normalize(data, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+    
+    # Aplica GaussianBlur usando o FWHM esperado para suavizar ruído antes do threshold
+    ksize = int(fwhm) | 1 # Garante que seja ímpar
+    blurred = cv2.GaussianBlur(norm_img, (ksize, ksize), 0)
+    
+    # Threshold base. Usamos sigma para controlar a agressividade do limiar
+    threshold_val = min(255, np.median(blurred) + (sigma * np.std(blurred)))
+    _, thresh = cv2.threshold(blurred, threshold_val, 255, cv2.THRESH_BINARY)
+    
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    # Filtra ruídos mínimos e gigantes, depois ordena pela área e limita ao max_stars
+    valid_contours = [c for c in contours if 2 < cv2.contourArea(c) < 1000]
+    valid_contours = sorted(valid_contours, key=cv2.contourArea, reverse=True)[:max_stars]
+    
+    coords_list = []
+    areas = []
+    fluxes = []
+    
+    for cnt in valid_contours:
+        M = cv2.moments(cnt)
+        if M["m00"] != 0:
+            cX = M["m10"] / M["m00"]
+            cY = M["m01"] / M["m00"]
+            coords_list.append([cX, cY])
+            areas.append(cv2.contourArea(cnt))
+            # Fluxo aproximado lendo o pixel central na matriz original
+            fluxes.append(float(data[int(cY), int(cX)]))
 
-    daofind = DAOStarFinder(fwhm=fwhm, threshold=sigma * std)
-    sources = daofind(data - median)
-
-    if sources is None or len(sources) < 3:
-        return np.empty((0, 2), dtype=np.float32), float(fwhm), {"star_count": 0, "mean": float(mean), "median": float(median), "std": float(std), "fwhm": float(fwhm)}
-
-    sources.sort("flux", reverse=True)
-    sources = sources[:max_stars]
-
-    pts = np.column_stack((np.asarray(sources["x_centroid"], dtype=np.float32), np.asarray(sources["y_centroid"], dtype=np.float32)))
-
-    metrics = {"star_count": int(len(pts)), "mean": float(mean), "median": float(median), "std": float(std), "fwhm": float(fwhm)}
-    return pts, float(fwhm), metrics
+    coords = np.array(coords_list) if coords_list else np.empty((0, 2))
+    star_count = len(coords)
+    
+    # FWHM aproximado a partir da área do contorno
+    current_fwhm = float(np.mean([np.sqrt(a/np.pi) * 2 for a in areas])) if areas else 0.0
+    min_flux = float(np.min(fluxes)) if fluxes else 0.0
+    max_flux = float(np.max(fluxes)) if fluxes else 0.0
+    snr = float(np.mean(fluxes) / std_val) if std_val > 0 and fluxes else 0.0
+    
+    valid = bool(star_count > 10 and current_fwhm < (fwhm * 2.5))
+    
+    metrics = {
+        "star_count": star_count,
+        "fwhm": round(current_fwhm, 2),
+        "mean": round(mean_val, 2),
+        "median": round(median_val, 2),
+        "std": round(std_val, 2),
+        "background": round(median_val, 2),
+        "snr": round(snr, 2),
+        "min_flux": round(min_flux, 2),
+        "max_flux": round(max_flux, 2),
+        "valid": valid
+    }
+    
+    return coords, current_fwhm, metrics
 
 
 def detect_stars(data: np.ndarray, fwhm: float, sigma: float, max_stars: int, engine: str = "DAO") -> tuple[np.ndarray, float, dict]:
@@ -224,7 +260,8 @@ def _process_single_frame(
         # A imagem que o algoritmo vai investigar passa a ser a representação pseudo-Luminância isolada:
         working_data = extract_luminance(data, header)
         stars, measured_fwhm, metrics = detect_stars(working_data, fwhm_val, sigma_val, max_stars_val, engine_val)
-
+        save_frame_metrics(filepath, metrics)
+        
         if len(stars) < min_stars:
             return filepath.name, None
 
@@ -1008,3 +1045,13 @@ def preview_star_detection(batch_dir: Path, config: dict) -> tuple[np.ndarray | 
         cv2.circle(img_color, (int(x), int(y)), radius, (0, 0, 255), 1)
         
     return img_color, star_count, measured_fwhm
+
+def save_frame_metrics(image_path, metrics):
+    """Salva as métricas em um arquivo .json na mesma pasta e com o mesmo nome do frame."""
+    base_path, _ = os.path.splitext(image_path)
+    json_path = f"{base_path}_metrics.json"
+    
+    with open(json_path, 'w', encoding='utf-8') as f:
+        json.dump(metrics, f, indent=4)
+        
+    return json_path
