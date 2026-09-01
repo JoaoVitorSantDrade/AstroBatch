@@ -7,10 +7,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
+import colour_demosaicing
 import cv2
 import numpy as np
 from astropy.io import fits
 from astropy.utils.exceptions import AstropyWarning
+from skimage.restoration import richardson_lucy
+from skimage.transform import AffineTransform, warp
 
 # Suprime todos os avisos de verificação de cabeçalho do Astropy
 warnings.simplefilter("ignore", category=AstropyWarning)
@@ -18,10 +21,10 @@ warnings.simplefilter("ignore", category=AstropyWarning)
 FITS_SUFFIXES = {".fit", ".fits", ".fts"}
 
 INTERPOLATION_MODES = {
-    "Nearest": cv2.INTER_NEAREST,
-    "Bilinear": cv2.INTER_LINEAR,
-    "Bicubic": cv2.INTER_CUBIC,
-    "Lanczos": cv2.INTER_LANCZOS4,
+    "Nearest": "nearest",
+    "Bilinear": "bilinear",
+    "Bicubic": "bicubic",
+    "Lanczos": "lanczos",
 }
 
 # ============================================================
@@ -29,54 +32,11 @@ INTERPOLATION_MODES = {
 # ============================================================
 
 BAYER_BASE_CODES = {
-    "RGGB": cv2.COLOR_BayerBG2RGB,
-    "BGGR": cv2.COLOR_BayerRG2RGB,
-    "GRBG": cv2.COLOR_BayerGB2RGB,
-    "GBRG": cv2.COLOR_BayerGR2RGB,
+    "RGGB": True,
+    "BGGR": True,
+    "GRBG": True,
+    "GBRG": True,
 }
-
-
-def get_debayer_conversion_code(
-    pattern: str,
-    method: str,
-) -> int:
-    """
-    Retorna o código OpenCV correspondente ao padrão Bayer
-    e ao método de debayerização escolhido.
-
-    Os nomes dos padrões seguem a convenção utilizada nos
-    headers astronômicos. O OpenCV utiliza códigos próprios.
-    """
-
-    pattern_codes = {
-        "RGGB": {
-            "Bilinear": cv2.COLOR_BayerBG2RGB,
-            "VNG": cv2.COLOR_BayerBG2RGB_VNG,
-            "Edge-Aware": cv2.COLOR_BayerBG2RGB_EA,
-        },
-        "BGGR": {
-            "Bilinear": cv2.COLOR_BayerRG2RGB,
-            "VNG": cv2.COLOR_BayerRG2RGB_VNG,
-            "Edge-Aware": cv2.COLOR_BayerRG2RGB_EA,
-        },
-        "GRBG": {
-            "Bilinear": cv2.COLOR_BayerGB2RGB,
-            "VNG": cv2.COLOR_BayerGB2RGB_VNG,
-            "Edge-Aware": cv2.COLOR_BayerGB2RGB_EA,
-        },
-        "GBRG": {
-            "Bilinear": cv2.COLOR_BayerGR2RGB,
-            "VNG": cv2.COLOR_BayerGR2RGB_VNG,
-            "Edge-Aware": cv2.COLOR_BayerGR2RGB_EA,
-        },
-    }
-
-    try:
-        return pattern_codes[pattern][method]
-    except KeyError as exc:
-        raise ValueError(
-            f"Método de debayer inválido: pattern={pattern!r}, method={method!r}"
-        ) from exc
 
 
 # ============================================================
@@ -95,6 +55,9 @@ class AlignConfig:
 
     # Alignment
     interpolation: str
+
+    # Advanced Chromatic Registration (Níveis 1 e 2)
+    rgb_registration: bool
 
     # Storage / execution
     overwrite: bool
@@ -278,110 +241,44 @@ def process_in_memory_debayer(
     data: np.ndarray,
     header: fits.Header,
     pattern: str | None,
-    method: str = "Bilinear",
+    method: str = "VNG",
 ) -> tuple[np.ndarray, fits.Header]:
-    """
-    Realiza o debayer em memória.
-
-    A versão OpenCV utilizada exige entrada CV_8U para demosaicing.
-    Para evitar uma conversão destrutiva simples de 16 -> 8 bits,
-    a faixa dinâmica do RAW é normalizada para 8 bits antes do
-    demosaicing e posteriormente restaurada para uint16.
-
-    pattern:
-        RGGB
-        BGGR
-        GRBG
-        GBRG
-
-    method:
-        Bilinear
-        VNG
-        Edge-Aware
-
-    Se pattern for None, os dados permanecem CFA/mono.
-    """
 
     if not pattern:
         return data, header
 
     pattern = str(pattern).upper()
+    valid_patterns = ["RGGB", "BGGR", "GRBG", "GBRG"]
 
-    if pattern not in BAYER_BASE_CODES:
+    if pattern not in valid_patterns:
         raise ValueError(f"Padrão Bayer inválido: {pattern}")
 
-    cv2_conversion_code = get_debayer_conversion_code(
-        pattern,
-        method,
-    )
+    # Normalize 16-bit data to [0.0, 1.0] float32 for colour-demosaicing algorithms
+    data_normalized = np.clip(data, 0, 65535).astype(np.float32) / 65535.0
+
+    # Route to the requested demosaicing algorithm natively
+    if method == "VNG":
+        rgb_float = colour_demosaicing.demosaicing_CFA_Bayer_Malvar2004(
+            data_normalized, pattern
+        )
+    elif method == "Bilinear":
+        rgb_float = colour_demosaicing.demosaicing_CFA_Bayer_bilinear(
+            data_normalized, pattern
+        )
+    elif method == "Menon2007":
+        # DDFAPD (Edge-Aware alternative that is excellent for astrophotography)
+        rgb_float = colour_demosaicing.demosaicing_CFA_Bayer_Menon2007(
+            data_normalized, pattern
+        )
+    else:
+        raise ValueError(f"Método de debayer não suportado: {method}")
+
+    # Scale back to 16-bit range as float32 for downstream compatibility
+    rgb_data = (np.clip(rgb_float, 0.0, 1.0) * 65535.0).astype(np.float32)
 
     # --------------------------------------------------------
-    # Preserva a faixa dinâmica do RAW
+    # Update Header
     # --------------------------------------------------------
-
-    data_float = np.asarray(
-        data,
-        dtype=np.float32,
-    )
-
-    finite_mask = np.isfinite(data_float)
-
-    if not np.any(finite_mask):
-        raise ValueError("Imagem RAW não possui pixels finitos.")
-
-    finite_values = data_float[finite_mask]
-
-    data_min = float(np.min(finite_values))
-
-    data_max = float(np.max(finite_values))
-
-    if data_max <= data_min:
-        raise ValueError("Imagem RAW possui faixa dinâmica inválida.")
-
-    # --------------------------------------------------------
-    # OpenCV 5: demosaicing exige CV_8U
-    # --------------------------------------------------------
-
-    normalized = (data_float - data_min) / (data_max - data_min) * 255.0
-
-    normalized = np.nan_to_num(
-        normalized,
-        nan=0.0,
-        posinf=255.0,
-        neginf=0.0,
-    )
-
-    data_u8 = np.clip(
-        normalized,
-        0,
-        255,
-    ).astype(np.uint8)
-
-    # --------------------------------------------------------
-    # Debayer
-    # --------------------------------------------------------
-
-    rgb_u8 = cv2.cvtColor(
-        data_u8,
-        cv2_conversion_code,
-    )
-
-    # --------------------------------------------------------
-    # Recupera a escala original
-    # --------------------------------------------------------
-
-    rgb_data = rgb_u8.astype(np.float32) / 255.0 * (data_max - data_min) + data_min
-
-    rgb_data = np.clip(
-        rgb_data,
-        0,
-        65535,
-    ).astype(np.uint16)
-
-    # --------------------------------------------------------
-    # Atualiza Header
-    # --------------------------------------------------------
-
     for key in [
         "BAYERPAT",
         "BAYERPATTERN",
@@ -389,51 +286,113 @@ def process_in_memory_debayer(
         "BZERO",
         "BSCALE",
     ]:
-        header.remove(
-            key,
-            ignore_missing=True,
-        )
+        header.remove(key, ignore_missing=True)
 
     header["DEBAYER"] = pattern
     header["DEBMETHOD"] = method
     header["CTYPE3"] = "RGB"
 
-    return (
-        rgb_data,
-        header,
-    )
+    return rgb_data, header
 
 
 # ============================================================
-# Warping
+# Warping (Scikit-Image Refactored)
 # ============================================================
 
 
 def warp_frame(
     data: np.ndarray,
     final_matrix: np.ndarray,
-    interpolation_flag: int,
+    interpolation_mode: str,
+    rgb_registration: bool = False,
 ) -> np.ndarray:
-
+    """
+    Aplica a transformação afim global e, opcionalmente, executa
+    um micro-registro sub-pixel dos canais R e B usando o canal G como âncora
+    (correção de dispersão atmosférica / color fringing).
+    """
     h, w = data.shape[:2]
 
-    matrix_2x3 = final_matrix[:2, :].astype(np.float64)
+    matrix_3x3 = np.eye(3, dtype=np.float64)
+    matrix_3x3[:2, :] = final_matrix[:2, :].astype(np.float64)
 
-    return cv2.warpAffine(
-        data,
-        matrix_2x3,
-        (w, h),
-        flags=interpolation_flag,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=((0, 0, 0) if data.ndim == 3 else 0),
-    )
+    tform = AffineTransform(matrix=matrix_3x3)
+
+    order_map = {
+        "nearest": 0,
+        "bilinear": 1,
+        "bicubic": 3,
+        "lanczos": 3,
+    }
+    order = order_map.get(interpolation_mode, 3)
+
+    if data.ndim == 3:
+        channels = []
+
+        # 1. Warp Global em todos os canais independentemente
+        for i in range(data.shape[2]):
+            warped_channel = warp(
+                data[:, :, i],
+                tform.inverse,
+                order=order,
+                mode="constant",
+                cval=0.0,
+                preserve_range=True,
+            )
+            channels.append(warped_channel)
+
+        # 2. Nível 1: Micro-Registro RGB pós-warp
+        if rgb_registration and data.shape[2] >= 3:
+            from skimage.registration import phase_cross_correlation
+
+            # O Canal Verde (índice 1) é nossa referência fixa e opticamente mais nítida
+            ref_channel = channels[1]
+
+            for c in [0, 2]:  # Processa o Vermelho (0) e o Azul (2)
+                # Calcula o desvio sub-pixel exato do canal em relação ao verde
+                shift_vector, error, diffphase = phase_cross_correlation(
+                    ref_channel,
+                    channels[c],
+                    upsample_factor=10,  # Precisão de 0.1 pixel
+                    normalization=None,
+                )
+
+                # shift_vector retorna (y, x). O AffineTransform espera translação em (x, y)
+                micro_tform = AffineTransform(
+                    translation=(-shift_vector[1], -shift_vector[0])
+                )
+
+                # Realinha o canal com o desvio cromático corrigido
+                channels[c] = warp(
+                    channels[c],
+                    micro_tform.inverse,
+                    order=order,
+                    mode="constant",
+                    cval=0.0,
+                    preserve_range=True,
+                )
+
+        return np.stack(channels, axis=-1).astype(np.float32)
+    else:
+        # Mono
+        warped = warp(
+            data,
+            tform.inverse,
+            order=order,
+            mode="constant",
+            cval=0.0,
+            preserve_range=True,
+        )
+        return warped.astype(np.float32)
 
 
 def generate_valid_mask(
     shape: tuple,
     final_matrix: np.ndarray,
 ) -> np.ndarray:
-
+    """
+    Gera a máscara de pixels válidos utilizando skimage.transform.warp.
+    """
     height = shape[0]
     width = shape[1]
 
@@ -442,19 +401,24 @@ def generate_valid_mask(
             height,
             width,
         ),
-        dtype=np.uint8,
+        dtype=np.float32,
     )
 
-    matrix_2x3 = final_matrix[:2, :].astype(np.float64)
+    matrix_3x3 = np.eye(3, dtype=np.float64)
+    matrix_3x3[:2, :] = final_matrix[:2, :].astype(np.float64)
 
-    return cv2.warpAffine(
+    tform = AffineTransform(matrix=matrix_3x3)
+
+    warped_mask = warp(
         mask,
-        matrix_2x3,
-        (width, height),
-        flags=cv2.INTER_NEAREST,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=0,
+        tform.inverse,
+        order=0,
+        mode="constant",
+        cval=0.0,
+        preserve_range=True,
     )
+
+    return (warped_mask > 0.5).astype(np.uint8)
 
 
 # ============================================================
@@ -521,6 +485,32 @@ def save_compressed_fits(
     )
 
 
+def build_motion_kernel(dx: float, dy: float) -> np.ndarray:
+    # Aumentamos o kernel para acomodar o anti-aliasing e o desfoque
+    length = max(5, int(np.ceil(np.sqrt(dx**2 + dy**2))) + 4)
+    if length % 2 == 0:
+        length += 1
+
+    kernel = np.zeros((length, length), dtype=np.float32)
+    center = length // 2
+
+    # cv2.LINE_AA desenha o rastro com suavização sub-pixel real
+    cv2.line(
+        kernel,
+        (center, center),
+        (int(round(center + dx)), int(round(center + dy))),
+        1.0,
+        1,
+        cv2.LINE_AA,
+    )
+
+    # O blur simula o espalhamento atmosférico durante a exposição do rastro
+    kernel = cv2.GaussianBlur(kernel, (3, 3), 0)
+
+    sum_k = np.sum(kernel)
+    return kernel / sum_k if sum_k > 0 else kernel
+
+
 # ============================================================
 # Frame individual
 # ============================================================
@@ -532,7 +522,7 @@ def _process_single_alignment(
     batch_dir: Path,
     output_dir: Path,
     global_matrix: list,
-    interpolation_flag: int,
+    interpolation_mode: str,
     config: AlignConfig,
 ) -> tuple[str, str | None]:
 
@@ -614,14 +604,55 @@ def _process_single_alignment(
             config.debayer_method,
         )
 
+        dx, dy = frame_info.get("translation", [0.0, 0.0])
+
+        drift_x = -dx * 0.8
+        drift_y = -dy * 0.8
+
+        if abs(drift_x) > 1.0 or abs(drift_y) > 1.0:
+            kernel = build_motion_kernel(drift_x, drift_y)
+
+            if rgb_data.ndim == 3:
+                channels = []
+                for i in range(rgb_data.shape[2]):
+                    channel_data = rgb_data[:, :, i]
+                    channel_max = channel_data.max()
+                    if channel_max > 0:
+                        channel_data = channel_data / channel_max
+                        # Limitado a 5 iterações: cura o trailing sem criar anéis negros (Ringing)
+                        deconvolved = richardson_lucy(
+                            channel_data,
+                            kernel,
+                            num_iter=5,
+                            clip=False,
+                        )
+                        deconvolved = deconvolved * channel_max
+                        channels.append(deconvolved)
+                    else:
+                        channels.append(channel_data)
+                rgb_data = np.stack(channels, axis=-1).astype(np.float32)
+            else:
+                channel_max = rgb_data.max()
+                if channel_max > 0:
+                    rgb_data = rgb_data / channel_max
+                    rgb_data = richardson_lucy(
+                        rgb_data,
+                        kernel,
+                        num_iter=5,
+                        clip=False,
+                    )
+                    rgb_data = rgb_data * channel_max
+                rgb_data = rgb_data.astype(np.float32)
+
         # ----------------------------------------------------
-        # Warping
+        # Warping (Scikit-Image)
         # ----------------------------------------------------
 
         warped_data = warp_frame(
             rgb_data,
             final_matrix,
-            interpolation_flag,
+            interpolation_mode,
+            rgb_registration=config.rgb_registration,
         )
 
         # ----------------------------------------------------
@@ -751,9 +782,9 @@ def process_batch_alignment(
 
     output_dir = config.output_dir / batch_dir.name
 
-    interpolation_flag = INTERPOLATION_MODES.get(
+    interpolation_mode = INTERPOLATION_MODES.get(
         config.interpolation,
-        cv2.INTER_LANCZOS4,
+        "lanczos",
     )
 
     worker_count = get_optimal_worker_count()
@@ -773,7 +804,7 @@ def process_batch_alignment(
                 batch_dir,
                 output_dir,
                 global_matrix,
-                interpolation_flag,
+                interpolation_mode,
                 config,
             ): fname
             for fname, finfo in valid_frames.items()
@@ -874,6 +905,12 @@ def process_all_alignments(
         interpolation=config_dict.get(
             "interpolation",
             "Lanczos",
+        ),
+        rgb_registration=bool(
+            config_dict.get(
+                "rgb_registration",
+                True,
+            )
         ),
         overwrite=bool(
             config_dict.get(

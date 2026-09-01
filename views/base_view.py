@@ -42,3 +42,13 @@ class BaseAstroView(ttk.Frame):
         ttk.Label(
             parent, text=text, style="Muted.TLabel", wraplength=820, justify="left"
         ).grid(row=row, column=0, columnspan=columnspan, sticky="w", pady=(0, 10))
+
+    def _on_mousewheel(self, event):
+        # Descobre qual widget está exatamente debaixo do ponteiro do mouse
+        widget_under_mouse = self.winfo_containing(event.x_root, event.y_root)
+
+        # Só permite o scroll do Canvas se o widget sob o mouse pertencer a esta View (Tab).
+        # Como o Console fica no Main (fora da Tab), ele será ignorado aqui.
+        if widget_under_mouse and str(widget_under_mouse).startswith(str(self)):
+            # Substitua 'self.canvas' pelo nome exato da sua variável de Canvas, se for diferente
+            self.app.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")

@@ -20,6 +20,7 @@ from views.batch_view import BatchView
 # Importando as views separadas
 from views.calibration_view import CalibrationView
 from views.flow_view import FlowView
+from views.stacking_view import StackingView
 
 
 class AstroProcessManager(tk.Tk):
@@ -102,10 +103,44 @@ class AstroProcessManager(tk.Tk):
         self.align_debayer_pattern_var = tk.StringVar(value="Auto")
         self.align_debayer_method_var = tk.StringVar(value="Bilinear")
         self.align_interpolation_var = tk.StringVar(value="Lanczos")
+        self.align_rgb_registration_var = tk.BooleanVar(value=True)
         self.align_overwrite_var = tk.BooleanVar(value=False)
         self.align_dry_run_var = tk.BooleanVar(value=False)
         self.align_keep_header_var = tk.BooleanVar(value=True)
         self.align_delete_intermediates_var = tk.BooleanVar(value=False)
+
+        # ---- AstroStack ----
+        # ---- Diretórios ----
+        self.stack_output_dir_var = tk.StringVar(value="")
+        self.stack_input_dir_var = tk.StringVar(value="")
+
+        # ---- Seleção de Frames ----
+        self.stack_selection_mode_var = tk.StringVar(value="BestPercentage")
+        self.stack_selection_percentage_var = tk.DoubleVar(value=80.0)
+        self.stack_selection_percentage_text_var = tk.StringVar(value="80%")
+        self.stack_selection_metric_var = tk.StringVar(value="quality")
+
+        # ---- Combinação ----
+        self.stack_method_var = tk.StringVar(value="Median")
+
+        # ---- Rejeição de Outliers ----
+        self.stack_rejection_method_var = tk.StringVar(value="SigmaClip")
+        self.stack_rejection_low_var = tk.DoubleVar(value=3.0)
+        self.stack_rejection_high_var = tk.DoubleVar(
+            value=3.0
+        )  # Corrigido para 3.0 (padrão)
+
+        # ---- Normalização ----
+        self.stack_normalize_var = tk.BooleanVar(value=True)
+        self.stack_normalize_method_var = tk.StringVar(value="Median")
+
+        # ---- Pós-processamento ----
+        self.stack_dither_correction_var = tk.BooleanVar(value=False)
+
+        # ---- Saída ----
+        self.stack_output_name_var = tk.StringVar(value="stacked_image.fits")
+        self.stack_output_bit_depth_var = tk.StringVar(value="32-bit")  # NOVO!
+        self.stack_compress_var = tk.BooleanVar(value=True)
 
         # Registry atualizado
         self.config_registry = {
@@ -150,10 +185,35 @@ class AstroProcessManager(tk.Tk):
                 "debayer_pattern": self.align_debayer_pattern_var,
                 "debayer_method": self.align_debayer_method_var,
                 "interpolation": self.align_interpolation_var,
+                "rgb_registration": self.align_rgb_registration_var,
                 "overwrite": self.align_overwrite_var,
                 "dry_run": self.align_dry_run_var,
                 "keep_header": self.align_keep_header_var,
                 "delete_intermediates": self.align_delete_intermediates_var,
+            },
+            "AstroStack": {
+                # ---- Diretórios ----
+                "input_dir": self.stack_input_dir_var,
+                "output_dir": self.stack_output_dir_var,
+                # ---- Seleção de Frames ----
+                "selection_mode": self.stack_selection_mode_var,
+                "selection_percentage": self.stack_selection_percentage_var,
+                "selection_metric": self.stack_selection_metric_var,
+                # ---- Combinação ----
+                "method": self.stack_method_var,
+                # ---- Rejeição de Outliers ----
+                "rejection_method": self.stack_rejection_method_var,
+                "rejection_low": self.stack_rejection_low_var,
+                "rejection_high": self.stack_rejection_high_var,
+                # ---- Normalização ----
+                "normalize": self.stack_normalize_var,
+                "normalize_method": self.stack_normalize_method_var,
+                # ---- Pós-processamento ----
+                "apply_dither_correction": self.stack_dither_correction_var,
+                # ---- Saída ----
+                "output_name": self.stack_output_name_var,
+                "output_bit_depth": self.stack_output_bit_depth_var,
+                "compress_output": self.stack_compress_var,
             },
         }
 
@@ -291,11 +351,13 @@ class AstroProcessManager(tk.Tk):
         self.tab_batch = BatchView(self.notebook, app=self)
         self.tab_flow = FlowView(self.notebook, app=self)
         self.tab_align = AlignView(self.notebook, app=self)
+        self.tab_stack = StackingView(self.notebook, app=self)
 
         self.notebook.add(self.tab_calib, text="1  Calibration")
         self.notebook.add(self.tab_batch, text="2  Batch")
         self.notebook.add(self.tab_flow, text="3  Flow")
         self.notebook.add(self.tab_align, text="4  Align")
+        self.notebook.add(self.tab_stack, text="5  Stack")
 
         self._build_footer()
 
@@ -343,6 +405,7 @@ class AstroProcessManager(tk.Tk):
         folder = filedialog.askdirectory(parent=self)
         if folder:
             var.set(folder)
+            self.save_settings()
             if var == self.batch_dir_var:
                 self._update_global_master_options()
                 self.refresh_flow_reference_preview()
@@ -353,12 +416,14 @@ class AstroProcessManager(tk.Tk):
             filetypes=[("FITS", "*.fits *.fit *.fts"), ("Todos os arquivos", "*.*")],
         )
         if path:
+            self.save_settings()
             var.set(path)
 
     def browse_file_or_dir(self, var):
         folder = filedialog.askdirectory(parent=self)
         if folder:
             var.set(folder)
+            self.save_settings()
             return
         self.browse_file(var)
 
@@ -728,6 +793,115 @@ class AstroProcessManager(tk.Tk):
         finally:
             self.after(0, self._unlock_ui)
 
+    # Método para iniciar stacking:
+
+    def start_stacking(self):
+        if self.worker and self.worker.is_alive():
+            return
+
+        # ---- Verifica pasta de entrada ----
+        input_dir = Path(self.stack_input_dir_var.get()).expanduser().resolve()
+        if not input_dir.is_dir():
+            messagebox.showerror(
+                "Erro",
+                "Selecione uma pasta de entrada com os frames alinhados.\n\n"
+                "Esta deve ser a pasta de saída do AstroAlign (ex: .../aligned).",
+                parent=self,
+            )
+            return
+
+        # ---- Verifica pasta de saída ----
+        output_dir = Path(self.stack_output_dir_var.get()).expanduser().resolve()
+        if not str(self.stack_output_dir_var.get()).strip():
+            messagebox.showerror(
+                "Erro",
+                "Selecione uma pasta de saída para a imagem empilhada.",
+                parent=self,
+            )
+            return
+
+        # ---- Verifica se há arquivos de flow (opcional, mas recomendado) ----
+        has_flow = False
+        for batch_dir in input_dir.iterdir():
+            if batch_dir.is_dir() and (batch_dir / "flow_local.json").exists():
+                has_flow = True
+                break
+
+        if not has_flow:
+            # Verifica se há global_flow.json na pasta pai
+            if not (input_dir.parent / "global_flow.json").exists():
+                # Avisa, mas não impede
+                self.print_to_console(
+                    "[Stack] Aviso: Nenhum arquivo de flow encontrado.\n"
+                    "  O Stacking usará apenas os nomes dos arquivos para organizar os frames.\n"
+                )
+
+        # ---- Configuração ----
+        config = {
+            "base_dir": str(self.batch_dir_var.get()),
+            "input_dir": str(input_dir),
+            "output_dir": str(output_dir),
+            "selection_mode": self.stack_selection_mode_var.get(),
+            "selection_percentage": self.stack_selection_percentage_var.get(),
+            "selection_metric": self.stack_selection_metric_var.get(),
+            "method": self.stack_method_var.get(),
+            "rejection_method": self.stack_rejection_method_var.get(),
+            "rejection_low": self.stack_rejection_low_var.get(),
+            "rejection_high": self.stack_rejection_high_var.get(),
+            "normalize": self.stack_normalize_var.get(),
+            "normalize_method": self.stack_normalize_method_var.get(),
+            "output_name": self.stack_output_name_var.get(),
+            "output_bit_depth": self.stack_output_bit_depth_var.get(),
+            "compress_output": self.stack_compress_var.get(),
+            "apply_dither_correction": self.stack_dither_correction_var.get(),
+        }
+
+        self._lock_ui("Stack")
+        self.worker = threading.Thread(
+            target=self.run_stacking_logic, args=(input_dir, config), daemon=True
+        )
+        self.worker.start()
+
+    def run_stacking_logic(self, input_dir, config):
+        from stacking_logic import process_all_stacking
+
+        try:
+            # O stacking_logic agora recebe o input_dir diretamente
+            result = process_all_stacking(
+                input_dir,  # Pasta com frames alinhados
+                config,
+                self.update_progress,
+                self.print_to_console,
+                self.cancel_event,
+            )
+
+            if result and result.get("status") == "success":
+                self.after(
+                    0,
+                    lambda: self.status_var.set(
+                        f"AstroStack concluído. {result['n_frames']} frames combinados."
+                    ),
+                )
+                self.print_to_console("\n✅ Stacking concluído!\n")
+                self.print_to_console(f"📁 Imagem salva em: {result['output_path']}\n")
+            else:
+                reason = (
+                    result.get("reason", "erro desconhecido")
+                    if result
+                    else "erro desconhecido"
+                )
+                self.after(
+                    0, lambda: self.status_var.set(f"AstroStack falhou: {reason}")
+                )
+        except Exception as exc:
+            self.print_to_console(f"\n❌ ERRO FATAL NO ASTROSTACK:\n{exc}\n")
+            import traceback
+
+            self.print_to_console(traceback.format_exc())
+            self.after(0, lambda: self.status_var.set("Erro no AstroStack."))
+        finally:
+            self.after(0, self._unlock_ui)
+
     # --------------------------------------------------------
     # Funções de GUI Auxiliares (Preview, Chart, Combo Global Master)
     # --------------------------------------------------------
@@ -827,7 +1001,13 @@ class AstroProcessManager(tk.Tk):
         ).pack(pady=(0, 10))
 
     def show_flow_visualization(self):
-        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+        import math
+
+        import numpy as np
+        from matplotlib.backends.backend_tkagg import (
+            FigureCanvasTkAgg,
+            NavigationToolbar2Tk,
+        )
         from matplotlib.figure import Figure
 
         base_dir = Path(self.batch_dir_var.get()).expanduser().resolve()
@@ -845,11 +1025,15 @@ class AstroProcessManager(tk.Tk):
             with global_json.open("r", encoding="utf-8") as f:
                 global_data = json.load(f)
 
-            points_x, points_y = [], []
+            points_x, points_y, rotations, time_seq = [], [], [], []
             center_pt = np.array([0, 0, 1])
+            frame_counter = 0
 
-            for batch_name, g_info in global_data["batches"].items():
-                g_matrix = np.array(g_info["matrix"])
+            for batch_name, g_info in global_data.get("batches", {}).items():
+                if g_info.get("status") != "accepted" or g_info.get("matrix") is None:
+                    continue
+
+                g_matrix = np.array(g_info["matrix"], dtype=np.float64)
                 local_json = base_dir / batch_name / "flow_local.json"
 
                 if not local_json.exists():
@@ -858,16 +1042,27 @@ class AstroProcessManager(tk.Tk):
                 with local_json.open("r", encoding="utf-8") as f:
                     local_data = json.load(f)
 
-                for _, l_info in local_data["frames"].items():
-                    if l_info.get("status") == "rejected":
+                for _, l_info in local_data.get("frames", {}).items():
+                    if (
+                        l_info.get("status") != "accepted"
+                        or l_info.get("matrix") is None
+                    ):
                         continue
 
-                    l_matrix = np.array(l_info["matrix"])
+                    l_matrix = np.array(l_info["matrix"], dtype=np.float64)
                     abs_matrix = np.dot(g_matrix, l_matrix)
+
                     transformed_pt = np.dot(abs_matrix, center_pt)
+
+                    # Extrai a rotação da matriz geométrica (em graus)
+                    angle_rad = math.atan2(abs_matrix[1, 0], abs_matrix[0, 0])
+                    angle_deg = math.degrees(angle_rad)
 
                     points_x.append(transformed_pt[0])
                     points_y.append(transformed_pt[1])
+                    rotations.append(angle_deg)
+                    time_seq.append(frame_counter)
+                    frame_counter += 1
 
         except Exception as exc:
             messagebox.showerror(
@@ -882,35 +1077,72 @@ class AstroProcessManager(tk.Tk):
             return
 
         win = tk.Toplevel(self)
-        win.title("AstroFlow — Trajetória")
-        win.geometry("850x600")
+        win.title("AstroFlow — Trajetória e Rotação 3D")
+        win.geometry("950x750")
 
-        fig = Figure(figsize=(8, 5), dpi=90)
-        ax = fig.add_subplot(111)
+        # Configura o Figure indicando projeção 3D
+        fig = Figure(figsize=(8, 6), dpi=90)
+        ax = fig.add_subplot(111, projection="3d")
 
-        ax.plot(
+        # Desenha a linha conectando a trajetória ao longo do tempo
+        ax.plot(points_x, points_y, rotations, color="gray", alpha=0.3, linewidth=1)
+
+        # Desenha os pontos coloridos baseados na passagem do tempo (time_seq)
+        sc = ax.scatter(
             points_x,
             points_y,
+            rotations,
+            c=time_seq,
+            cmap="plasma",  # Mapas térmicos como plasma ou viridis ficam ótimos em 3D
             marker="o",
-            markersize=2,
-            linestyle="-",
-            alpha=0.6,
-            rasterized=True,
+            s=25,
+            alpha=0.9,
+            depthshade=True,
         )
-        ax.scatter(points_x[0], points_y[0], s=40, label="Início", zorder=5)
-        ax.scatter(points_x[-1], points_y[-1], s=40, label="Fim", zorder=5)
 
-        ax.set_title("Drift analisado pelo AstroFlow")
-        ax.set_xlabel("Deslocamento X (pixels)")
-        ax.set_ylabel("Deslocamento Y (pixels)")
-        ax.invert_yaxis()
-        ax.grid(True, linestyle="--", alpha=0.2)
-        ax.legend(fontsize=8)
+        # Destaca o Início e o Fim
+        ax.scatter(
+            points_x[0],
+            points_y[0],
+            rotations[0],
+            color="lime",
+            s=60,
+            label="Primeiro Frame",
+            edgecolor="black",
+        )
+        ax.scatter(
+            points_x[-1],
+            points_y[-1],
+            rotations[-1],
+            color="red",
+            s=60,
+            label="Último Frame",
+            edgecolor="black",
+        )
 
+        ax.set_title("Drift XY e Rotação de Campo (Field Rotation)", pad=20)
+        ax.set_xlabel("Deslocamento X (px)", labelpad=10)
+        ax.set_ylabel("Deslocamento Y (px)", labelpad=10)
+        ax.set_zlabel("Rotação (graus)", labelpad=10)
+        ax.invert_yaxis()  # Inverte o eixo Y para bater com a tela da imagem
+
+        # Barra lateral mostrando o gradiente de tempo
+        cbar = fig.colorbar(sc, ax=ax, shrink=0.7, pad=0.1)
+        cbar.set_label("Evolução Temporal (Nº do Frame)")
+
+        ax.legend(loc="upper left")
         fig.tight_layout()
+
+        # Renderização do Canvas e inclusão da Barra de Navegação (para rotacionar o 3D)
         canvas = FigureCanvasTkAgg(fig, master=win)
         canvas.draw()
-        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        toolbar_frame = tk.Frame(win)
+        toolbar_frame.pack(side=tk.TOP, fill=tk.X)
+        toolbar = NavigationToolbar2Tk(canvas, toolbar_frame)
+        toolbar.update()
+
+        canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
     def open_anchor_selector(self, target_batch=None):
         import functools

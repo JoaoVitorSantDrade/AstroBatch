@@ -6,3 +6,5 @@ photutils
 scipy
 matplotlib
 psutil
+colour-demosaicing
+scikit-image

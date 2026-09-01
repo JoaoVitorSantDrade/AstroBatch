@@ -14,7 +14,7 @@ class FlowView(BaseAstroView):
     def __init__(self, parent, app):
         super().__init__(parent, app)
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(2, weight=1)
+        self.rowconfigure(3, weight=1)
 
         self.reference_preview_frame = None
         self.reference_preview_canvas = None
@@ -26,15 +26,118 @@ class FlowView(BaseAstroView):
         self.after(150, self.refresh_reference_preview)
 
     def _build_ui(self):
+        # ============================================================
+        # 1. PARÂMETROS
+        # ============================================================
         params = ttk.LabelFrame(
-            self, text="Detecção e referência", style="Section.TLabelframe", padding=12
+            self,
+            text="Parâmetros de Detecção e Pareamento",
+            style="Section.TLabelframe",
+            padding=12,
         )
         params.grid(row=0, column=0, sticky="ew", pady=(0, 10))
 
-        ttk.Label(params, text="Global Master:").grid(row=0, column=0, sticky="w")
+        # Adicionando pesos nas colunas para melhor responsividade
+        for i in range(4):
+            params.columnconfigure(i, weight=1)
 
-        self.combo_global_master = ttk.Combobox(
+        # --- Detecção ---
+        ttk.Label(params, text="Star Engine:").grid(
+            row=0, column=0, sticky="w", pady=(0, 5)
+        )
+        ttk.Combobox(
             params,
+            textvariable=self.app.flow_engine_var,
+            values=["DAO", "OpenCV"],
+            state="readonly",
+            width=14,
+        ).grid(row=0, column=1, sticky="w", padx=8, pady=(0, 5))
+
+        ttk.Label(params, text="Mínimo de estrelas:").grid(
+            row=0, column=2, sticky="w", pady=(0, 5)
+        )
+        ttk.Entry(
+            params,
+            textvariable=self.app.flow_min_stars_var,
+            width=14,
+        ).grid(row=0, column=3, sticky="w", padx=8, pady=(0, 5))
+
+        ttk.Label(params, text="FWHM médio (px):").grid(
+            row=1, column=0, sticky="w", pady=(5, 5)
+        )
+        ttk.Entry(
+            params,
+            textvariable=self.app.flow_fwhm_var,
+            width=14,
+        ).grid(row=1, column=1, sticky="w", padx=8, pady=(5, 5))
+
+        ttk.Label(params, text="Sigma threshold:").grid(
+            row=1, column=2, sticky="w", pady=(5, 5)
+        )
+        ttk.Entry(
+            params,
+            textvariable=self.app.flow_sigma_var,
+            width=14,
+        ).grid(row=1, column=3, sticky="w", padx=8, pady=(5, 5))
+
+        # --- Geometria / RANSAC ---
+        ttk.Label(params, text="Raio de pareamento (px):").grid(
+            row=2, column=0, sticky="w", pady=(5, 5)
+        )
+        ttk.Entry(
+            params,
+            textvariable=self.app.flow_matching_radius_var,
+            width=14,
+        ).grid(row=2, column=1, sticky="w", padx=8, pady=(5, 5))
+
+        ttk.Label(params, text="RANSAC reprojection:").grid(
+            row=2, column=2, sticky="w", pady=(5, 5)
+        )
+        ttk.Entry(
+            params,
+            textvariable=self.app.flow_ransac_var,
+            width=14,
+        ).grid(row=2, column=3, sticky="w", padx=8, pady=(5, 5))
+
+        ttk.Label(params, text="Mínimo de inliers:").grid(
+            row=3, column=0, sticky="w", pady=(5, 0)
+        )
+        ttk.Entry(
+            params,
+            textvariable=self.app.flow_min_inliers_var,
+            width=14,
+        ).grid(row=3, column=1, sticky="w", padx=8, pady=(5, 0))
+
+        ttk.Label(params, text="Ratio mínimo de inliers:").grid(
+            row=3, column=2, sticky="w", pady=(5, 0)
+        )
+        ttk.Entry(
+            params,
+            textvariable=self.app.flow_min_ratio_var,
+            width=14,
+        ).grid(row=3, column=3, sticky="w", padx=8, pady=(5, 0))
+
+        ttk.Checkbutton(
+            params,
+            text="Gerar imagens de diagnóstico nas âncoras (debug)",
+            variable=self.app.flow_debug_var,
+        ).grid(row=4, column=0, columnspan=4, sticky="w", pady=(12, 0))
+
+        # ============================================================
+        # 2. CONTROLES DO GLOBAL FLOW
+        # ============================================================
+        global_params = ttk.LabelFrame(
+            self, text="Global Flow", style="Section.TLabelframe", padding=12
+        )
+        global_params.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+
+        global_params.columnconfigure(1, weight=1)
+
+        ttk.Label(global_params, text="Global Master:").grid(
+            row=0, column=0, sticky="w"
+        )
+        self.combo_global_master = ttk.Combobox(
+            global_params,
             textvariable=self.app.flow_global_master_var,
             values=["Auto"],
             state="readonly",
@@ -42,89 +145,25 @@ class FlowView(BaseAstroView):
         )
         self.combo_global_master.grid(row=0, column=1, sticky="w", padx=8)
 
-        ttk.Label(params, text="Star Engine:").grid(
-            row=0, column=2, sticky="w", padx=(30, 8)
+        # Botão Exclusivo para re-calcular o Global Flow
+        self.btn_run_global_only = ttk.Button(
+            global_params,
+            text="🌍 Calcular Apenas Global Flow",
+            command=self.start_global_flow_only,
         )
+        self.btn_run_global_only.grid(row=0, column=2, sticky="e")
 
-        ttk.Combobox(
-            params,
-            textvariable=self.app.flow_engine_var,
-            values=["DAO", "OpenCV"],
-            state="readonly",
-            width=14,
-        ).grid(row=0, column=3, sticky="w")
+        ttk.Label(
+            global_params,
+            text="Use este botão para recalcular a malha global caso os Flows Locais já existam.",
+            style="Muted.TLabel",
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
-        ttk.Label(params, text="FWHM médio (px):").grid(
-            row=1, column=0, sticky="w", pady=(10, 0)
-        )
-        ttk.Entry(
-            params,
-            textvariable=self.app.flow_fwhm_var,
-            width=14,
-        ).grid(row=1, column=1, sticky="w", padx=8, pady=(10, 0))
-
-        ttk.Label(params, text="Sigma threshold:").grid(
-            row=1, column=2, sticky="w", padx=(30, 8), pady=(10, 0)
-        )
-        ttk.Entry(
-            params,
-            textvariable=self.app.flow_sigma_var,
-            width=14,
-        ).grid(row=1, column=3, sticky="w", pady=(10, 0))
-
-        ttk.Label(params, text="Raio de pareamento (px):").grid(
-            row=2, column=0, sticky="w", pady=(10, 0)
-        )
-        ttk.Entry(
-            params,
-            textvariable=self.app.flow_matching_radius_var,
-            width=14,
-        ).grid(row=2, column=1, sticky="w", padx=8, pady=(10, 0))
-
-        ttk.Label(params, text="RANSAC reprojection:").grid(
-            row=2, column=2, sticky="w", padx=(30, 8), pady=(10, 0)
-        )
-        ttk.Entry(
-            params,
-            textvariable=self.app.flow_ransac_var,
-            width=14,
-        ).grid(row=2, column=3, sticky="w", pady=(10, 0))
-
-        ttk.Label(params, text="Mínimo de estrelas:").grid(
-            row=3, column=0, sticky="w", pady=(10, 0)
-        )
-        ttk.Entry(
-            params,
-            textvariable=self.app.flow_min_stars_var,
-            width=14,
-        ).grid(row=3, column=1, sticky="w", padx=8, pady=(10, 0))
-
-        ttk.Label(params, text="Mínimo de inliers:").grid(
-            row=3, column=2, sticky="w", padx=(30, 8), pady=(10, 0)
-        )
-        ttk.Entry(
-            params,
-            textvariable=self.app.flow_min_inliers_var,
-            width=14,
-        ).grid(row=3, column=3, sticky="w", pady=(10, 0))
-
-        ttk.Label(params, text="Ratio mínimo de inliers:").grid(
-            row=4, column=0, sticky="w", pady=(10, 0)
-        )
-        ttk.Entry(
-            params,
-            textvariable=self.app.flow_min_ratio_var,
-            width=14,
-        ).grid(row=4, column=1, sticky="w", padx=8, pady=(10, 0))
-
-        ttk.Checkbutton(
-            params,
-            text="Gerar imagens de diagnóstico nas âncoras",
-            variable=self.app.flow_debug_var,
-        ).grid(row=5, column=0, columnspan=4, sticky="w", pady=(12, 0))
-
+        # ============================================================
+        # 3. AÇÕES
+        # ============================================================
         actions = ttk.Frame(self)
-        actions.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        actions.grid(row=2, column=0, sticky="ew", pady=(0, 10))
         for col in range(5):
             actions.columnconfigure(col, weight=1)
 
@@ -142,7 +181,7 @@ class FlowView(BaseAstroView):
 
         self.app.btn_run_flow = ttk.Button(
             actions,
-            text="▶  Iniciar AstroFlow",
+            text="▶  Processar AstroFlow Completo",
             style="Accent.TButton",
             command=self.app.start_flow_processing,
         )
@@ -172,13 +211,13 @@ class FlowView(BaseAstroView):
             padding=10,
         )
         preview_frame.grid(
-            row=2,
+            row=3,
             column=0,
             sticky="nsew",
             pady=(0, 10),
         )
 
-        parent.rowconfigure(2, weight=1)
+        parent.rowconfigure(3, weight=1)
         preview_frame.columnconfigure(0, weight=1)
         preview_frame.rowconfigure(0, weight=1)
 
@@ -233,14 +272,47 @@ class FlowView(BaseAstroView):
         inner.bind("<Configure>", update_scroll_region)
         canvas.bind("<Configure>", resize_inner)
 
-        # Mouse wheel
-        def on_mousewheel(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
-        canvas.bind_all("<MouseWheel>", on_mousewheel)
-
         # Inicialmente mostra estado vazio.
         self.after(100, self.refresh_reference_preview)
+
+    def start_global_flow_only(self):
+        """
+        Gatilho para iniciar apenas a lógica de Global Flow
+        sem recalcular os Flows Locais.
+        Injeta uma flag na configuração para que a lógica principal saiba.
+        """
+        if self.app.worker and self.app.worker.is_alive():
+            return
+
+        base_dir_str = self.app.batch_dir_var.get()
+        if not base_dir_str:
+            self.app.print_to_console("ERRO: Selecione a Pasta Base primeiro.\n")
+            return
+
+        batch_dir = Path(base_dir_str).expanduser().resolve()
+
+        config = {
+            "custom_anchors": dict(self.app.custom_anchors),
+            "global_master": self.app.flow_global_master_var.get(),
+            "fwhm": self.app.flow_fwhm_var.get(),
+            "sigma": self.app.flow_sigma_var.get(),
+            "matching_radius": self.app.flow_matching_radius_var.get(),
+            "ransac": self.app.flow_ransac_var.get(),
+            "debug_images": self.app.flow_debug_var.get(),
+            "min_stars": self.app.flow_min_stars_var.get(),
+            "min_inliers": self.app.flow_min_inliers_var.get(),
+            "min_ratio": self.app.flow_min_ratio_var.get(),
+            "max_stars": 150,
+            "engine": self.app.flow_engine_var.get(),
+            "skip_local_flow": True,  # <--- Flag cruciaL adicionada
+        }
+
+        self.app.save_settings()
+        self.app._lock_ui("Flow")
+        self.app.worker = threading.Thread(
+            target=self.app.run_flow_logic, args=(batch_dir, config), daemon=True
+        )
+        self.app.worker.start()
 
     def _load_reference_thumbnail(self, filepath):
         """
@@ -438,7 +510,7 @@ class FlowView(BaseAstroView):
                     card, batch_name, frame_name, img, generation
                 ),
             )
-        except Exception:
+        except Exception:  # Fixed undefined 'exc' variable
             self.after(
                 0,
                 lambda: self._populate_reference_card_error(

@@ -42,121 +42,57 @@ class AlignView(BaseAstroView):
             style="Section.TLabelframe",
             padding=12,
         )
-        debayer.grid(
-            row=1,
-            column=0,
-            sticky="ew",
-            pady=(0, 10),
-        )
-
+        debayer.grid(row=1, column=0, sticky="ew", pady=(0, 10))
         debayer.columnconfigure(2, weight=1)
 
-        # --------------------------------------------------------
-        # Padrão Bayer
-        # --------------------------------------------------------
-
-        ttk.Label(
-            debayer,
-            text="Padrão Bayer:",
-        ).grid(
-            row=0,
-            column=0,
-            sticky="w",
-        )
-
+        ttk.Label(debayer, text="Padrão Bayer:").grid(row=0, column=0, sticky="w")
         ttk.Combobox(
             debayer,
             textvariable=self.app.align_debayer_pattern_var,
-            values=[
-                "Auto",
-                "RGGB",
-                "BGGR",
-                "GRBG",
-                "GBRG",
-                "Nenhum",
-            ],
+            values=["Auto", "RGGB", "BGGR", "GRBG", "GBRG", "Nenhum"],
             state="readonly",
             width=16,
-        ).grid(
-            row=0,
-            column=1,
-            sticky="w",
-            padx=8,
-        )
+        ).grid(row=0, column=1, sticky="w", padx=8)
 
         ttk.Label(
             debayer,
             text="Auto lê o padrão do Header FITS.",
             style="Muted.TLabel",
-        ).grid(
-            row=0,
-            column=2,
-            sticky="w",
+        ).grid(row=0, column=2, sticky="w")
+
+        ttk.Label(debayer, text="Método:").grid(
+            row=1, column=0, sticky="w", pady=(10, 0)
         )
-
-        # --------------------------------------------------------
-        # Método de Debayer
-        # --------------------------------------------------------
-
-        ttk.Label(
-            debayer,
-            text="Método:",
-        ).grid(
-            row=1,
-            column=0,
-            sticky="w",
-            pady=(10, 0),
-        )
-
         self.debayer_method_combo = ttk.Combobox(
             debayer,
             textvariable=self.app.align_debayer_method_var,
-            values=[
-                "Bilinear",
-                "VNG",
-                "Edge-Aware",
-            ],
+            values=["Bilinear", "VNG", "Menon2007"],
             state="readonly",
             width=16,
         )
-
         self.debayer_method_combo.grid(
-            row=1,
-            column=1,
-            sticky="w",
-            padx=8,
-            pady=(10, 0),
+            row=1, column=1, sticky="w", padx=8, pady=(10, 0)
         )
 
         def _update_debayer_controls(self, *_):
             disabled = self.app.align_debayer_pattern_var.get() == "Nenhum"
-
             self.debayer_method_combo.configure(
                 state="disabled" if disabled else "readonly"
             )
 
-        self.app.align_debayer_pattern_var.trace_add(
-            "write",
-            _update_debayer_controls,
-        )
-
+        self.app.align_debayer_pattern_var.trace_add("write", _update_debayer_controls)
         _update_debayer_controls(self)
 
         ttk.Label(
             debayer,
-            text="VNG/Edge-Aware preservam melhor detalhes, mas são mais lentos.",
+            text="VNG/Menon preservam detalhes finos e reduzem ruído.",
             style="Muted.TLabel",
-        ).grid(
-            row=1,
-            column=2,
-            sticky="w",
-            pady=(10, 0),
-        )
+        ).grid(row=1, column=2, sticky="w", pady=(10, 0))
 
         # 3. Warping e Armazenamento
         params = ttk.LabelFrame(
             self,
-            text="Warping e Armazenamento",
+            text="Warping, Registro e Armazenamento",
             style="Section.TLabelframe",
             padding=12,
         )
@@ -168,34 +104,41 @@ class AlignView(BaseAstroView):
         ttk.Combobox(
             params,
             textvariable=self.app.align_interpolation_var,
-            values=["Nearest", "Bilinear", "Bicubic", "Lanczos"],
+            values=["nearest", "bilinear", "bicubic", "lanczos"],
             state="readonly",
             width=16,
         ).grid(row=0, column=1, sticky="w", padx=8)
+
+        # ---> NOVA OPÇÃO: REGISTRO CROMÁTICO <---
+        ttk.Checkbutton(
+            params,
+            text="Registro Cromático Avançado (Realinhar canais R e B usando G como âncora)",
+            variable=self.app.align_rgb_registration_var,
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
         ttk.Checkbutton(
             params,
             text="Preservar Header FITS original",
             variable=self.app.align_keep_header_var,
-        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(7, 0))
 
         ttk.Checkbutton(
             params,
             text="Sobrescrever arquivos existentes no destino",
             variable=self.app.align_overwrite_var,
-        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(7, 0))
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(7, 0))
 
         ttk.Checkbutton(
             params,
-            text="Apagar batches CFA intermediários após alinhar (Limpeza de Disco)",
+            text="Apagar batches intermediários após alinhar (Limpeza de Disco)",
             variable=self.app.align_delete_intermediates_var,
-        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(7, 0))
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(7, 0))
 
         ttk.Checkbutton(
             params,
             text="Dry-Run (Simular processamento sem gravar no disco)",
             variable=self.app.align_dry_run_var,
-        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(7, 0))
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(7, 0))
 
         # 4. Ações
         actions = ttk.Frame(self)
