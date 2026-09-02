@@ -208,6 +208,7 @@ def load_fits_data(
     with fits.open(
         filepath,
         memmap=False,
+        ignore_missing_end=True,
     ) as hdul:
         for hdu in hdul:
             if hdu.is_image and hdu.data is not None and hdu.data.ndim == 2:
@@ -445,8 +446,8 @@ def generate_valid_mask(
 # ============================================================
 
 
-def _uncompressed_output_header(header: fits.Header | None) -> fits.Header | None:
-    """Remove FITS structural and compression cards before writing an ImageHDU."""
+def _clean_structural_keywords(header: fits.Header | None) -> fits.Header | None:
+    """Remove cartas estruturais e de compressão para evitar corrupção ao reescrever o FITS."""
     if header is None:
         return None
 
@@ -455,6 +456,9 @@ def _uncompressed_output_header(header: fits.Header | None) -> fits.Header | Non
         "XTENSION",
         "BITPIX",
         "NAXIS",
+        "NAXIS1",
+        "NAXIS2",
+        "NAXIS3",
         "PCOUNT",
         "GCOUNT",
         "THEAP",
@@ -476,15 +480,13 @@ def save_aligned_fits(
     compress_output: bool = True,
 ) -> None:
     """Write aligned science data and its valid-pixel mask in the chosen layout."""
-    if header is not None:
-        header["BITPIX"] = 16
-        header["BZERO"] = 32768
-        header["BSCALE"] = 1
 
-        header.remove(
-            "BLANK",
-            ignore_missing=True,
-        )
+    clean_header = _clean_structural_keywords(header)
+
+    if clean_header is not None:
+        clean_header["BITPIX"] = 16
+        clean_header["BZERO"] = 32768
+        clean_header["BSCALE"] = 1
 
     data_uint16 = np.clip(
         data,
@@ -505,7 +507,7 @@ def save_aligned_fits(
     if compress_output:
         hdu_data = fits.CompImageHDU(
             data=data_uint16,
-            header=header,
+            header=clean_header,
             compression_type="RICE_1",
         )
         hdu_mask = fits.CompImageHDU(
@@ -516,7 +518,7 @@ def save_aligned_fits(
     else:
         hdu_data = fits.ImageHDU(
             data=data_uint16,
-            header=_uncompressed_output_header(header),
+            header=clean_header,
         )
         hdu_mask = fits.ImageHDU(
             data=np.asarray(mask, dtype=np.uint8),

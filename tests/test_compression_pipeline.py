@@ -64,6 +64,37 @@ class CompressionPipelineTests(unittest.TestCase):
         self.assertTrue((compressed_input / stacking.FITS_CACHE_DIR_NAME).is_dir())
         self.assertFalse((uncompressed_input / stacking.FITS_CACHE_DIR_NAME).exists())
 
+    def test_rgb_median_stack_reduces_substacks_channel_by_channel(self) -> None:
+        input_dir = self.root / "rgb"
+        input_dir.mkdir()
+        for index in range(3):
+            data = np.empty((4, 4, 3), dtype=np.float32)
+            data[..., 0] = 100 + index
+            data[..., 1] = 200 + index
+            data[..., 2] = 300 + index
+            align.save_aligned_fits(
+                data,
+                np.ones((4, 4), dtype=np.uint8),
+                fits.Header({"OBJECT": "M42"}),
+                input_dir / f"rgb_{index}.fits",
+                compress_output=False,
+            )
+
+        result = stacking.process_stacking(
+            stacking.StackingConfig(
+                input_dir=input_dir,
+                output_dir=self.root / "rgb_out",
+                selection_mode="All",
+                method="Median",
+                rejection_method="SigmaClip",
+                normalize=False,
+                workers=1,
+            )
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["shape"], (3, 4, 4))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -67,6 +67,21 @@ class RejectionPerformanceTests(unittest.TestCase):
         actual = stacking._reject_cpu(self.values, masks, "SigmaClip", 3.0, 3.0)
         np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-5)
 
+    def test_winsorized_partial_mask_matches_nanpercentile(self) -> None:
+        masks = self.valid.copy()
+        masks[:, ::3, ::4] = False
+        expected = _reference_reject(self.values, masks, "Winsorized", 3.0, 3.0)
+        actual = stacking._reject_cpu(self.values, masks, "Winsorized", 3.0, 3.0)
+        np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-4)
+
+    def test_all_invalid_pixels_do_not_emit_warning(self) -> None:
+        masks = np.zeros_like(self.valid)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = stacking._reject_cpu(self.values, masks, "SigmaClip", 3.0, 3.0)
+        self.assertFalse(caught)
+        self.assertTrue(np.isnan(result).all())
+
     def test_no_outlier_fast_path_avoids_nanmedian(self) -> None:
         values = np.arange(9 * 4 * 4, dtype=np.float32).reshape(9, 4, 4)
         masks = np.ones_like(values, dtype=bool)

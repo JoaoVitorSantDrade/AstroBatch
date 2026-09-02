@@ -13,6 +13,7 @@ import os
 import queue
 import tempfile
 import threading
+import time
 import uuid
 import warnings
 from collections.abc import Callable
@@ -1145,6 +1146,33 @@ def _gpu_memory_cleanup() -> None:
         pass
 
 
+def _nanpercentile_axis0(
+    values: np.ndarray,
+    percentile: float,
+) -> np.ndarray:
+    """Compute a NaN-aware percentile without NumPy's per-column Python loop."""
+    sorted_values = np.sort(values, axis=0)
+    valid_count = np.sum(~np.isnan(values), axis=0, dtype=np.intp)
+    rank = (valid_count - 1) * (percentile / 100.0)
+    lower_index = np.floor(np.maximum(rank, 0)).astype(np.intp)
+    upper_index = np.ceil(np.maximum(rank, 0)).astype(np.intp)
+    lower = np.take_along_axis(sorted_values, lower_index[None, ...], axis=0)[0]
+    upper = np.take_along_axis(sorted_values, upper_index[None, ...], axis=0)[0]
+    fraction = rank - lower_index
+    result = lower + (upper - lower) * fraction
+    return np.where(valid_count > 0, result, np.nan).astype(np.float32, copy=False)
+
+
+def _nanmedian_axis0_no_warning(values: np.ndarray) -> np.ndarray:
+    """NaN median that skips all-NaN columns without emitting a warning."""
+    flat = np.asarray(values, dtype=np.float32).reshape(values.shape[0], -1)
+    valid_columns = np.any(~np.isnan(flat), axis=0)
+    result = np.full(flat.shape[1], np.nan, dtype=np.float32)
+    if np.any(valid_columns):
+        result[valid_columns] = np.nanmedian(flat[:, valid_columns], axis=0)
+    return result.reshape(values.shape[1:])
+
+
 def _reject_cpu_all_valid(
     values: np.ndarray,
     method: str,
@@ -1184,7 +1212,9 @@ def _reject_cpu_all_valid(
             max(51.0, min(100.0, 100.0 - high * 10.0)),
             axis=0,
         )
-        return np.asarray(np.median(np.clip(values, p_low, p_high), axis=0), dtype=np.float32)
+        return np.asarray(
+            np.median(np.clip(values, p_low, p_high), axis=0), dtype=np.float32
+        )
 
     raise ValueError(f"Unsupported rejection method: {method}")
 
@@ -1207,7 +1237,7 @@ def _reject_cpu(
         warnings.simplefilter("ignore", category=RuntimeWarning)
 
         if method == "SigmaClip":
-            center = np.nanmedian(masked, axis=0)
+            center = _nanmedian_axis0_no_warning(masked)
             std = np.nanstd(masked, axis=0)
 
             lower = center - low * std
@@ -1220,11 +1250,8 @@ def _reject_cpu(
             masked[~valid] = np.nan
 
         elif method == "MAD":
-            center = np.nanmedian(masked, axis=0)
-            mad = np.nanmedian(
-                np.abs(masked - center),
-                axis=0,
-            )
+            center = _nanmedian_axis0_no_warning(masked)
+            mad = _nanmedian_axis0_no_warning(np.abs(masked - center))
 
             sigma = np.float32(1.4826) * mad
             lower = center - low * sigma
@@ -1237,15 +1264,13 @@ def _reject_cpu(
             masked[~valid] = np.nan
 
         elif method == "Winsorized":
-            p_low = np.nanpercentile(
+            p_low = _nanpercentile_axis0(
                 masked,
                 min(49.0, max(0.0, low * 10.0)),
-                axis=0,
             )
-            p_high = np.nanpercentile(
+            p_high = _nanpercentile_axis0(
                 masked,
                 max(51.0, min(100.0, 100.0 - high * 10.0)),
-                axis=0,
             )
 
             valid_range = np.isfinite(p_low) & np.isfinite(p_high) & (p_high >= p_low)
@@ -1258,12 +1283,12 @@ def _reject_cpu(
 
         if method in {"SigmaClip", "MAD"}:
             return np.asarray(
-                np.nanmedian(masked, axis=0),
+                _nanmedian_axis0_no_warning(masked),
                 dtype=np.float32,
             )
 
         return np.asarray(
-            np.nanmedian(masked, axis=0),
+            _nanmedian_axis0_no_warning(masked),
             dtype=np.float32,
         )
 
@@ -1564,28 +1589,58 @@ def _process_substack(
     channels: int,
     cancel_event: threading.Event | None,
     leaf_index: int = 0,
-    progress_queue: queue.SimpleQueue[tuple[int, int]] | None = None,
+    progress_queue: queue.SimpleQueue[tuple[int, int, str]] | None = None,
 ) -> SubstackInfo:
     """Create one leaf using wide row bands and a bounded number of files."""
     group_size = len(frames)
     band_rows = _leaf_band_rows(config, group_size, width, channels, height)
+    total_bands = math.ceil(height / band_rows)
     shape = (height, width) if channels == 1 else (channels, height, width)
     result = np.zeros(shape, dtype=np.float32)
     counts = np.zeros((height, width), dtype=np.uint32)
 
+    def report(increment: int, message: str) -> None:
+        if progress_queue is not None:
+            progress_queue.put((leaf_index, increment, message))
+
     # Opening each FITS once is the key change.  The previous spatial loop
     # reopened/decompressed each source for every x/y block.
-    handles = [_open_streaming_fits(frame.path) for frame in frames]
+    handles: list[fits.HDUList] = []
     try:
-        for y1 in range(0, height, band_rows):
+        for index, frame in enumerate(frames, start=1):
+            check_cancel(cancel_event)
+            report(
+                0,
+                f"Leaf {leaf_index + 1}: opening {index}/{group_size} ({frame.name})",
+            )
+            handles.append(_open_streaming_fits(frame.path))
+    except Exception:
+        for handle in handles:
+            handle.close()
+        raise
+    try:
+        last_frame_report = 0.0
+        for band_index, y1 in enumerate(range(0, height, band_rows), start=1):
             check_cancel(cancel_event)
             y2 = min(height, y1 + band_rows)
+            report(
+                0,
+                f"Leaf {leaf_index + 1}: reading band {band_index}/{total_bands}",
+            )
             for channel in range(channels):
                 values = np.empty((group_size, y2 - y1, width), dtype=np.float32)
                 masks = np.empty(values.shape, dtype=bool)
                 for index, (frame, hdul) in enumerate(
                     zip(frames, handles, strict=True)
                 ):
+                    now = time.monotonic()
+                    if index == 0 or now - last_frame_report >= 0.5:
+                        report(
+                            0,
+                            f"Leaf {leaf_index + 1}: band {band_index}/{total_bands}, "
+                            f"frame {index + 1}/{group_size} ({frame.name})",
+                        )
+                        last_frame_report = now
                     geometry = geometries[frame.path]
                     if shifts[index] is not None:
                         # Dithered bands need pixels outside their nominal row
@@ -1634,6 +1689,10 @@ def _process_substack(
                         mask &= frame.valid_mask[y1:y2, :]
                     values[index] = np.where(mask, raw, 0.0)
                     masks[index] = mask
+                report(
+                    0,
+                    f"Leaf {leaf_index + 1}: combining band {band_index}/{total_bands}",
+                )
                 combined = reject_and_combine_block(
                     values,
                     masks,
@@ -1650,8 +1709,10 @@ def _process_substack(
                     result[channel, y1:y2] = combined
                 if channel == 0:
                     counts[y1:y2] = masks.sum(axis=0, dtype=np.uint32)
-            if progress_queue is not None:
-                progress_queue.put((leaf_index, 1))
+            report(
+                1,
+                f"Leaf {leaf_index + 1}: completed band {band_index}/{total_bands}",
+            )
     finally:
         for handle in handles:
             handle.close()
@@ -1684,33 +1745,59 @@ def _combine_substacks(
             data_list.append(np.array(hdul[0].data, dtype=np.float32, copy=True))
             masks.append(np.array(hdul["VALID_MASK"].data, dtype=bool, copy=True))
             counts.append(np.array(hdul["SUB_COUNT"].data, dtype=np.uint32, copy=True))
+
     values = np.stack(data_list)
-    valid = np.stack(masks)
-    coverage = np.sum(np.stack(counts), axis=0, dtype=np.uint32)
+
+    # Se a saída for RGB (4D: [N_substacks, Canais, Altura, Largura])
+    # a máscara e a contagem que estão em 3D [N_substacks, Altura, Largura] precisam se expandir.
+    if values.ndim == 4:
+        valid = np.stack(masks)
+        valid = np.broadcast_to(valid[:, None, :, :], values.shape)
+        coverage_base = np.sum(np.stack(counts), axis=0, dtype=np.uint32)
+        # O coverage de saída deve permanecer 2D (Altura, Largura) para uso posterior na referência
+        coverage = coverage_base
+    else:
+        valid = np.stack(masks)
+        coverage = np.sum(np.stack(counts), axis=0, dtype=np.uint32)
+
     threshold = max(1, math.ceil(total_frames * 0.70))
     final_mask = coverage >= threshold
-    if values.ndim == 4:
-        valid = np.broadcast_to(valid[:, None], values.shape)
+
     if config.method == "Mean" and config.rejection_method == "None":
         weights = np.stack(counts).astype(np.float32)
         if values.ndim == 4:
-            weights = weights[:, None]
+            weights = weights[:, None, :, :]
         result = np.sum(values * weights, axis=0) / np.maximum(
-            coverage if values.ndim == 3 else coverage[None], 1
+            coverage if values.ndim == 3 else coverage[None, :, :], 1
         )
     elif config.method == "Sum" and config.rejection_method == "None":
         result = np.sum(np.where(valid, values, 0.0), axis=0)
     else:
-        result = reject_and_combine_block(
-            values,
-            valid,
-            config.method,
-            config.rejection_method,
-            config.rejection_low,
-            config.rejection_high,
-            cancel_event,
-            config.use_gpu,
-        )
+        if values.ndim == 3:
+            result = reject_and_combine_block(
+                values,
+                valid,
+                config.method,
+                config.rejection_method,
+                config.rejection_low,
+                config.rejection_high,
+                cancel_event,
+                config.use_gpu,
+            )
+        else:
+            result = np.empty(values.shape[1:], dtype=np.float32)
+            for channel in range(values.shape[1]):
+                check_cancel(cancel_event)
+                result[channel] = reject_and_combine_block(
+                    values[:, channel],
+                    valid[:, channel],
+                    config.method,
+                    config.rejection_method,
+                    config.rejection_low,
+                    config.rejection_high,
+                    cancel_event,
+                    config.use_gpu,
+                )
     return np.asarray(result, dtype=np.float32), final_mask, coverage
 
 
@@ -1809,7 +1896,7 @@ def _create_substacks(
     factor_groups = _partition_frames(normalization_factors, leaf_count)
     shift_groups = _partition_frames(dither_shifts, leaf_count)
     results: list[SubstackInfo] = []
-    progress_queue: queue.SimpleQueue[tuple[int, int]] = queue.SimpleQueue()
+    progress_queue: queue.SimpleQueue[tuple[int, int, str]] = queue.SimpleQueue()
     band_totals = [
         math.ceil(height / _leaf_band_rows(config, len(group), width, channels, height))
         for group in groups
@@ -1821,7 +1908,7 @@ def _create_substacks(
             f"Starting substack work | Leafs {leaf_count} | bands {total_bands}"
         )
     with ThreadPoolExecutor(
-        max_workers=workers, thread_name_prefix="AstroLeaf"
+        max_workers=workers, thread_name_prefix="AstroLeaf_substack"
     ) as executor:
         futures = [
             executor.submit(
@@ -1849,7 +1936,7 @@ def _create_substacks(
             done, pending = wait(pending, timeout=0.1, return_when=FIRST_COMPLETED)
             while True:
                 try:
-                    leaf_index, increment = progress_queue.get_nowait()
+                    leaf_index, increment, message = progress_queue.get_nowait()
                 except queue.Empty:
                     break
                 band_done[leaf_index] += increment
@@ -1857,8 +1944,7 @@ def _create_substacks(
                     progress_callback(
                         sum(band_done),
                         total_bands,
-                        f"Leaf {leaf_index + 1}/{len(groups)}: "
-                        f"band {band_done[leaf_index]}/{band_totals[leaf_index]}",
+                        message,
                     )
             for future in done:
                 results.append(future.result())
