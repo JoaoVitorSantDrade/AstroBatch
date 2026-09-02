@@ -8,11 +8,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import colour_demosaicing
-import cv2
 import numpy as np
 from astropy.io import fits
 from astropy.utils.exceptions import AstropyWarning
-from skimage.restoration import richardson_lucy
 from skimage.transform import AffineTransform, warp
 
 # Suprime todos os avisos de verificação de cabeçalho do Astropy
@@ -485,32 +483,6 @@ def save_compressed_fits(
     )
 
 
-def build_motion_kernel(dx: float, dy: float) -> np.ndarray:
-    # Aumentamos o kernel para acomodar o anti-aliasing e o desfoque
-    length = max(5, int(np.ceil(np.sqrt(dx**2 + dy**2))) + 4)
-    if length % 2 == 0:
-        length += 1
-
-    kernel = np.zeros((length, length), dtype=np.float32)
-    center = length // 2
-
-    # cv2.LINE_AA desenha o rastro com suavização sub-pixel real
-    cv2.line(
-        kernel,
-        (center, center),
-        (int(round(center + dx)), int(round(center + dy))),
-        1.0,
-        1,
-        cv2.LINE_AA,
-    )
-
-    # O blur simula o espalhamento atmosférico durante a exposição do rastro
-    kernel = cv2.GaussianBlur(kernel, (3, 3), 0)
-
-    sum_k = np.sum(kernel)
-    return kernel / sum_k if sum_k > 0 else kernel
-
-
 # ============================================================
 # Frame individual
 # ============================================================
@@ -603,46 +575,6 @@ def _process_single_alignment(
             pattern,
             config.debayer_method,
         )
-
-        dx, dy = frame_info.get("translation", [0.0, 0.0])
-
-        drift_x = -dx * 0.8
-        drift_y = -dy * 0.8
-
-        if abs(drift_x) > 1.0 or abs(drift_y) > 1.0:
-            kernel = build_motion_kernel(drift_x, drift_y)
-
-            if rgb_data.ndim == 3:
-                channels = []
-                for i in range(rgb_data.shape[2]):
-                    channel_data = rgb_data[:, :, i]
-                    channel_max = channel_data.max()
-                    if channel_max > 0:
-                        channel_data = channel_data / channel_max
-                        # Limitado a 5 iterações: cura o trailing sem criar anéis negros (Ringing)
-                        deconvolved = richardson_lucy(
-                            channel_data,
-                            kernel,
-                            num_iter=5,
-                            clip=False,
-                        )
-                        deconvolved = deconvolved * channel_max
-                        channels.append(deconvolved)
-                    else:
-                        channels.append(channel_data)
-                rgb_data = np.stack(channels, axis=-1).astype(np.float32)
-            else:
-                channel_max = rgb_data.max()
-                if channel_max > 0:
-                    rgb_data = rgb_data / channel_max
-                    rgb_data = richardson_lucy(
-                        rgb_data,
-                        kernel,
-                        num_iter=5,
-                        clip=False,
-                    )
-                    rgb_data = rgb_data * channel_max
-                rgb_data = rgb_data.astype(np.float32)
 
         # ----------------------------------------------------
         # Warping (Scikit-Image)

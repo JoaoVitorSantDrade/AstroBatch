@@ -8,3 +8,7 @@ matplotlib
 psutil
 colour-demosaicing
 scikit-image
+cupy-cuda13x
+cupy-cuda13x[ctk]
+pyinstrument
+py-spy
