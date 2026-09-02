@@ -5,11 +5,11 @@ import warnings
 
 import numpy as np
 
-import astroflow_logic as flow
-import stacking_logic as stacking
+import astrobatch.processing.flow as flow
+import astrobatch.processing.stacking as stacking
 
 try:
-    import astroalign_logic as align
+    import astrobatch.processing.align as align
 except ModuleNotFoundError:
     align = None
 

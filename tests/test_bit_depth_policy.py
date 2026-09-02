@@ -8,8 +8,8 @@ from pathlib import Path
 import numpy as np
 from astropy.io import fits
 
-import calibration_logic as calibration
-import stacking_logic as stacking
+import astrobatch.processing.calibration as calibration
+import astrobatch.processing.stacking as stacking
 
 
 class BitDepthPolicyTests(unittest.TestCase):

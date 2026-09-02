@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 from astropy.io import fits
 
-import astroalign_logic as align
+import astrobatch.processing.align as align
 
 
 class AstroAlignOutputTests(unittest.TestCase):

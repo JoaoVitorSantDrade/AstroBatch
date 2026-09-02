@@ -8,9 +8,9 @@ from pathlib import Path
 import numpy as np
 from astropy.io import fits
 
-import calibration_logic as calibration
-from cpu_kernels import calibrate_inplace, masked_extrema, warm_cpu_kernels
-import stacking_logic as stacking
+import astrobatch.processing.calibration as calibration
+from astrobatch.processing.cpu_kernels import calibrate_inplace, masked_extrema, warm_cpu_kernels
+import astrobatch.processing.stacking as stacking
 
 
 class CpuKernelExactnessTests(unittest.TestCase):

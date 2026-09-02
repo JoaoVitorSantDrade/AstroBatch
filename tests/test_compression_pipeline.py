@@ -7,8 +7,8 @@ from pathlib import Path
 import numpy as np
 from astropy.io import fits
 
-import astroalign_logic as align
-import stacking_logic as stacking
+import astrobatch.processing.align as align
+import astrobatch.processing.stacking as stacking
 
 
 class CompressionPipelineTests(unittest.TestCase):

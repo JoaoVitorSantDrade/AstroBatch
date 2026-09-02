@@ -17,12 +17,12 @@ import psutil
 # Make the repository root importable when this file is executed directly.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import astroflow_logic as flow
-import stacking_logic as stacking
-from cpu_kernels import warm_cpu_kernels
+import astrobatch.processing.flow as flow
+import astrobatch.processing.stacking as stacking
+from astrobatch.processing.cpu_kernels import warm_cpu_kernels
 
 try:
-    import astroalign_logic as align
+    import astrobatch.processing.align as align
 except ModuleNotFoundError:
     align = None
 

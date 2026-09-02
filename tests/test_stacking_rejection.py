@@ -7,7 +7,7 @@ from unittest import mock
 
 import numpy as np
 
-import stacking_logic as stacking
+import astrobatch.processing.stacking as stacking
 
 
 def _reference_reject(
