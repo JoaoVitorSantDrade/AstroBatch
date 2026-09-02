@@ -376,7 +376,7 @@ def _match_incremental_stars(
     current_stars: np.ndarray,
     shift: tuple[float, float],
     matching_radius: float,
-) -> tuple[list, list]:
+) -> tuple[np.ndarray, np.ndarray]:
     if len(previous_stars) == 0 or len(current_stars) == 0:
         return [], []
     dx, dy = shift
@@ -386,23 +386,30 @@ def _match_incremental_stars(
         shifted_current, distance_upper_bound=matching_radius
     )
 
-    candidates = [
-        (float(distance), int(previous_idx), int(current_idx))
-        for current_idx, (distance, previous_idx) in enumerate(zip(distances, indices))
-        if np.isfinite(distance) and previous_idx < len(previous_stars)
-    ]
-    candidates.sort(key=lambda item: item[0])
+    # KDTree.query already evaluates every candidate in compiled code. Keep the
+    # original greedy rule (nearest current star wins for each previous star),
+    # but choose winners with arrays instead of Python tuples and sets.
+    current_indices = np.arange(len(current_stars), dtype=np.intp)
+    valid = np.isfinite(distances) & (indices < len(previous_stars))
+    if not np.any(valid):
+        return [], []
 
-    used_previous = set()
-    previous_points, current_points = [], []
-    for distance, previous_idx, current_idx in candidates:
-        if previous_idx in used_previous:
-            continue
-        used_previous.add(previous_idx)
-        previous_points.append(previous_stars[previous_idx])
-        current_points.append(current_stars[current_idx])
+    candidate_distances = distances[valid]
+    candidate_previous = indices[valid].astype(np.intp, copy=False)
+    candidate_current = current_indices[valid]
+    # Stable ordering retains the previous tuple-sort tie break: input/current
+    # star order wins when distances are equal.
+    order = np.argsort(candidate_distances, kind="stable")
+    ordered_previous = candidate_previous[order]
+    # The same previous star can appear at non-adjacent distances, so obtain
+    # each first occurrence globally, then restore distance ordering.
+    _, first_occurrences = np.unique(ordered_previous, return_index=True)
+    winner_order = order[np.sort(first_occurrences)]
 
-    return previous_points, current_points
+    return (
+        np.asarray(previous_stars, dtype=np.float32)[candidate_previous[winner_order]],
+        np.asarray(current_stars, dtype=np.float32)[candidate_current[winner_order]],
+    )
 
 
 # ============================================================
@@ -431,8 +438,8 @@ def _estimate_incremental_transform(
         previous,
         method=cv2.RANSAC,
         ransacReprojThreshold=ransac_thresh,
-        maxIters=4000,
-        confidence=0.9999,
+        maxIters=7000,
+        confidence=0.99995,
         refineIters=25,
     )
 
@@ -889,7 +896,8 @@ def _build_quad_hash(
     Normaliza 4 pontos em um sistema de coordenadas invariante a escala e rotação:
     A e B tornam-se (0,0) e (1,1). C e D geram o hash 4D.
     """
-    # Encontra os dois pontos mais distantes para servir de eixo de base
+    # This fixed six-pair calculation is intentionally scalar: allocating
+    # temporary NumPy arrays here is slower than this tiny hot loop.
     best_dist = -1.0
     best_pair = (0, 1)
     for i in range(4):

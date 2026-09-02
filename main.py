@@ -53,6 +53,19 @@ class AstroProcessManager(tk.Tk):
         self._configure_style()
         self.load_settings()
         self._create_widgets()
+        self._start_cpu_kernel_warmup()
+
+    def _start_cpu_kernel_warmup(self) -> None:
+        """Compile/cache CPU kernels without delaying the UI startup."""
+        def warm() -> None:
+            try:
+                from cpu_kernels import warm_cpu_kernels
+
+                warm_cpu_kernels()
+            except Exception as exc:
+                self.log_queue.put(f"[CPU] Kernel warm-up unavailable: {exc}\n")
+
+        threading.Thread(target=warm, name="cpu_kernel_warmup", daemon=True).start()
 
         self.after(50, self._drain_log_queue)
         self.after(100, self._update_global_master_options)
@@ -140,15 +153,8 @@ class AstroProcessManager(tk.Tk):
 
         # ---- Saída ----
         self.stack_output_name_var = tk.StringVar(value="stacked_image.fits")
-        self.stack_output_bit_depth_var = tk.StringVar(value="32-bit")  # NOVO!
+        self.stack_output_bit_depth_var = tk.StringVar(value="16-bit")
         self.stack_compress_var = tk.BooleanVar(value=True)
-        try:
-            from stacking_logic import HAS_CUPY
-
-            self.stack_gpu_available = bool(HAS_CUPY)
-        except Exception:
-            self.stack_gpu_available = False
-        self.stack_use_gpu_var = tk.BooleanVar(value=False)
 
         # Registry atualizado
         self.config_registry = {
@@ -223,7 +229,6 @@ class AstroProcessManager(tk.Tk):
                 "output_name": self.stack_output_name_var,
                 "output_bit_depth": self.stack_output_bit_depth_var,
                 "compress_output": self.stack_compress_var,
-                "use_gpu": self.stack_use_gpu_var,
             },
         }
 
@@ -449,7 +454,10 @@ class AstroProcessManager(tk.Tk):
                 for key, variable in variables.items():
                     if key in module_data:
                         try:
-                            variable.set(module_data[key])
+                            value = module_data[key]
+                            if module == "AstroStack" and key == "output_bit_depth":
+                                value = "16-bit"
+                            variable.set(value)
                         except (tk.TclError, ValueError, TypeError):
                             pass
 
@@ -865,7 +873,6 @@ class AstroProcessManager(tk.Tk):
             "output_bit_depth": self.stack_output_bit_depth_var.get(),
             "compress_output": self.stack_compress_var.get(),
             "apply_dither_correction": self.stack_dither_correction_var.get(),
-            "use_gpu": self.stack_use_gpu_var.get() and self.stack_gpu_available,
         }
 
         self._lock_ui("Stack")

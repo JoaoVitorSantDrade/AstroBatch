@@ -7,8 +7,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
+import psutil
 from astropy.io import fits
 from astropy.utils.exceptions import AstropyWarning
+
+from cpu_kernels import calibrate_inplace
 
 # Suprime avisos de verificação de cabeçalho do Astropy.
 warnings.simplefilter("ignore", category=AstropyWarning)
@@ -64,45 +67,93 @@ def _read_for_master(
     return load_fits_data(filepath)
 
 
-def save_float32_fits(
+def _inspect_master_frame(filepath: Path) -> tuple[tuple[int, int], fits.Header, int]:
+    """Read master geometry without retaining the image in RAM."""
+    with fits.open(filepath, memmap=True, ignore_missing_end=True) as hdul:
+        for index, hdu in enumerate(hdul):
+            if hdu.is_image and hdu.shape is not None and len(hdu.shape) == 2:
+                return tuple(hdu.shape), _sanitize_float_header(hdu.header), index
+    raise ValueError(f"Imagem 2D não encontrada em {filepath.name}")
+
+
+def _read_master_band(filepath: Path, hdu_index: int, y1: int, y2: int) -> np.ndarray:
+    """Load one scaled FITS row band as a compact float32 array."""
+    with fits.open(filepath, memmap=False, ignore_missing_end=True) as hdul:
+        section = hdul[hdu_index].section[y1:y2, :]
+        return np.ascontiguousarray(section, dtype=np.float32)
+
+
+def _master_band_rows(frame_count: int, width: int, height: int) -> int:
+    """Choose a full-width band that consumes at most 25% of free RAM."""
+    available = max(64 * 1024 * 1024, int(psutil.virtual_memory().available))
+    budget = max(32 * 1024 * 1024, available // 4)
+    bytes_per_row = max(1, frame_count * width * np.dtype(np.float32).itemsize)
+    return max(1, min(height, budget // bytes_per_row))
+
+
+def _finite_range(data: np.ndarray) -> tuple[float, float]:
+    finite = np.asarray(data, dtype=np.float32)[np.isfinite(data)]
+    if finite.size == 0:
+        return 0.0, 0.0
+    return float(np.min(finite)), float(np.max(finite))
+
+
+def normalize_to_uint16(
+    data: np.ndarray, data_min: float, data_max: float
+) -> np.ndarray:
+    """Map data to a shared unsigned-16-bit range."""
+    values = np.asarray(data, dtype=np.float32)
+    if not np.isfinite(data_min) or not np.isfinite(data_max) or data_max <= data_min:
+        return np.zeros(values.shape, dtype=np.uint16)
+    clean = np.nan_to_num(values, nan=data_min, posinf=data_max, neginf=data_min)
+    scale = np.float32(65535.0 / (data_max - data_min))
+    return np.clip((clean - np.float32(data_min)) * scale, 0.0, 65535.0).astype(
+        np.uint16
+    )
+
+
+def _restore_normalized_values(data: np.ndarray, header: fits.Header) -> np.ndarray:
+    """Restore a normalized calibration master to its in-RAM value range."""
+    if not bool(header.get("CALNORM", False)):
+        return np.asarray(data, dtype=np.float32)
+    data_min = float(header.get("CALMIN", 0.0))
+    data_max = float(header.get("CALMAX", data_min))
+    if not np.isfinite(data_min) or not np.isfinite(data_max) or data_max <= data_min:
+        return np.full(np.asarray(data).shape, data_min, dtype=np.float32)
+    scale = np.float32((data_max - data_min) / 65535.0)
+    return np.asarray(data, dtype=np.float32) * scale + np.float32(data_min)
+
+
+def load_calibration_master(filepath: Path) -> np.ndarray:
+    """Load a uint16 calibration master and restore its recorded scale in RAM."""
+    data, header = load_fits_data(filepath)
+    return _restore_normalized_values(data, header)
+
+
+def save_uint16_fits(
     data: np.ndarray,
     header: fits.Header | None,
     output_path: Path,
+    data_min: float,
+    data_max: float,
 ) -> None:
-    """
-    Salva a imagem em FITS float32 SEM conversão para uint16.
-
-    Não há:
-        - clipping 0..65535;
-        - cast uint16;
-        - BZERO/BSCALE de unsigned integer;
-        - quantização de float durante compressão.
-
-    A saída é intencionalmente um FITS float32 não comprimido para
-    preservar exatamente os valores float32 produzidos pela calibração.
-
-    A conversão para uint16 anterior era inadequada para este estágio:
-    subtração de Dark e divisão por Flat produzem valores fracionários
-    e podem também produzir valores negativos legítimos do ponto de vista
-    matemático do pipeline. Esses valores não devem ser descartados aqui.
-    """
+    """Persist a FITS 16-bit image using the provided shared value range."""
     output_path.parent.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    float_data = np.asarray(
-        data,
-        dtype=np.float32,
-    )
+    output_data = normalize_to_uint16(data, data_min, data_max)
 
-    float_header = _sanitize_float_header(header)
+    output_header = _sanitize_float_header(header)
+    output_header["CALNORM"] = (True, "Shared calibration normalization")
+    output_header["CALMIN"] = (float(data_min), "Calibration normalization minimum")
+    output_header["CALMAX"] = (float(data_max), "Calibration normalization maximum")
 
-    # Não definimos BITPIX manualmente; o Astropy o determina a partir
-    # do dtype=float32 e evita inconsistência entre header e dados.
+    # Astropy writes uint16 using the standard FITS unsigned scaling cards.
     hdu = fits.PrimaryHDU(
-        data=float_data,
-        header=float_header,
+        data=output_data,
+        header=output_header,
     )
 
     hdul = fits.HDUList([hdu])
@@ -131,10 +182,9 @@ def make_master(
     cancel_event: threading.Event,
 ) -> np.ndarray | None:
     """
-    Cria Master Dark ou Master Flat em float32.
+    Cria Master Dark ou Master Flat e o persiste em FIT 16-bit.
 
-    Todos os frames são carregados como float32 e a mediana é calculada
-    nesse mesmo domínio. O arquivo resultante também permanece float32.
+    A mediana usa float32 somente em RAM; nenhum FITS float32 é criado.
     """
     files = sorted(
         [
@@ -149,107 +199,42 @@ def make_master(
         app_print(f"Nenhum frame encontrado em {folder_path.name} para criar Master.\n")
         return None
 
-    app_print(
-        f"Lendo {len(files)} frames em paralelo para gerar Master "
-        f"({folder_path.name})...\n"
-    )
-
-    data_stack: list[np.ndarray] = []
-    base_header: fits.Header | None = None
-
-    workers = max(
-        1,
-        min(
-            MAX_WORKERS,
-            (os.cpu_count() or 1) + 2,
-        ),
-    )
-
-    with ThreadPoolExecutor(
-        max_workers=workers,
-        thread_name_prefix="master_read",
-    ) as executor:
-        futures = {
-            executor.submit(
-                _read_for_master,
-                filepath,
-            ): filepath
-            for filepath in files
-        }
-
-        for future in as_completed(futures):
-            if cancel_event.is_set():
-                for pending in futures:
-                    pending.cancel()
-                return None
-
-            filepath = futures[future]
-
-            try:
-                data, header = future.result()
-
-                # Garante explicitamente float32 mesmo que o leitor
-                # de uma instalação do Astropy retorne outro dtype.
-                data = np.asarray(
-                    data,
-                    dtype=np.float32,
-                )
-
-                data_stack.append(data)
-
-                if base_header is None:
-                    base_header = header
-
-            except Exception as exc:
-                app_print(f"Erro ao ler {filepath.name}: {exc}\n")
-
-    if cancel_event.is_set():
-        return None
-
-    if not data_stack:
-        app_print(f"Nenhum frame válido para gerar Master em {folder_path.name}.\n")
-        return None
-
-    # Verificação de geometria antes da mediana.
-    reference_shape = data_stack[0].shape
-
-    incompatible = [
-        index for index, data in enumerate(data_stack) if data.shape != reference_shape
-    ]
-
+    app_print(f"Inspecionando {len(files)} frames para gerar Master ({folder_path.name})...\n")
+    reference_shape, base_header, hdu_index = _inspect_master_frame(files[0])
+    incompatible = []
+    for index, filepath in enumerate(files[1:], start=1):
+        shape, _, candidate_hdu_index = _inspect_master_frame(filepath)
+        if shape != reference_shape or candidate_hdu_index != hdu_index:
+            incompatible.append(index)
     if incompatible:
         raise ValueError(
             "Frames incompatíveis encontrados durante a criação do Master. "
-            f"Shape de referência={reference_shape}; "
-            f"índices incompatíveis={incompatible[:10]}"
+            f"Shape de referência={reference_shape}; índices incompatíveis={incompatible[:10]}"
         )
 
-    app_print(f"Calculando a mediana dos {len(data_stack)} frames em float32...\n")
-
-    # np.median preserva a natureza float32 dos dados da entrada em
-    # versões atuais do NumPy, mas fazemos cast explícito para garantir
-    # o contrato do módulo.
-    master_data = np.asarray(
-        np.median(
-            np.stack(data_stack, axis=0),
-            axis=0,
-        ),
-        dtype=np.float32,
+    height, width = reference_shape
+    band_rows = _master_band_rows(len(files), width, height)
+    app_print(
+        f"Calculando Master em bandas de {band_rows} linhas; "
+        f"buffer={len(files)}x{band_rows}x{width} float32.\n"
     )
-
-    del data_stack
+    master_data = np.empty(reference_shape, dtype=np.float32)
+    for y1 in range(0, height, band_rows):
+        if cancel_event.is_set():
+            return None
+        y2 = min(height, y1 + band_rows)
+        band_values = np.empty((len(files), y2 - y1, width), dtype=np.float32)
+        for index, filepath in enumerate(files):
+            band_values[index] = _read_master_band(filepath, hdu_index, y1, y2)
+        master_data[y1:y2] = np.median(band_values, axis=0)
 
     if cancel_event.is_set():
-        del master_data
         return None
 
-    save_float32_fits(
-        master_data,
-        base_header,
-        output_path,
-    )
+    master_min, master_max = _finite_range(master_data)
+    save_uint16_fits(master_data, base_header, output_path, master_min, master_max)
 
-    app_print(f"Master float32 salvo em: {output_path.name}\n")
+    app_print(f"Master 16-bit normalizado salvo em: {output_path.name}\n")
 
     return master_data
 
@@ -258,7 +243,7 @@ def prepare_master_flat(
     master_flat: np.ndarray,
 ) -> np.ndarray:
     """
-    Normaliza o Master Flat preservando float32.
+    Normaliza o Master Flat em RAM antes de sua gravação em 16-bit.
 
     Pixels não utilizáveis são neutralizados para 1.0, evitando divisão
     por zero sem modificar artificialmente pixels válidos.
@@ -290,9 +275,10 @@ def calibrate_single_frame(
     master_dark: np.ndarray | None,
     master_flat: np.ndarray | None,
     overwrite: bool,
+    normalization_range: tuple[float, float],
 ) -> str | None:
     """
-    Calibra um LIGHT preservando float32.
+    Calibra um LIGHT e o grava normalizado em FIT 16-bit.
 
     Fórmula:
 
@@ -308,45 +294,13 @@ def calibrate_single_frame(
     try:
         data, header = load_fits_data(light_path)
 
-        # ----------------------------------------------------
-        # Dark subtraction
-        # ----------------------------------------------------
-        if master_dark is not None:
-            if master_dark.shape != data.shape:
-                raise ValueError(
-                    "Master Dark possui dimensão incompatível: "
-                    f"{master_dark.shape} vs {data.shape}"
-                )
-
-            data -= np.asarray(
-                master_dark,
-                dtype=np.float32,
-            )
-
-            # NÃO fazemos:
-            #
-            # data[data < 0] = 0.0
-            #
-            # Valores negativos não são convertidos artificialmente.
-
-        # ----------------------------------------------------
-        # Flat correction
-        # ----------------------------------------------------
-        if master_flat is not None:
-            if master_flat.shape != data.shape:
-                raise ValueError(
-                    "Master Flat possui dimensão incompatível: "
-                    f"{master_flat.shape} vs {data.shape}"
-                )
-
-            # np.divide evita uma exceção/warning desnecessário caso
-            # um Flat inválido apareça inesperadamente.
-            np.divide(
-                data,
-                master_flat,
-                out=data,
-                where=np.isfinite(master_flat) & (master_flat > np.float32(0.01)),
-            )
+        if master_dark is not None and master_dark.shape != data.shape:
+            raise ValueError(f"Master Dark possui dimensão incompatível: {master_dark.shape} vs {data.shape}")
+        if master_flat is not None and master_flat.shape != data.shape:
+            raise ValueError(f"Master Flat possui dimensão incompatível: {master_flat.shape} vs {data.shape}")
+        data = calibrate_inplace(
+            np.ascontiguousarray(data, dtype=np.float32), master_dark, master_flat
+        )
 
         # ----------------------------------------------------
         # Garantia final de dtype.
@@ -360,16 +314,41 @@ def calibrate_single_frame(
         # Eles podem indicar problema real no Flat/Dark e não devem ser
         # escondidos nesta etapa do workflow.
 
-        save_float32_fits(
-            data,
-            header,
-            out_path,
-        )
+        save_uint16_fits(data, header, out_path, *normalization_range)
 
         return None
 
     except Exception as exc:
         return f"Erro em {light_path.name}: {exc}"
+
+
+def _calibration_range(
+    lights: list[Path],
+    master_dark: np.ndarray | None,
+    master_flat: np.ndarray | None,
+    app_print,
+    cancel_event: threading.Event,
+) -> tuple[float, float] | None:
+    """Determine one finite post-calibration range for all LIGHT frames."""
+    data_min = np.inf
+    data_max = -np.inf
+    for index, light_path in enumerate(lights, start=1):
+        if cancel_event.is_set():
+            return None
+        data, _ = load_fits_data(light_path)
+        if master_dark is not None and master_dark.shape != data.shape:
+            raise ValueError(f"Master Dark incompatível com {light_path.name}")
+        if master_flat is not None and master_flat.shape != data.shape:
+            raise ValueError(f"Master Flat incompatível com {light_path.name}")
+        calibrated = calibrate_inplace(
+            np.ascontiguousarray(data, dtype=np.float32), master_dark, master_flat
+        )
+        current_min, current_max = _finite_range(calibrated)
+        data_min = min(data_min, current_min)
+        data_max = max(data_max, current_max)
+        if index % 10 == 0 or index == len(lights):
+            app_print(f"Normalização: analisando {index}/{len(lights)} frames...\n")
+    return float(data_min), float(data_max)
 
 
 def run_calibration_pipeline(
@@ -381,11 +360,9 @@ def run_calibration_pipeline(
     """
     Executa a calibração completa.
 
-    Todos os produtos permanecem em float32:
-
-        RAW / Master Dark / Master Flat / LIGHT calibrado
-
-    Nenhum produto de calibração é convertido para uint16.
+    A matemática de calibração usa float32 apenas em RAM. Masters e LIGHTs
+    calibrados são persistidos como FITS uint16; os LIGHTs compartilham uma
+    única faixa global de normalização calculada antes da gravação.
     """
 
     input_dir = Path(config["input_dir"])
@@ -420,14 +397,9 @@ def run_calibration_pipeline(
             )
 
         elif dark_path.is_file():
-            master_dark, _ = load_fits_data(dark_path)
+            master_dark = load_calibration_master(dark_path)
 
-            master_dark = np.asarray(
-                master_dark,
-                dtype=np.float32,
-            )
-
-            app_print("Master Dark float32 carregado.\n")
+            app_print("Master Dark 16-bit carregado para cálculo em RAM.\n")
 
     if cancel_event.is_set():
         app_print("\nCalibração cancelada durante o Master Dark.\n")
@@ -456,24 +428,27 @@ def run_calibration_pipeline(
 
                 # Atualiza o arquivo do Master Flat com a forma
                 # normalizada que será efetivamente usada.
-                save_float32_fits(
+                flat_min, flat_max = _finite_range(master_flat)
+                save_uint16_fits(
                     master_flat,
                     None,
                     master_flat_path,
+                    flat_min,
+                    flat_max,
                 )
 
-                app_print("Master Flat normalizado e salvo em float32.\n")
+                app_print("Master Flat normalizado e salvo em 16-bit.\n")
 
                 del raw_master_flat
 
         elif flat_path.is_file():
-            raw_master_flat, _ = load_fits_data(flat_path)
+            raw_master_flat = load_calibration_master(flat_path)
 
             master_flat = prepare_master_flat(raw_master_flat)
 
             del raw_master_flat
 
-            app_print("Master Flat float32 carregado e normalizado.\n")
+            app_print("Master Flat 16-bit carregado e normalizado em RAM.\n")
 
     if cancel_event.is_set():
         app_print("\nCalibração cancelada durante os Masters.\n")
@@ -497,6 +472,22 @@ def run_calibration_pipeline(
     if total == 0:
         app_print("Nenhum LIGHT encontrado na pasta de entrada.\n")
         return
+
+    app_print("\nCalculando faixa global para normalização 16-bit...\n")
+    normalization_range = _calibration_range(
+        lights,
+        master_dark,
+        master_flat,
+        app_print,
+        cancel_event,
+    )
+    if normalization_range is None or cancel_event.is_set():
+        app_print("\nCalibração cancelada durante a normalização.\n")
+        return
+    app_print(
+        f"Faixa global calibrada: {normalization_range[0]:.6g} a "
+        f"{normalization_range[1]:.6g}.\n"
+    )
 
     app_print(f"\nIniciando calibração paralela de {total} frames...\n")
 
@@ -550,6 +541,7 @@ def run_calibration_pipeline(
                             True,
                         )
                     ),
+                    normalization_range,
                 )
 
                 future_to_light[future] = light_path

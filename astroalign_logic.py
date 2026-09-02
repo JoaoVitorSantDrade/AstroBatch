@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import colour_demosaicing
+import cv2
 import numpy as np
 from astropy.io import fits
 from astropy.utils.exceptions import AstropyWarning
@@ -23,6 +24,11 @@ INTERPOLATION_MODES = {
     "Bilinear": "bilinear",
     "Bicubic": "bicubic",
     "Lanczos": "lanczos",
+}
+
+CV2_INTERPOLATION_MODES = {
+    "nearest": cv2.INTER_NEAREST,
+    "bilinear": cv2.INTER_LINEAR,
 }
 
 # ============================================================
@@ -320,6 +326,33 @@ def process_in_memory_debayer(
 # ============================================================
 
 
+def _warp_affine_cpu(
+    data: np.ndarray,
+    matrix: np.ndarray,
+    interpolation_mode: str,
+) -> np.ndarray:
+    """Apply one affine transform to a mono or interleaved RGB image.
+
+    OpenCV processes an HxWxC image in one native call, replacing the former
+    Python loop that invoked scikit-image once for every colour channel.  The
+    matrix maps source coordinates to output coordinates, matching
+    ``warp(..., tform.inverse)`` used previously.
+    """
+    height, width = data.shape[:2]
+    interpolation = CV2_INTERPOLATION_MODES.get(interpolation_mode)
+    if interpolation is None:
+        raise ValueError(f"No native affine path for {interpolation_mode!r}")
+    warped = cv2.warpAffine(
+        np.asarray(data, dtype=np.float32),
+        np.asarray(matrix[:2, :], dtype=np.float64),
+        (width, height),
+        flags=interpolation,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0.0,
+    )
+    return np.asarray(warped, dtype=np.float32)
+
+
 def warp_frame(
     data: np.ndarray,
     final_matrix: np.ndarray,
@@ -331,13 +364,9 @@ def warp_frame(
     um micro-registro sub-pixel dos canais R e B usando o canal G como âncora
     (correção de dispersão atmosférica / color fringing).
     """
-    h, w = data.shape[:2]
-
     matrix_3x3 = np.eye(3, dtype=np.float64)
     matrix_3x3[:2, :] = final_matrix[:2, :].astype(np.float64)
-
     tform = AffineTransform(matrix=matrix_3x3)
-
     order_map = {
         "nearest": 0,
         "bilinear": 1,
@@ -345,34 +374,38 @@ def warp_frame(
         "lanczos": 3,
     }
     order = order_map.get(interpolation_mode, 3)
+    has_native_path = interpolation_mode in CV2_INTERPOLATION_MODES
 
     if data.ndim == 3:
-        channels = []
-
-        # 1. Warp Global em todos os canais independentemente
-        for i in range(data.shape[2]):
-            warped_channel = warp(
-                data[:, :, i],
-                tform.inverse,
-                order=order,
-                mode="constant",
-                cval=0.0,
-                preserve_range=True,
-            )
-            channels.append(warped_channel)
+        if has_native_path:
+            # OpenCV handles interleaved channels in one native call.
+            output = _warp_affine_cpu(data, final_matrix, interpolation_mode)
+        else:
+            # OpenCV's cubic kernel is not numerically compatible with the
+            # prior skimage order=3 kernel, so retain it for these modes.
+            output = np.empty(data.shape, dtype=np.float32)
+            for i in range(data.shape[2]):
+                output[:, :, i] = warp(
+                    data[:, :, i],
+                    tform.inverse,
+                    order=order,
+                    mode="constant",
+                    cval=0.0,
+                    preserve_range=True,
+                )
 
         # 2. Nível 1: Micro-Registro RGB pós-warp
         if rgb_registration and data.shape[2] >= 3:
             from skimage.registration import phase_cross_correlation
 
             # O Canal Verde (índice 1) é nossa referência fixa e opticamente mais nítida
-            ref_channel = channels[1]
+            ref_channel = output[:, :, 1]
 
             for c in [0, 2]:  # Processa o Vermelho (0) e o Azul (2)
                 # Calcula o desvio sub-pixel exato do canal em relação ao verde
                 shift_vector, error, diffphase = phase_cross_correlation(
                     ref_channel,
-                    channels[c],
+                    output[:, :, c],
                     upsample_factor=10,  # Precisão de 0.1 pixel
                     normalization=None,
                 )
@@ -383,8 +416,8 @@ def warp_frame(
                 )
 
                 # Realinha o canal com o desvio cromático corrigido
-                channels[c] = warp(
-                    channels[c],
+                output[:, :, c] = warp(
+                    output[:, :, c],
                     micro_tform.inverse,
                     order=order,
                     mode="constant",
@@ -392,18 +425,18 @@ def warp_frame(
                     preserve_range=True,
                 )
 
-        return np.stack(channels, axis=-1).astype(np.float32)
+        return output
     else:
-        # Mono
-        warped = warp(
+        if has_native_path:
+            return _warp_affine_cpu(data, final_matrix, interpolation_mode)
+        return warp(
             data,
             tform.inverse,
             order=order,
             mode="constant",
             cval=0.0,
             preserve_range=True,
-        )
-        return warped.astype(np.float32)
+        ).astype(np.float32)
 
 
 def generate_valid_mask(
@@ -411,32 +444,13 @@ def generate_valid_mask(
     final_matrix: np.ndarray,
 ) -> np.ndarray:
     """
-    Gera a máscara de pixels válidos utilizando skimage.transform.warp.
+    Gera a máscara de pixels válidos com o mesmo caminho afim nativo.
     """
     height = shape[0]
     width = shape[1]
 
-    mask = np.ones(
-        (
-            height,
-            width,
-        ),
-        dtype=np.float32,
-    )
-
-    matrix_3x3 = np.eye(3, dtype=np.float64)
-    matrix_3x3[:2, :] = final_matrix[:2, :].astype(np.float64)
-
-    tform = AffineTransform(matrix=matrix_3x3)
-
-    warped_mask = warp(
-        mask,
-        tform.inverse,
-        order=0,
-        mode="constant",
-        cval=0.0,
-        preserve_range=True,
-    )
+    mask = np.ones((height, width), dtype=np.float32)
+    warped_mask = _warp_affine_cpu(mask, final_matrix, "nearest")
 
     return (warped_mask > 0.5).astype(np.uint8)
 

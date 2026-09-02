@@ -33,6 +33,8 @@ from astropy.stats import SigmaClip
 from astropy.utils.exceptions import AstropyWarning
 from photutils.background import Background2D, MedianBackground
 
+from cpu_kernels import masked_extrema
+
 try:
     from pyinstrument import Profiler
 
@@ -41,15 +43,6 @@ except ImportError:
     HAS_PYINSTRUMENT = False
 
 warnings.simplefilter("ignore", category=AstropyWarning)
-
-try:
-    import cupy as cp
-
-    HAS_CUPY = True
-except Exception:
-    cp = None
-    HAS_CUPY = False
-
 
 FITS_SUFFIXES = {".fits", ".fit", ".fts"}
 FITS_CACHE_DIR_NAME = ".astrostack_fits_cache"
@@ -86,7 +79,9 @@ class StackingConfig:
     remove_background: bool = False
 
     output_name: str = "stacked_image.fits"
-    output_bit_depth: Literal["16-bit", "32-bit"] = "32-bit"
+    # Final presentation/output defaults to the acquisition-compatible 16-bit
+    # FITS format. Internal calibration and stack math remain float32.
+    output_bit_depth: Literal["16-bit"] = "16-bit"
     compress_output: bool = True
 
     workers: int | None = None
@@ -94,9 +89,6 @@ class StackingConfig:
     memory_budget_mb: int = DEFAULT_MEMORY_BUDGET_MB
     normalization_max_samples: int = DEFAULT_NORMALIZATION_MAX_SAMPLES
     io_queue_factor: int = 2
-    # FITS I/O dominates the measured workload; GPU is opt-in for workloads
-    # where the user has verified that rejection math amortizes transfer/setup.
-    use_gpu: bool = False
     cache_decompressed_fits: bool = True
 
     @property
@@ -1136,16 +1128,6 @@ def calculate_normalization_factors(
     return factors
 
 
-def _gpu_memory_cleanup() -> None:
-    if not HAS_CUPY:
-        return
-
-    try:
-        cp.get_default_memory_pool().free_all_blocks()
-    except Exception:
-        pass
-
-
 def _nanpercentile_axis0(
     values: np.ndarray,
     percentile: float,
@@ -1171,6 +1153,37 @@ def _nanmedian_axis0_no_warning(values: np.ndarray) -> np.ndarray:
     if np.any(valid_columns):
         result[valid_columns] = np.nanmedian(flat[:, valid_columns], axis=0)
     return result.reshape(values.shape[1:])
+
+
+def _combine_masked_cpu(
+    values: np.ndarray,
+    masks: np.ndarray,
+    combine_method: str,
+) -> np.ndarray:
+    """Combine a block without materialising a NaN-filled float copy."""
+    values = np.asarray(values, dtype=np.float32)
+    # Exclude NaN, but deliberately retain infinity: this mirrors NumPy's
+    # nan-reducers and the caller's final nan_to_num policy.
+    valid = masks & ~np.isnan(values)
+
+    if combine_method in {"Mean", "Sum"}:
+        total = np.sum(np.where(valid, values, np.float32(0.0)), axis=0)
+        if combine_method == "Sum":
+            return total
+        count = np.sum(valid, axis=0, dtype=np.intp)
+        return np.divide(
+            total,
+            count,
+            out=np.full(total.shape, np.nan, dtype=np.float32),
+            where=count > 0,
+        )
+    if combine_method == "Maximum":
+        return masked_extrema(values, valid, True)
+    if combine_method == "Minimum":
+        return masked_extrema(values, valid, False)
+    if combine_method == "Median":
+        return _nanmedian_axis0_no_warning(np.where(valid, values, np.nan))
+    raise ValueError(f"Unsupported combine method: {combine_method}")
 
 
 def _reject_cpu_all_valid(
@@ -1301,7 +1314,6 @@ def reject_and_combine_block(
     low: float,
     high: float,
     cancel_event: threading.Event | None = None,
-    use_gpu: bool = False,
 ) -> np.ndarray:
     check_cancel(cancel_event)
 
@@ -1311,208 +1323,14 @@ def reject_and_combine_block(
     if rejection_method == "None" or values.shape[0] <= 3:
         rejection_method = "None"
 
-    if not use_gpu or not HAS_CUPY:
-        if rejection_method == "None":
-            masked = values.astype(
-                np.float32,
-                copy=True,
-            )
-            masked[~masks] = np.nan
-
-            with warnings.catch_warnings():
-                warnings.simplefilter(
-                    "ignore",
-                    category=RuntimeWarning,
-                )
-
-                if combine_method == "Median":
-                    result = np.nanmedian(
-                        masked,
-                        axis=0,
-                    )
-                elif combine_method == "Mean":
-                    result = np.nanmean(
-                        masked,
-                        axis=0,
-                    )
-                elif combine_method == "Sum":
-                    result = np.nansum(
-                        masked,
-                        axis=0,
-                    )
-                elif combine_method == "Maximum":
-                    result = np.nanmax(
-                        masked,
-                        axis=0,
-                    )
-                elif combine_method == "Minimum":
-                    result = np.nanmin(
-                        masked,
-                        axis=0,
-                    )
-                else:
-                    raise ValueError(f"Método desconhecido: {combine_method}")
-
-            return np.asarray(
-                np.nan_to_num(
-                    result,
-                    nan=0.0,
-                    posinf=0.0,
-                    neginf=0.0,
-                ),
-                dtype=np.float32,
-            )
-
-        return _reject_cpu(
-            values,
-            masks,
-            rejection_method,
-            low,
-            high,
-        )
-
-    try:
-        masked_gpu = cp.asarray(values)
-        masks_gpu = cp.asarray(masks)
-
-        masked_gpu = cp.where(
-            masks_gpu,
-            masked_gpu,
-            cp.nan,
-        )
-
-        if rejection_method == "SigmaClip":
-            center = cp.nanmedian(
-                masked_gpu,
-                axis=0,
-            )
-            std = cp.nanstd(
-                masked_gpu,
-                axis=0,
-            )
-
-            lower = center - low * std
-            upper = center + high * std
-
-            valid = (masked_gpu >= lower) & (masked_gpu <= upper)
-
-            stable = cp.isfinite(std) & (std > 1e-10)
-            valid |= ~stable
-            masked_gpu = cp.where(
-                valid,
-                masked_gpu,
-                cp.nan,
-            )
-
-        elif rejection_method == "MAD":
-            center = cp.nanmedian(
-                masked_gpu,
-                axis=0,
-            )
-            mad = cp.nanmedian(
-                cp.abs(masked_gpu - center),
-                axis=0,
-            )
-
-            sigma = cp.float32(1.4826) * mad
-            lower = center - low * sigma
-            upper = center + high * sigma
-
-            valid = (masked_gpu >= lower) & (masked_gpu <= upper)
-
-            stable = cp.isfinite(mad) & (mad > 1e-10)
-            valid |= ~stable
-
-            masked_gpu = cp.where(
-                valid,
-                masked_gpu,
-                cp.nan,
-            )
-
-        elif rejection_method == "Winsorized":
-            p_low = cp.nanpercentile(
-                masked_gpu,
-                min(49.0, max(0.0, low * 10.0)),
-                axis=0,
-            )
-            p_high = cp.nanpercentile(
-                masked_gpu,
-                max(51.0, min(100.0, 100.0 - high * 10.0)),
-                axis=0,
-            )
-
-            valid_range = cp.isfinite(p_low) & cp.isfinite(p_high) & (p_high >= p_low)
-
-            clipped = cp.clip(
-                masked_gpu,
-                p_low,
-                p_high,
-            )
-
-            masked_gpu = cp.where(
-                valid_range,
-                clipped,
-                masked_gpu,
-            )
-
-        check_cancel(cancel_event)
-
-        if combine_method == "Median":
-            result_gpu = cp.nanmedian(
-                masked_gpu,
-                axis=0,
-            )
-        elif combine_method == "Mean":
-            result_gpu = cp.nanmean(
-                masked_gpu,
-                axis=0,
-            )
-        elif combine_method == "Sum":
-            result_gpu = cp.nansum(
-                masked_gpu,
-                axis=0,
-            )
-        elif combine_method == "Maximum":
-            result_gpu = cp.nanmax(
-                masked_gpu,
-                axis=0,
-            )
-        elif combine_method == "Minimum":
-            result_gpu = cp.nanmin(
-                masked_gpu,
-                axis=0,
-            )
-        else:
-            raise ValueError(f"Método desconhecido: {combine_method}")
-
-        result = cp.asnumpy(
-            cp.nan_to_num(
-                result_gpu,
-                nan=0.0,
-                posinf=0.0,
-                neginf=0.0,
-            )
-        )
-
-        del masked_gpu, masks_gpu, result_gpu
-
+    if rejection_method == "None":
+        result = _combine_masked_cpu(values, masks, combine_method)
         return np.asarray(
-            result,
+            np.nan_to_num(result, nan=0.0, posinf=0.0, neginf=0.0),
             dtype=np.float32,
         )
 
-    except StackingCancelled:
-        raise
-    except Exception:
-        _gpu_memory_cleanup()
-
-        return _reject_cpu(
-            values,
-            masks,
-            rejection_method,
-            low,
-            high,
-        )
+    return _reject_cpu(values, masks, rejection_method, low, high)
 
 
 def _hierarchical_worker_count(config: StackingConfig, n_frames: int) -> int:
@@ -1687,7 +1505,10 @@ def _process_substack(
                     mask = np.isfinite(raw)
                     if frame.valid_mask is not None:
                         mask &= frame.valid_mask[y1:y2, :]
-                    values[index] = np.where(mask, raw, 0.0)
+                    # Reuse the preallocated contiguous band slot instead of
+                    # allocating a second full np.where result per frame.
+                    values[index] = raw
+                    values[index][~mask] = np.float32(0.0)
                     masks[index] = mask
                 report(
                     0,
@@ -1701,7 +1522,6 @@ def _process_substack(
                     config.rejection_low,
                     config.rejection_high,
                     cancel_event,
-                    config.use_gpu,
                 )
                 if channels == 1:
                     result[y1:y2] = combined
@@ -1782,7 +1602,6 @@ def _combine_substacks(
                 config.rejection_low,
                 config.rejection_high,
                 cancel_event,
-                config.use_gpu,
             )
         else:
             result = np.empty(values.shape[1:], dtype=np.float32)
@@ -1796,7 +1615,6 @@ def _combine_substacks(
                     config.rejection_low,
                     config.rejection_high,
                     cancel_event,
-                    config.use_gpu,
                 )
     return np.asarray(result, dtype=np.float32), final_mask, coverage
 
@@ -2051,61 +1869,6 @@ def flatten_background(
     data: np.ndarray,
     valid_mask: np.ndarray,
 ) -> np.ndarray:
-    try:
-        from cupyx.scipy.ndimage import median_filter, uniform_filter
-
-        data_gpu = cp.asarray(data)
-        mask_gpu = cp.asarray(valid_mask)
-
-        if data_gpu.ndim == 3:
-            output_gpu = cp.empty_like(data_gpu)
-
-            for channel in range(data_gpu.shape[0]):
-                channel_data = data_gpu[channel].copy()
-
-                if bool(cp.any(mask_gpu)):
-                    background_fill = cp.median(channel_data[mask_gpu])
-                else:
-                    background_fill = cp.float32(0.0)
-
-                channel_data[~mask_gpu] = background_fill
-
-                background = median_filter(
-                    channel_data,
-                    size=35,
-                )
-                background = uniform_filter(
-                    background,
-                    size=35,
-                )
-
-                output_gpu[channel] = data_gpu[channel] - background
-        else:
-            channel_data = data_gpu.copy()
-
-            if bool(cp.any(mask_gpu)):
-                background_fill = cp.median(channel_data[mask_gpu])
-            else:
-                background_fill = cp.float32(0.0)
-
-            channel_data[~mask_gpu] = background_fill
-
-            background = median_filter(
-                channel_data,
-                size=35,
-            )
-            background = uniform_filter(
-                background,
-                size=35,
-            )
-
-            output_gpu = data_gpu - background
-
-        return cp.asnumpy(output_gpu).astype(np.float32, copy=False)
-
-    except Exception:
-        pass
-
     sigma_clip = SigmaClip(sigma=3.0)
     bkg_estimator = MedianBackground()
     bkg_mask = ~valid_mask
@@ -2253,10 +2016,6 @@ def prepare_output_header(
             True,
             "Block streaming enabled",
         ),
-        "STACK_GPU": (
-            bool(HAS_CUPY),
-            "CuPy available",
-        ),
         "STACK_BG": (
             bool(config.remove_background),
             "Background subtraction",
@@ -2315,14 +2074,6 @@ def convert_output_dtype(
     config: StackingConfig,
 ) -> np.ndarray:
     result = np.asarray(result)
-
-    if config.output_bit_depth == "32-bit":
-        return np.nan_to_num(
-            result,
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        ).astype(np.float32, copy=False)
 
     clean = np.nan_to_num(
         result,
@@ -2461,10 +2212,7 @@ def _validate_config(config: StackingConfig) -> None:
     }:
         raise ValueError(f"Modo de seleção inválido: {config.selection_mode}")
 
-    if config.output_bit_depth not in {
-        "16-bit",
-        "32-bit",
-    }:
+    if config.output_bit_depth != "16-bit":
         raise ValueError(f"Profundidade inválida: {config.output_bit_depth}")
 
     if config.selection_percentage <= 0:
@@ -2821,7 +2569,6 @@ def process_stacking(
             "memory_budget_mb": config.memory_budget_mb,
             "streaming": True,
             "hierarchical": True,
-            "gpu": bool(config.use_gpu and HAS_CUPY),
             "background_removed": bool(config.remove_background),
             "dither_correction": bool(config.apply_dither_correction),
             "batches": {
@@ -2931,10 +2678,7 @@ def _build_config_from_dict(
             "output_name",
             "stacked_image.fits",
         ),
-        output_bit_depth=config_dict.get(
-            "output_bit_depth",
-            "32-bit",
-        ),
+        output_bit_depth="16-bit",
         compress_output=bool(
             config_dict.get(
                 "compress_output",
@@ -2966,7 +2710,6 @@ def _build_config_from_dict(
                 2,
             )
         ),
-        use_gpu=bool(config_dict.get("use_gpu", False)),
         cache_decompressed_fits=bool(config_dict.get("cache_decompressed_fits", True)),
     )
 
@@ -2994,7 +2737,6 @@ def process_all_stacking(
 
 
 __all__ = [
-    "HAS_CUPY",
     "BlockRead",
     "FitsCacheStats",
     "FrameGeometry",

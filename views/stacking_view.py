@@ -261,24 +261,6 @@ class StackingView(BaseAstroView):
             style="Muted.TLabel",
         ).grid(row=2, column=2, sticky="w", padx=(8, 0), pady=(8, 0))
 
-        gpu_available = bool(getattr(self.app, "stack_gpu_available", False))
-        gpu_text = (
-            "Use GPU acceleration (CuPy/CUDA)"
-            if gpu_available
-            else "GPU acceleration unavailable (CuPy/CUDA not detected)"
-        )
-        ttk.Checkbutton(
-            rejection_frame,
-            text=gpu_text,
-            variable=self.app.stack_use_gpu_var,
-            state="normal" if gpu_available else "disabled",
-        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(10, 0))
-        ttk.Label(
-            rejection_frame,
-            text="Optional: useful only for rejection-heavy stacks; FITS I/O usually dominates.",
-            style="Muted.TLabel",
-        ).grid(row=3, column=2, sticky="w", padx=(8, 0), pady=(10, 0))
-
         # ============================================================
         # 5. Normalização
         # ============================================================
@@ -350,21 +332,16 @@ class StackingView(BaseAstroView):
             output_frame, textvariable=self.app.stack_output_name_var, width=30
         ).grid(row=0, column=1, sticky="w", padx=8)
 
-        # Bit depth (NOVO!)
         ttk.Label(output_frame, text="Profundidade de bits:").grid(
             row=1, column=0, sticky="w", pady=(8, 0)
         )
-        ttk.Combobox(
-            output_frame,
-            textvariable=self.app.stack_output_bit_depth_var,
-            values=["16-bit", "32-bit"],
-            state="readonly",
-            width=14,
-        ).grid(row=1, column=1, sticky="w", padx=8, pady=(8, 0))
+        ttk.Label(output_frame, text="16-bit").grid(
+            row=1, column=1, sticky="w", padx=8, pady=(8, 0)
+        )
 
         ttk.Label(
             output_frame,
-            text="32-bit preserva mais detalhes, 16-bit reduz tamanho",
+            text="Saída FIT padrão e única: 16-bit",
             style="Muted.TLabel",
         ).grid(row=1, column=2, sticky="w", padx=(8, 0), pady=(8, 0))
 
