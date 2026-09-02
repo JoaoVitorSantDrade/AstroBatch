@@ -62,6 +62,27 @@ class AlignConfig:
     dry_run: bool
     keep_header: bool
     delete_intermediates: bool
+    compress_output: bool
+
+
+def _build_align_config(
+    base_dir: Path,
+    output_dir: Path,
+    config_dict: dict,
+) -> AlignConfig:
+    return AlignConfig(
+        base_dir=base_dir,
+        output_dir=output_dir,
+        debayer_pattern=config_dict.get("debayer_pattern", "Auto"),
+        debayer_method=config_dict.get("debayer_method", "Bilinear"),
+        interpolation=config_dict.get("interpolation", "Lanczos"),
+        rgb_registration=bool(config_dict.get("rgb_registration", True)),
+        overwrite=bool(config_dict.get("overwrite", False)),
+        dry_run=bool(config_dict.get("dry_run", False)),
+        keep_header=bool(config_dict.get("keep_header", True)),
+        delete_intermediates=bool(config_dict.get("delete_intermediates", False)),
+        compress_output=bool(config_dict.get("compress_output", True)),
+    )
 
 
 # ============================================================
@@ -424,12 +445,37 @@ def generate_valid_mask(
 # ============================================================
 
 
-def save_compressed_fits(
+def _uncompressed_output_header(header: fits.Header | None) -> fits.Header | None:
+    """Remove FITS structural and compression cards before writing an ImageHDU."""
+    if header is None:
+        return None
+
+    output_header = header.copy()
+    structural = {
+        "XTENSION",
+        "BITPIX",
+        "NAXIS",
+        "PCOUNT",
+        "GCOUNT",
+        "THEAP",
+        "BSCALE",
+        "BZERO",
+        "BLANK",
+    }
+    for keyword in list(output_header):
+        if keyword in structural or keyword.startswith("Z"):
+            del output_header[keyword]
+    return output_header
+
+
+def save_aligned_fits(
     data: np.ndarray,
     mask: np.ndarray,
     header: fits.Header | None,
     output_path: Path,
-):
+    compress_output: bool = True,
+) -> None:
+    """Write aligned science data and its valid-pixel mask in the chosen layout."""
     if header is not None:
         header["BITPIX"] = 16
         header["BZERO"] = 32768
@@ -456,17 +502,26 @@ def save_compressed_fits(
             0,
         )
 
-    hdu_data = fits.CompImageHDU(
-        data=data_uint16,
-        header=header,
-        compression_type="RICE_1",
-    )
-
-    hdu_mask = fits.CompImageHDU(
-        data=mask,
-        name="VALID_MASK",
-        compression_type="PLIO_1",
-    )
+    if compress_output:
+        hdu_data = fits.CompImageHDU(
+            data=data_uint16,
+            header=header,
+            compression_type="RICE_1",
+        )
+        hdu_mask = fits.CompImageHDU(
+            data=np.asarray(mask, dtype=np.uint8),
+            name="VALID_MASK",
+            compression_type="PLIO_1",
+        )
+    else:
+        hdu_data = fits.ImageHDU(
+            data=data_uint16,
+            header=_uncompressed_output_header(header),
+        )
+        hdu_mask = fits.ImageHDU(
+            data=np.asarray(mask, dtype=np.uint8),
+            name="VALID_MASK",
+        )
 
     hdul = fits.HDUList(
         [
@@ -608,11 +663,12 @@ def _process_single_alignment(
             exist_ok=True,
         )
 
-        save_compressed_fits(
+        save_aligned_fits(
             warped_data,
             mask,
             (updated_header if config.keep_header else None),
             output_path,
+            config.compress_output,
         )
 
         return (
@@ -823,52 +879,7 @@ def process_all_alignments(
     ):
         config_dict = {}
 
-    align_config = AlignConfig(
-        base_dir=base_dir,
-        output_dir=output_dir,
-        debayer_pattern=config_dict.get(
-            "debayer_pattern",
-            "Auto",
-        ),
-        debayer_method=config_dict.get(
-            "debayer_method",
-            "Bilinear",
-        ),
-        interpolation=config_dict.get(
-            "interpolation",
-            "Lanczos",
-        ),
-        rgb_registration=bool(
-            config_dict.get(
-                "rgb_registration",
-                True,
-            )
-        ),
-        overwrite=bool(
-            config_dict.get(
-                "overwrite",
-                False,
-            )
-        ),
-        dry_run=bool(
-            config_dict.get(
-                "dry_run",
-                False,
-            )
-        ),
-        keep_header=bool(
-            config_dict.get(
-                "keep_header",
-                True,
-            )
-        ),
-        delete_intermediates=bool(
-            config_dict.get(
-                "delete_intermediates",
-                False,
-            )
-        ),
-    )
+    align_config = _build_align_config(base_dir, output_dir, config_dict)
 
     # --------------------------------------------------------
     # Global Flow

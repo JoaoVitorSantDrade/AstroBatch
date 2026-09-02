@@ -108,6 +108,7 @@ class AstroProcessManager(tk.Tk):
         self.align_dry_run_var = tk.BooleanVar(value=False)
         self.align_keep_header_var = tk.BooleanVar(value=True)
         self.align_delete_intermediates_var = tk.BooleanVar(value=False)
+        self.align_compress_output_var = tk.BooleanVar(value=True)
 
         # ---- AstroStack ----
         # ---- Diretórios ----
@@ -141,6 +142,13 @@ class AstroProcessManager(tk.Tk):
         self.stack_output_name_var = tk.StringVar(value="stacked_image.fits")
         self.stack_output_bit_depth_var = tk.StringVar(value="32-bit")  # NOVO!
         self.stack_compress_var = tk.BooleanVar(value=True)
+        try:
+            from stacking_logic import HAS_CUPY
+
+            self.stack_gpu_available = bool(HAS_CUPY)
+        except Exception:
+            self.stack_gpu_available = False
+        self.stack_use_gpu_var = tk.BooleanVar(value=False)
 
         # Registry atualizado
         self.config_registry = {
@@ -190,6 +198,7 @@ class AstroProcessManager(tk.Tk):
                 "dry_run": self.align_dry_run_var,
                 "keep_header": self.align_keep_header_var,
                 "delete_intermediates": self.align_delete_intermediates_var,
+                "compress_output": self.align_compress_output_var,
             },
             "AstroStack": {
                 # ---- Diretórios ----
@@ -214,6 +223,7 @@ class AstroProcessManager(tk.Tk):
                 "output_name": self.stack_output_name_var,
                 "output_bit_depth": self.stack_output_bit_depth_var,
                 "compress_output": self.stack_compress_var,
+                "use_gpu": self.stack_use_gpu_var,
             },
         }
 
@@ -752,6 +762,7 @@ class AstroProcessManager(tk.Tk):
                 "dry_run": self.align_dry_run_var.get(),
                 "keep_header": self.align_keep_header_var.get(),
                 "delete_intermediates": self.align_delete_intermediates_var.get(),
+                "compress_output": self.align_compress_output_var.get(),
             }
 
         except Exception as exc:
@@ -854,6 +865,7 @@ class AstroProcessManager(tk.Tk):
             "output_bit_depth": self.stack_output_bit_depth_var.get(),
             "compress_output": self.stack_compress_var.get(),
             "apply_dither_correction": self.stack_dither_correction_var.get(),
+            "use_gpu": self.stack_use_gpu_var.get() and self.stack_gpu_available,
         }
 
         self._lock_ui("Stack")

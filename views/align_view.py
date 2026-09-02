@@ -124,21 +124,33 @@ class AlignView(BaseAstroView):
 
         ttk.Checkbutton(
             params,
+            text="Comprimir saída FITS (RICE_1)",
+            variable=self.app.align_compress_output_var,
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(7, 0))
+
+        ttk.Label(
+            params,
+            text="Reduz o espaço em disco; desative para leituras mais rápidas no AstroStack.",
+            style="Muted.TLabel",
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(0, 0))
+
+        ttk.Checkbutton(
+            params,
             text="Sobrescrever arquivos existentes no destino",
             variable=self.app.align_overwrite_var,
-        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(7, 0))
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(7, 0))
 
         ttk.Checkbutton(
             params,
             text="Apagar batches intermediários após alinhar (Limpeza de Disco)",
             variable=self.app.align_delete_intermediates_var,
-        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(7, 0))
+        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(7, 0))
 
         ttk.Checkbutton(
             params,
             text="Dry-Run (Simular processamento sem gravar no disco)",
             variable=self.app.align_dry_run_var,
-        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(7, 0))
+        ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(7, 0))
 
         # 4. Ações
         actions = ttk.Frame(self)

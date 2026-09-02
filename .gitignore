@@ -1,3 +1,5 @@
 *.json
 .venv
 __pycache__
+original_example/
+*.svg

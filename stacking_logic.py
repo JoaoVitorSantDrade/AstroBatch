@@ -6,15 +6,18 @@ AstroStack - empilhamento otimizado para o AstroProcessManager.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
+import queue
+import tempfile
 import threading
+import uuid
 import warnings
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from concurrent.futures import (
     FIRST_COMPLETED,
-    Future,
     ThreadPoolExecutor,
     as_completed,
     wait,
@@ -48,6 +51,8 @@ except Exception:
 
 
 FITS_SUFFIXES = {".fits", ".fit", ".fts"}
+FITS_CACHE_DIR_NAME = ".astrostack_fits_cache"
+FITS_CACHE_FORMAT_VERSION = 1
 DEFAULT_CHUNK_SIZE = 2048
 DEFAULT_MEMORY_BUDGET_MB = 4096
 DEFAULT_NORMALIZATION_MAX_SAMPLES = 1_000_000
@@ -88,6 +93,10 @@ class StackingConfig:
     memory_budget_mb: int = DEFAULT_MEMORY_BUDGET_MB
     normalization_max_samples: int = DEFAULT_NORMALIZATION_MAX_SAMPLES
     io_queue_factor: int = 2
+    # FITS I/O dominates the measured workload; GPU is opt-in for workloads
+    # where the user has verified that rejection math amortizes transfer/setup.
+    use_gpu: bool = False
+    cache_decompressed_fits: bool = True
 
     @property
     def worker_count(self) -> int:
@@ -141,12 +150,31 @@ class FrameGeometry:
     channels: int
     hdu_index: int
     mask_hdu_index: int | None
+    science_compressed: bool = False
+    cache_raw_storage: bool = False
+    cache_bscale: float = 1.0
+    cache_bzero: float = 0.0
+    cache_blank: int | None = None
 
 
 @dataclass(slots=True)
 class BlockRead:
     data: np.ndarray
     mask: np.ndarray
+
+
+@dataclass(slots=True)
+class SubstackInfo:
+    path: Path
+    frame_count: int
+
+
+@dataclass(slots=True)
+class FitsCacheStats:
+    hits: int = 0
+    rebuilt: int = 0
+    direct: int = 0
+    skipped: int = 0
 
 
 def get_optimal_worker_count() -> int:
@@ -162,39 +190,6 @@ def check_cancel(cancel_event: threading.Event | None) -> None:
         raise StackingCancelled("Operação cancelada pelo usuário.")
 
 
-def estimate_block_memory_bytes(
-    n_frames: int,
-    chunk_size: int,
-    channels: int,
-    rejection: bool,
-) -> int:
-    pixels = chunk_size * chunk_size
-    base = n_frames * pixels * max(1, channels) * 4
-
-    if rejection:
-        return int(base * 4.0)
-
-    return int(base * 0.35 + pixels * 16)
-
-
-def adapt_chunk_size(
-    requested: int,
-    n_frames: int,
-    channels: int,
-    memory_budget_mb: int,
-    rejection: bool,
-) -> int:
-    chunk = max(32, int(requested))
-    budget = max(64, int(memory_budget_mb)) * 1024 * 1024
-
-    while chunk > 32:
-        if estimate_block_memory_bytes(n_frames, chunk, channels, rejection) <= budget:
-            break
-        chunk //= 2
-
-    return max(32, chunk)
-
-
 def discover_aligned_frames(
     input_dir: Path,
 ) -> tuple[list[Path], dict[str, dict[str, Any]]]:
@@ -204,7 +199,14 @@ def discover_aligned_frames(
     found: list[Path] = []
     batch_metadata: dict[str, dict[str, Any]] = {}
 
-    for root, _, filenames in os.walk(input_dir):
+    for root, dirnames, filenames in os.walk(input_dir):
+        # The persistent decompression cache lives next to the aligned frames,
+        # but it must never become another input batch on the next run.
+        dirnames[:] = [
+            dirname
+            for dirname in dirnames
+            if dirname.casefold() != FITS_CACHE_DIR_NAME.casefold()
+        ]
         root_path = Path(root)
 
         for filename in filenames:
@@ -334,6 +336,15 @@ def inspect_fits(filepath: Path) -> FrameGeometry:
             channels=channels,
             hdu_index=hdu_index,
             mask_hdu_index=mask_hdu_index,
+            science_compressed=_is_compressed_hdu(image_hdu),
+            cache_raw_storage=bool(image_hdu.header.get("ASTRAW", False)),
+            cache_bscale=float(image_hdu.header.get("ASTBSCL", 1.0)),
+            cache_bzero=float(image_hdu.header.get("ASTBZRO", 0.0)),
+            cache_blank=(
+                int(image_hdu.header["ASTBLNK"])
+                if "ASTBLNK" in image_hdu.header
+                else None
+            ),
         )
 
 
@@ -576,6 +587,223 @@ def _load_full_valid_mask(
     return np.asarray(mask, dtype=bool)
 
 
+def _fits_cache_key(path: Path) -> str:
+    stat = path.stat()
+    identity = f"{path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}"
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def _is_compressed_hdu(hdu: Any) -> bool:
+    return isinstance(hdu, fits.CompImageHDU)
+
+
+def _has_active_scaling(hdu: Any) -> bool:
+    header = hdu.header
+    return (
+        _is_compressed_hdu(hdu)
+        or "BLANK" in header
+        or float(header.get("BSCALE", 1.0)) != 1.0
+        or float(header.get("BZERO", 0.0)) != 0.0
+    )
+
+
+def _cache_file_is_raw(path: Path, expected_key: str) -> bool:
+    try:
+        with fits.open(
+            path,
+            memmap=False,
+            lazy_load_hdus=True,
+            do_not_scale_image_data=True,
+        ) as hdul:
+            _, image_hdu = _find_primary_image_hdu(hdul)
+            header = image_hdu.header
+            if (
+                int(header.get("ASTCVER", 0)) != FITS_CACHE_FORMAT_VERSION
+                or str(header.get("ASTCKEY", "")) != expected_key
+                or not bool(header.get("ASTRAW", False))
+            ):
+                return False
+            if _has_active_scaling(image_hdu):
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def _raw_image_header(header: fits.Header) -> fits.Header:
+    """Keep science metadata but remove compression/scaling implementation cards."""
+    raw_header = header.copy()
+    structural = {
+        "XTENSION",
+        "BITPIX",
+        "NAXIS",
+        "PCOUNT",
+        "GCOUNT",
+        "THEAP",
+        "BSCALE",
+        "BZERO",
+        "BLANK",
+    }
+    for keyword in list(raw_header):
+        if keyword in structural or keyword.startswith("Z"):
+            del raw_header[keyword]
+    return raw_header
+
+
+def _cache_header_for_raw_storage(
+    header: fits.Header,
+    source_key: str,
+) -> fits.Header:
+    raw_header = _raw_image_header(header)
+    raw_header["ASTRAW"] = (True, "AstroStack raw-storage cache")
+    raw_header["ASTCVER"] = (FITS_CACHE_FORMAT_VERSION, "AstroStack cache format")
+    raw_header["ASTCKEY"] = source_key
+    raw_header["ASTBSCL"] = (float(header.get("BSCALE", 1.0)), "Original BSCALE")
+    raw_header["ASTBZRO"] = (float(header.get("BZERO", 0.0)), "Original BZERO")
+    if "BLANK" in header:
+        raw_header["ASTBLNK"] = (int(header["BLANK"]), "Original BLANK")
+    return raw_header
+
+
+def _restore_cached_physical_values(
+    data: np.ndarray,
+    geometry: FrameGeometry,
+) -> np.ndarray:
+    if not geometry.cache_raw_storage:
+        return np.asarray(data, dtype=np.float32)
+
+    raw = np.asarray(data, dtype=np.float32)
+    values = raw * np.float32(geometry.cache_bscale) + np.float32(geometry.cache_bzero)
+    if geometry.cache_blank is not None:
+        values = np.where(raw == geometry.cache_blank, np.nan, values)
+    return np.asarray(values, dtype=np.float32)
+
+
+def _valid_cached_geometry(
+    cached_path: Path,
+    source_key: str,
+    source_geometry: FrameGeometry,
+) -> FrameGeometry | None:
+    """Return a reusable cache geometry without reading the source FITS."""
+    if not cached_path.is_file() or not _cache_file_is_raw(cached_path, source_key):
+        return None
+
+    try:
+        candidate = inspect_fits(cached_path)
+    except Exception:
+        return None
+
+    if (
+        candidate.height != source_geometry.height
+        or candidate.width != source_geometry.width
+        or candidate.image_kind != source_geometry.image_kind
+        or candidate.channels != source_geometry.channels
+        or (candidate.mask_hdu_index is not None)
+        != (source_geometry.mask_hdu_index is not None)
+        or not candidate.cache_raw_storage
+    ):
+        return None
+    return candidate
+
+
+def cache_decompressed_frames(
+    frames: list[FrameInfo],
+    geometries: dict[Path, FrameGeometry],
+    cache_dir: Path,
+    app_print: Callable[[str], None],
+    cancel_event: threading.Event | None,
+) -> tuple[dict[Path, FrameGeometry], FitsCacheStats]:
+    """Persist compressed FITS pixels as raw FITS without retaining a RAM cache.
+
+    The cache key includes source path, size and mtime.  A changed source gets a
+    different entry automatically; existing entries are safe to reuse between
+    runs.  Only one frame is decoded at a time.
+    """
+    updated: dict[Path, FrameGeometry] = {}
+    stats = FitsCacheStats()
+
+    for index, frame in enumerate(frames, start=1):
+        check_cancel(cancel_event)
+        source_path = frame.path
+        geometry = geometries[source_path]
+        key = _fits_cache_key(source_path)
+        cached_path = cache_dir / f"{key}.fits"
+
+        try:
+            cached_geometry = _valid_cached_geometry(cached_path, key, geometry)
+
+            if cached_geometry is not None:
+                frame.path = cached_path
+                frame.has_valid_mask = cached_geometry.mask_hdu_index is not None
+                frame.valid_mask = None
+                updated[cached_path] = cached_geometry
+                stats.hits += 1
+                if index % max(1, len(frames) // 20) == 0 or index == len(frames):
+                    app_print(f"[Stack] FITS cache: {index}/{len(frames)}")
+                continue
+
+            with fits.open(
+                source_path,
+                memmap=False,
+                lazy_load_hdus=True,
+                do_not_scale_image_data=True,
+            ) as hdul:
+                image_hdu = hdul[geometry.hdu_index]
+                mask_hdu = (
+                    hdul[geometry.mask_hdu_index]
+                    if geometry.mask_hdu_index is not None
+                    else None
+                )
+                if not _is_compressed_hdu(image_hdu):
+                    updated[source_path] = geometry
+                    stats.direct += 1
+                    if index % max(1, len(frames) // 20) == 0 or index == len(frames):
+                        app_print(f"[Stack] FITS cache: {index}/{len(frames)}")
+                    continue
+
+                # Preserve FITS's raw signed storage. Original scaling is
+                # stored as AST* metadata and applied only to read bands.
+                image_data = np.asarray(image_hdu.data)
+                hdus: list[Any] = [
+                    fits.PrimaryHDU(
+                        image_data,
+                        header=_cache_header_for_raw_storage(image_hdu.header, key),
+                    )
+                ]
+                if mask_hdu is not None:
+                    hdus.append(
+                        fits.ImageHDU(
+                            np.asarray(mask_hdu.data, dtype=np.int8),
+                            name="VALID_MASK",
+                        )
+                    )
+
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            temporary_path = cache_dir / f".{key}.{uuid.uuid4().hex}.tmp"
+            try:
+                fits.HDUList(hdus).writeto(temporary_path, overwrite=True)
+                temporary_path.replace(cached_path)
+            finally:
+                temporary_path.unlink(missing_ok=True)
+            cached_geometry = inspect_fits(cached_path)
+
+            frame.path = cached_path
+            frame.has_valid_mask = cached_geometry.mask_hdu_index is not None
+            frame.valid_mask = None
+            updated[cached_path] = cached_geometry
+            stats.rebuilt += 1
+        except Exception as exc:
+            # A cache failure must never prevent stacking the original frame.
+            updated[source_path] = geometry
+            stats.skipped += 1
+            app_print(f"[Stack] Cache skipped for {frame.name}: {exc}")
+
+        if index % max(1, len(frames) // 20) == 0 or index == len(frames):
+            app_print(f"[Stack] FITS cache: {index}/{len(frames)}")
+
+    return updated, stats
+
+
 def _apply_translation(
     data: np.ndarray,
     dx: float,
@@ -688,7 +916,7 @@ def read_frame_block(
                 ),
             )[:, :, 0]
 
-        raw_data = np.asarray(raw_data, dtype=np.float32)
+        raw_data = _restore_cached_physical_values(raw_data, geometry)
 
         if normalization_factor != 1.0:
             raw_data *= np.float32(normalization_factor)
@@ -786,7 +1014,7 @@ def load_normalization_sample(
             )
             mask = mask[::spatial_step, ::spatial_step]
 
-        return np.asarray(sample, dtype=np.float32), mask
+        return _restore_cached_physical_values(sample, geometry), mask
 
 
 def _sample_valid_values(
@@ -907,173 +1135,6 @@ def calculate_normalization_factors(
     return factors
 
 
-def read_block_worker(
-    args: tuple[
-        FrameInfo,
-        FrameGeometry,
-        int,
-        int,
-        int,
-        int,
-        int | None,
-        float,
-        tuple[float, float] | None,
-    ],
-) -> BlockRead:
-    return read_frame_block(*args)
-
-
-def _bounded_parallel_reads(
-    args_list: list[
-        tuple[
-            FrameInfo,
-            FrameGeometry,
-            int,
-            int,
-            int,
-            int,
-            int | None,
-            float,
-            tuple[float, float] | None,
-        ]
-    ],
-    executor: ThreadPoolExecutor,
-    max_inflight: int,
-    cancel_event: threading.Event | None,
-) -> Iterator[tuple[int, BlockRead]]:
-    total = len(args_list)
-    next_index = 0
-    pending: dict[Future[BlockRead], int] = {}
-
-    while next_index < total or pending:
-        check_cancel(cancel_event)
-
-        while next_index < total and len(pending) < max_inflight:
-            check_cancel(cancel_event)
-
-            future = executor.submit(
-                read_block_worker,
-                args_list[next_index],
-            )
-            pending[future] = next_index
-            next_index += 1
-
-        if not pending:
-            break
-
-        done, _ = wait(
-            pending,
-            return_when=FIRST_COMPLETED,
-        )
-
-        for future in done:
-            index = pending.pop(future)
-
-            if cancel_event is not None and cancel_event.is_set():
-                future.cancel()
-                raise StackingCancelled("Operação cancelada pelo usuário.")
-
-            yield index, future.result()
-
-
-def load_channel_block_parallel(
-    selected_frames: list[FrameInfo],
-    geometries: dict[Path, FrameGeometry],
-    y1: int,
-    y2: int,
-    x1: int,
-    x2: int,
-    channel: int | None,
-    normalization_factors: list[float],
-    executor: ThreadPoolExecutor | None,
-    dither_shifts: list[tuple[float, float] | None] | None,
-    cancel_event: threading.Event | None,
-    io_queue_factor: int = 2,
-) -> tuple[np.ndarray, np.ndarray]:
-
-    args_list = [
-        (
-            frame,
-            geometries[frame.path],
-            y1,
-            y2,
-            x1,
-            x2,
-            channel,
-            normalization_factors[index],
-            dither_shifts[index] if dither_shifts else None,
-        )
-        for index, frame in enumerate(selected_frames)
-    ]
-
-    count = len(args_list)
-
-    if count == 0:
-        raise ValueError("Nenhum frame selecionado.")
-
-    first = read_block_worker(args_list[0])
-    block_h, block_w = first.data.shape
-
-    values = np.empty(
-        (count, block_h, block_w),
-        dtype=np.float32,
-    )
-    masks = np.empty(
-        (count, block_h, block_w),
-        dtype=bool,
-    )
-
-    values[0] = first.data
-    masks[0] = first.mask
-
-    if count == 1:
-        return values, masks
-
-    if executor is None:
-        for index in range(1, count):
-            check_cancel(cancel_event)
-            item = read_block_worker(args_list[index])
-            values[index] = item.data
-            masks[index] = item.mask
-        return values, masks
-
-    max_inflight = max(
-        1,
-        min(
-            count - 1,
-            executor._max_workers * max(1, int(io_queue_factor)),
-        ),
-    )
-
-    for index, item in _bounded_parallel_reads(
-        args_list[1:],
-        executor,
-        max_inflight,
-        cancel_event,
-    ):
-        real_index = index + 1
-        values[real_index] = item.data
-        masks[real_index] = item.mask
-
-    return values, masks
-
-
-def _gpu_enabled() -> bool:
-    return HAS_CUPY
-
-
-def _to_gpu(array: np.ndarray):
-    return cp.asarray(array) if HAS_CUPY else array
-
-
-def _from_gpu(array) -> np.ndarray:
-    return (
-        cp.asnumpy(array)
-        if HAS_CUPY and isinstance(array, cp.ndarray)
-        else np.asarray(array)
-    )
-
-
 def _gpu_memory_cleanup() -> None:
     if not HAS_CUPY:
         return
@@ -1084,307 +1145,48 @@ def _gpu_memory_cleanup() -> None:
         pass
 
 
-def _streaming_cpu(
-    selected_frames: list[FrameInfo],
-    geometries: dict[Path, FrameGeometry],
-    y1: int,
-    y2: int,
-    x1: int,
-    x2: int,
-    channel: int | None,
-    normalization_factors: list[float],
+def _reject_cpu_all_valid(
+    values: np.ndarray,
     method: str,
-    dither_shifts: list[tuple[float, float] | None] | None,
-    cancel_event: threading.Event | None,
+    low: float,
+    high: float,
 ) -> np.ndarray:
-    accumulator: np.ndarray | None = None
-    counts: np.ndarray | None = None
-
-    for index, frame in enumerate(selected_frames):
-        check_cancel(cancel_event)
-
-        block = read_frame_block(
-            frame,
-            geometries[frame.path],
-            y1,
-            y2,
-            x1,
-            x2,
-            channel,
-            normalization_factors[index],
-            dither_shifts[index] if dither_shifts else None,
+    """Fast rejection path for the common fully valid, finite image interior."""
+    if method == "SigmaClip":
+        center = np.median(values, axis=0)
+        std = np.std(values, axis=0)
+        valid = (values >= center - low * std) & (values <= center + high * std)
+        valid |= ~(std > 1e-10)
+        if np.all(valid):
+            return np.asarray(center, dtype=np.float32)
+        return np.asarray(
+            np.nanmedian(np.where(valid, values, np.nan), axis=0),
+            dtype=np.float32,
         )
 
-        data = block.data
-        mask = block.mask
-
-        if accumulator is None:
-            if method in {"Mean", "Sum"}:
-                accumulator = np.zeros_like(
-                    data,
-                    dtype=np.float32,
-                )
-                counts = np.zeros(
-                    data.shape,
-                    dtype=np.uint32,
-                )
-            elif method == "Maximum":
-                accumulator = np.full_like(
-                    data,
-                    -np.inf,
-                    dtype=np.float32,
-                )
-            else:
-                accumulator = np.full_like(
-                    data,
-                    np.inf,
-                    dtype=np.float32,
-                )
-
-        if method in {"Mean", "Sum"}:
-            accumulator[mask] += data[mask]
-            counts[mask] += 1
-        elif method == "Maximum":
-            accumulator[mask] = np.maximum(
-                accumulator[mask],
-                data[mask],
-            )
-        elif method == "Minimum":
-            accumulator[mask] = np.minimum(
-                accumulator[mask],
-                data[mask],
-            )
-        else:
-            raise ValueError(f"Método streaming não suportado: {method}")
-
-    if accumulator is None:
-        raise ValueError("Bloco sem dados.")
-
-    if method == "Mean":
-        result = np.zeros_like(accumulator)
-        valid = counts > 0
-        result[valid] = accumulator[valid] / counts[valid]
-        return result
-
-    if method == "Sum":
-        return accumulator
-
-    accumulator[~np.isfinite(accumulator)] = 0.0
-    return accumulator
-
-
-def combine_block_streaming(
-    selected_frames: list[FrameInfo],
-    geometries: dict[Path, FrameGeometry],
-    y1: int,
-    y2: int,
-    x1: int,
-    x2: int,
-    channel: int | None,
-    normalization_factors: list[float],
-    method: str,
-    executor: ThreadPoolExecutor | None,
-    dither_shifts: list[tuple[float, float] | None] | None,
-    cancel_event: threading.Event | None,
-    io_queue_factor: int,
-) -> np.ndarray:
-
-    if not HAS_CUPY:
-        return _streaming_cpu(
-            selected_frames,
-            geometries,
-            y1,
-            y2,
-            x1,
-            x2,
-            channel,
-            normalization_factors,
-            method,
-            dither_shifts,
-            cancel_event,
+    if method == "MAD":
+        center = np.median(values, axis=0)
+        mad = np.median(np.abs(values - center), axis=0)
+        sigma = np.float32(1.4826) * mad
+        valid = (values >= center - low * sigma) & (values <= center + high * sigma)
+        valid |= ~(mad > 1e-10)
+        if np.all(valid):
+            return np.asarray(center, dtype=np.float32)
+        return np.asarray(
+            np.nanmedian(np.where(valid, values, np.nan), axis=0),
+            dtype=np.float32,
         )
 
-    try:
-        args_list = [
-            (
-                frame,
-                geometries[frame.path],
-                y1,
-                y2,
-                x1,
-                x2,
-                channel,
-                normalization_factors[index],
-                dither_shifts[index] if dither_shifts else None,
-            )
-            for index, frame in enumerate(selected_frames)
-        ]
-
-        accumulator = None
-        counts = None
-        executor_local = executor
-
-        if executor_local is None:
-            for index, args in enumerate(args_list):
-                check_cancel(cancel_event)
-                block = read_block_worker(args)
-
-                data_gpu = cp.asarray(block.data)
-                mask_gpu = cp.asarray(block.mask)
-
-                if accumulator is None:
-                    if method in {"Mean", "Sum"}:
-                        accumulator = cp.zeros_like(
-                            data_gpu,
-                            dtype=cp.float32,
-                        )
-                        counts = cp.zeros(
-                            data_gpu.shape,
-                            dtype=cp.uint32,
-                        )
-                    elif method == "Maximum":
-                        accumulator = cp.full_like(
-                            data_gpu,
-                            -cp.inf,
-                            dtype=cp.float32,
-                        )
-                    elif method == "Minimum":
-                        accumulator = cp.full_like(
-                            data_gpu,
-                            cp.inf,
-                            dtype=cp.float32,
-                        )
-
-                if method in {"Mean", "Sum"}:
-                    accumulator += cp.where(
-                        mask_gpu,
-                        data_gpu,
-                        cp.float32(0),
-                    )
-                    counts += mask_gpu.astype(cp.uint32)
-                elif method == "Maximum":
-                    accumulator = cp.maximum(
-                        accumulator,
-                        cp.where(mask_gpu, data_gpu, -cp.inf),
-                    )
-                elif method == "Minimum":
-                    accumulator = cp.minimum(
-                        accumulator,
-                        cp.where(mask_gpu, data_gpu, cp.inf),
-                    )
-                else:
-                    raise ValueError(f"Método streaming não suportado: {method}")
-
-        else:
-            max_inflight = max(
-                1,
-                min(
-                    len(args_list),
-                    executor_local._max_workers * max(1, io_queue_factor),
-                ),
-            )
-
-            for index, block in _bounded_parallel_reads(
-                args_list,
-                executor_local,
-                max_inflight,
-                cancel_event,
-            ):
-                del index
-                data_gpu = cp.asarray(block.data)
-                mask_gpu = cp.asarray(block.mask)
-
-                if accumulator is None:
-                    if method in {"Mean", "Sum"}:
-                        accumulator = cp.zeros_like(
-                            data_gpu,
-                            dtype=cp.float32,
-                        )
-                        counts = cp.zeros(
-                            data_gpu.shape,
-                            dtype=cp.uint32,
-                        )
-                    elif method == "Maximum":
-                        accumulator = cp.full_like(
-                            data_gpu,
-                            -cp.inf,
-                            dtype=cp.float32,
-                        )
-                    elif method == "Minimum":
-                        accumulator = cp.full_like(
-                            data_gpu,
-                            cp.inf,
-                            dtype=cp.float32,
-                        )
-
-                if method in {"Mean", "Sum"}:
-                    accumulator += cp.where(
-                        mask_gpu,
-                        data_gpu,
-                        cp.float32(0),
-                    )
-                    counts += mask_gpu.astype(cp.uint32)
-                elif method == "Maximum":
-                    accumulator = cp.maximum(
-                        accumulator,
-                        cp.where(mask_gpu, data_gpu, -cp.inf),
-                    )
-                elif method == "Minimum":
-                    accumulator = cp.minimum(
-                        accumulator,
-                        cp.where(mask_gpu, data_gpu, cp.inf),
-                    )
-                else:
-                    raise ValueError(f"Método streaming não suportado: {method}")
-
-                del data_gpu, mask_gpu
-
-        check_cancel(cancel_event)
-
-        if accumulator is None:
-            raise ValueError("Bloco sem dados.")
-
-        if method == "Mean":
-            result_gpu = cp.zeros_like(
-                accumulator,
-                dtype=cp.float32,
-            )
-            valid = counts > 0
-            result_gpu[valid] = accumulator[valid] / counts[valid]
-        elif method == "Sum":
-            result_gpu = accumulator
-        else:
-            result_gpu = cp.where(
-                cp.isfinite(accumulator),
-                accumulator,
-                cp.float32(0),
-            )
-
-        result = cp.asnumpy(result_gpu)
-        del accumulator, result_gpu
-        if counts is not None:
-            del counts
-
-        return np.asarray(result, dtype=np.float32)
-
-    except StackingCancelled:
-        raise
-    except Exception:
-        _gpu_memory_cleanup()
-
-        return _streaming_cpu(
-            selected_frames,
-            geometries,
-            y1,
-            y2,
-            x1,
-            x2,
-            channel,
-            normalization_factors,
-            method,
-            dither_shifts,
-            cancel_event,
+    if method == "Winsorized":
+        p_low = np.percentile(values, min(49.0, max(0.0, low * 10.0)), axis=0)
+        p_high = np.percentile(
+            values,
+            max(51.0, min(100.0, 100.0 - high * 10.0)),
+            axis=0,
         )
+        return np.asarray(np.median(np.clip(values, p_low, p_high), axis=0), dtype=np.float32)
+
+    raise ValueError(f"Unsupported rejection method: {method}")
 
 
 def _reject_cpu(
@@ -1394,6 +1196,10 @@ def _reject_cpu(
     low: float,
     high: float,
 ) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float32)
+    if np.all(masks) and np.isfinite(values).all():
+        return _reject_cpu_all_valid(values, method, low, high)
+
     masked = values.astype(np.float32, copy=True)
     masked[~masks] = np.nan
 
@@ -1470,6 +1276,7 @@ def reject_and_combine_block(
     low: float,
     high: float,
     cancel_event: threading.Event | None = None,
+    use_gpu: bool = False,
 ) -> np.ndarray:
     check_cancel(cancel_event)
 
@@ -1479,7 +1286,7 @@ def reject_and_combine_block(
     if rejection_method == "None" or values.shape[0] <= 3:
         rejection_method = "None"
 
-    if not HAS_CUPY:
+    if not use_gpu or not HAS_CUPY:
         if rejection_method == "None":
             masked = values.astype(
                 np.float32,
@@ -1683,116 +1490,381 @@ def reject_and_combine_block(
         )
 
 
-def combine_channel_blocks(
+def _hierarchical_worker_count(config: StackingConfig, n_frames: int) -> int:
+    """Use a few independent I/O streams, never one task per frame/block."""
+    return max(1, min(8, config.worker_count, n_frames))
+
+
+def _leaf_band_rows(
+    config: StackingConfig,
+    group_size: int,
+    width: int,
+    channels: int,
+    height: int,
+) -> int:
+    # Values, masks and rejection temporaries need several copies of a band.
+    # Keep a conservative per-leaf cap instead of oversubscribing RAM.
+    bytes_per_row = max(1, group_size * width * max(1, channels) * 24)
+    budget = max(
+        64, config.memory_budget_mb // _hierarchical_worker_count(config, group_size)
+    )
+    return max(32, min(height, int((budget * 1024 * 1024) / bytes_per_row)))
+
+
+def _partition_frames(items: list[Any], groups: int) -> list[list[Any]]:
+    groups = max(1, min(groups, len(items)))
+    return [items[index::groups] for index in range(groups)]
+
+
+def _read_open_band(
+    hdu: Any,
+    frame: FrameInfo,
+    geometry: FrameGeometry,
+    y1: int,
+    y2: int,
+    channel: int | None,
+    factor: float,
+    shift: tuple[float, float] | None,
+) -> BlockRead:
+    # The open HDU is kept by the leaf worker for its entire group.  Reads are
+    # full-width, monotonically increasing bands rather than random tiles.
+    return read_frame_block(
+        frame, geometry, y1, y2, 0, geometry.width, channel, factor, shift
+    )
+
+
+def _open_streaming_fits(path: Path) -> fits.HDUList:
+    """Use mmap only when the science HDU can be read without FITS scaling."""
+    with fits.open(
+        path,
+        memmap=True,
+        lazy_load_hdus=True,
+        do_not_scale_image_data=True,
+    ) as probe:
+        _, image_hdu = _find_primary_image_hdu(probe)
+        requires_scaling = _has_active_scaling(image_hdu)
+
+    return fits.open(
+        path,
+        memmap=not requires_scaling,
+        lazy_load_hdus=True,
+        do_not_scale_image_data=False,
+    )
+
+
+def _process_substack(
+    frames: list[FrameInfo],
+    geometries: dict[Path, FrameGeometry],
+    factors: list[float],
+    shifts: list[tuple[float, float] | None],
+    config: StackingConfig,
+    output_path: Path,
+    height: int,
+    width: int,
+    channels: int,
+    cancel_event: threading.Event | None,
+    leaf_index: int = 0,
+    progress_queue: queue.SimpleQueue[tuple[int, int]] | None = None,
+) -> SubstackInfo:
+    """Create one leaf using wide row bands and a bounded number of files."""
+    group_size = len(frames)
+    band_rows = _leaf_band_rows(config, group_size, width, channels, height)
+    shape = (height, width) if channels == 1 else (channels, height, width)
+    result = np.zeros(shape, dtype=np.float32)
+    counts = np.zeros((height, width), dtype=np.uint32)
+
+    # Opening each FITS once is the key change.  The previous spatial loop
+    # reopened/decompressed each source for every x/y block.
+    handles = [_open_streaming_fits(frame.path) for frame in frames]
+    try:
+        for y1 in range(0, height, band_rows):
+            check_cancel(cancel_event)
+            y2 = min(height, y1 + band_rows)
+            for channel in range(channels):
+                values = np.empty((group_size, y2 - y1, width), dtype=np.float32)
+                masks = np.empty(values.shape, dtype=bool)
+                for index, (frame, hdul) in enumerate(
+                    zip(frames, handles, strict=True)
+                ):
+                    geometry = geometries[frame.path]
+                    if shifts[index] is not None:
+                        # Dithered bands need pixels outside their nominal row
+                        # range.  Preserve the established translation path.
+                        block = read_frame_block(
+                            frame,
+                            geometry,
+                            y1,
+                            y2,
+                            0,
+                            width,
+                            channel,
+                            factors[index],
+                            shifts[index],
+                        )
+                        values[index] = block.data
+                        masks[index] = block.mask
+                        continue
+                    # Inline the image section using the already-open HDU.
+                    hdu = hdul[geometry.hdu_index]
+                    if geometry.image_kind == "Mono":
+                        raw = _read_hdu_section(hdu, (slice(y1, y2), slice(0, width)))
+                    elif hdu.shape[0] in (3, 4):
+                        raw = _read_hdu_section(
+                            hdu,
+                            (
+                                slice(channel, channel + 1),
+                                slice(y1, y2),
+                                slice(0, width),
+                            ),
+                        )[0]
+                    else:
+                        raw = _read_hdu_section(
+                            hdu,
+                            (
+                                slice(y1, y2),
+                                slice(0, width),
+                                slice(channel, channel + 1),
+                            ),
+                        )[:, :, 0]
+                    raw = _restore_cached_physical_values(raw, geometry)
+                    if factors[index] != 1.0:
+                        raw *= np.float32(factors[index])
+                    mask = np.isfinite(raw)
+                    if frame.valid_mask is not None:
+                        mask &= frame.valid_mask[y1:y2, :]
+                    values[index] = np.where(mask, raw, 0.0)
+                    masks[index] = mask
+                combined = reject_and_combine_block(
+                    values,
+                    masks,
+                    config.method,
+                    config.rejection_method,
+                    config.rejection_low,
+                    config.rejection_high,
+                    cancel_event,
+                    config.use_gpu,
+                )
+                if channels == 1:
+                    result[y1:y2] = combined
+                else:
+                    result[channel, y1:y2] = combined
+                if channel == 0:
+                    counts[y1:y2] = masks.sum(axis=0, dtype=np.uint32)
+            if progress_queue is not None:
+                progress_queue.put((leaf_index, 1))
+    finally:
+        for handle in handles:
+            handle.close()
+
+    mask = counts > 0
+    fits.HDUList(
+        [
+            fits.PrimaryHDU(result),
+            fits.ImageHDU(mask.astype(np.uint8), name="VALID_MASK"),
+            fits.ImageHDU(counts, name="SUB_COUNT"),
+        ]
+    ).writeto(output_path, overwrite=True)
+    return SubstackInfo(output_path, group_size)
+
+
+def _combine_substacks(
+    substacks: list[SubstackInfo],
+    config: StackingConfig,
+    total_frames: int,
+    cancel_event: threading.Event | None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    data_list: list[np.ndarray] = []
+    masks: list[np.ndarray] = []
+    counts: list[np.ndarray] = []
+    for substack in substacks:
+        check_cancel(cancel_event)
+        # This reducer already materializes every child in memory. Avoid mmap
+        # so Windows can remove the temporary leaf files immediately afterward.
+        with fits.open(substack.path, memmap=False) as hdul:
+            data_list.append(np.array(hdul[0].data, dtype=np.float32, copy=True))
+            masks.append(np.array(hdul["VALID_MASK"].data, dtype=bool, copy=True))
+            counts.append(np.array(hdul["SUB_COUNT"].data, dtype=np.uint32, copy=True))
+    values = np.stack(data_list)
+    valid = np.stack(masks)
+    coverage = np.sum(np.stack(counts), axis=0, dtype=np.uint32)
+    threshold = max(1, math.ceil(total_frames * 0.70))
+    final_mask = coverage >= threshold
+    if values.ndim == 4:
+        valid = np.broadcast_to(valid[:, None], values.shape)
+    if config.method == "Mean" and config.rejection_method == "None":
+        weights = np.stack(counts).astype(np.float32)
+        if values.ndim == 4:
+            weights = weights[:, None]
+        result = np.sum(values * weights, axis=0) / np.maximum(
+            coverage if values.ndim == 3 else coverage[None], 1
+        )
+    elif config.method == "Sum" and config.rejection_method == "None":
+        result = np.sum(np.where(valid, values, 0.0), axis=0)
+    else:
+        result = reject_and_combine_block(
+            values,
+            valid,
+            config.method,
+            config.rejection_method,
+            config.rejection_low,
+            config.rejection_high,
+            cancel_event,
+            config.use_gpu,
+        )
+    return np.asarray(result, dtype=np.float32), final_mask, coverage
+
+
+def _write_substack(
+    path: Path,
+    data: np.ndarray,
+    valid_mask: np.ndarray,
+    coverage: np.ndarray,
+) -> None:
+    fits.HDUList(
+        [
+            fits.PrimaryHDU(np.asarray(data, dtype=np.float32)),
+            fits.ImageHDU(np.asarray(valid_mask, dtype=np.uint8), name="VALID_MASK"),
+            fits.ImageHDU(np.asarray(coverage, dtype=np.uint32), name="SUB_COUNT"),
+        ]
+    ).writeto(path, overwrite=True)
+
+
+def _process_branch(
+    children: list[SubstackInfo],
+    config: StackingConfig,
+    output_path: Path,
+    cancel_event: threading.Event | None,
+) -> SubstackInfo:
+    total_frames = sum(child.frame_count for child in children)
+    data, valid_mask, coverage = _combine_substacks(
+        children,
+        config,
+        total_frames,
+        cancel_event,
+    )
+    _write_substack(output_path, data, valid_mask, coverage)
+    return SubstackInfo(output_path, total_frames)
+
+
+def _reduce_substacks_tree(
+    leaves: list[SubstackInfo],
+    config: StackingConfig,
+    temp_dir: Path,
+    worker_count: int,
+    progress_callback: Callable[[int, int, str], None] | None,
+    cancel_event: threading.Event | None,
+) -> list[SubstackInfo]:
+    """Reduce leaves in parallel binary layers without increasing workers."""
+    current = leaves
+    level = 0
+    while len(current) > worker_count:
+        groups = [current[index : index + 2] for index in range(0, len(current), 2)]
+        next_level: list[SubstackInfo] = []
+        with ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix=f"AstroBranch{level}",
+        ) as executor:
+            futures = [
+                executor.submit(
+                    _process_branch,
+                    group,
+                    config,
+                    temp_dir / f"branch_{level:02d}_{index:02d}.fits",
+                    cancel_event,
+                )
+                for index, group in enumerate(groups)
+            ]
+            for completed, future in enumerate(as_completed(futures), start=1):
+                check_cancel(cancel_event)
+                next_level.append(future.result())
+                if progress_callback:
+                    progress_callback(
+                        completed,
+                        len(futures),
+                        f"Branch level {level + 1}: {completed}/{len(futures)}",
+                    )
+        current = next_level
+        level += 1
+    return current
+
+
+def _create_substacks(
     selected_frames: list[FrameInfo],
     geometries: dict[Path, FrameGeometry],
     normalization_factors: list[float],
+    dither_shifts: list[tuple[float, float] | None],
+    config: StackingConfig,
     height: int,
     width: int,
-    channel: int | None,
-    config: StackingConfig,
-    executor: ThreadPoolExecutor | None,
-    cancel_event: threading.Event | None,
+    channels: int,
+    temp_dir: Path,
     progress_callback: Callable[[int, int, str], None] | None,
-    channel_label: str,
-    dither_shifts: list[tuple[float, float] | None] | None,
-) -> np.ndarray | None:
-    check_cancel(cancel_event)
+    status_callback: Callable[[str], None] | None,
+    cancel_event: threading.Event | None,
+) -> list[SubstackInfo]:
 
-    rejection_enabled = config.rejection_method != "None"
-
-    use_streaming = not rejection_enabled and config.method in {
-        "Mean",
-        "Sum",
-        "Maximum",
-        "Minimum",
-    }
-
-    chunk = adapt_chunk_size(
-        config.effective_chunk_size,
-        len(selected_frames),
-        1,
-        config.memory_budget_mb,
-        rejection_enabled,
-    )
-
-    result = np.zeros(
-        (height, width),
-        dtype=np.float32,
-    )
-
-    n_blocks_y = math.ceil(height / chunk)
-    n_blocks_x = math.ceil(width / chunk)
-    total_blocks = n_blocks_y * n_blocks_x
-    completed_blocks = 0
-
-    for y1 in range(0, height, chunk):
-        check_cancel(cancel_event)
-        y2 = min(y1 + chunk, height)
-
-        for x1 in range(0, width, chunk):
+    workers = _hierarchical_worker_count(config, len(selected_frames))
+    leaf_count = min(len(selected_frames), workers * 4)
+    groups = _partition_frames(selected_frames, leaf_count)
+    factor_groups = _partition_frames(normalization_factors, leaf_count)
+    shift_groups = _partition_frames(dither_shifts, leaf_count)
+    results: list[SubstackInfo] = []
+    progress_queue: queue.SimpleQueue[tuple[int, int]] = queue.SimpleQueue()
+    band_totals = [
+        math.ceil(height / _leaf_band_rows(config, len(group), width, channels, height))
+        for group in groups
+    ]
+    band_done = [0] * len(groups)
+    total_bands = sum(band_totals)
+    if status_callback:
+        status_callback(
+            f"Starting substack work | Leafs {leaf_count} | bands {total_bands}"
+        )
+    with ThreadPoolExecutor(
+        max_workers=workers, thread_name_prefix="AstroLeaf"
+    ) as executor:
+        futures = [
+            executor.submit(
+                _process_substack,
+                group,
+                geometries,
+                factors,
+                shifts,
+                config,
+                temp_dir / f"leaf_{index:02d}.fits",
+                height,
+                width,
+                channels,
+                cancel_event,
+                index,
+                progress_queue,
+            )
+            for index, (group, factors, shifts) in enumerate(
+                zip(groups, factor_groups, shift_groups, strict=True)
+            )
+        ]
+        pending = set(futures)
+        while pending:
             check_cancel(cancel_event)
-            x2 = min(x1 + chunk, width)
-
-            if use_streaming:
-                block_result = combine_block_streaming(
-                    selected_frames=selected_frames,
-                    geometries=geometries,
-                    y1=y1,
-                    y2=y2,
-                    x1=x1,
-                    x2=x2,
-                    channel=channel,
-                    normalization_factors=normalization_factors,
-                    method=config.method,
-                    executor=executor,
-                    dither_shifts=dither_shifts,
-                    cancel_event=cancel_event,
-                    io_queue_factor=config.effective_io_queue,
-                )
-            else:
-                values, masks = load_channel_block_parallel(
-                    selected_frames=selected_frames,
-                    geometries=geometries,
-                    y1=y1,
-                    y2=y2,
-                    x1=x1,
-                    x2=x2,
-                    channel=channel,
-                    normalization_factors=normalization_factors,
-                    executor=executor,
-                    dither_shifts=dither_shifts,
-                    cancel_event=cancel_event,
-                    io_queue_factor=config.effective_io_queue,
-                )
-
-                check_cancel(cancel_event)
-
-                block_result = reject_and_combine_block(
-                    values,
-                    masks,
-                    combine_method=config.method,
-                    rejection_method=config.rejection_method,
-                    low=config.rejection_low,
-                    high=config.rejection_high,
-                    cancel_event=cancel_event,
-                )
-
-                del values, masks
-
-            result[y1:y2, x1:x2] = block_result
-            del block_result
-
-            completed_blocks += 1
-
-            if progress_callback:
-                progress_callback(
-                    completed_blocks,
-                    total_blocks,
-                    (f"{channel_label}: bloco {completed_blocks}/{total_blocks}"),
-                )
-
-    return result
+            done, pending = wait(pending, timeout=0.1, return_when=FIRST_COMPLETED)
+            while True:
+                try:
+                    leaf_index, increment = progress_queue.get_nowait()
+                except queue.Empty:
+                    break
+                band_done[leaf_index] += increment
+                if progress_callback:
+                    progress_callback(
+                        sum(band_done),
+                        total_bands,
+                        f"Leaf {leaf_index + 1}/{len(groups)}: "
+                        f"band {band_done[leaf_index]}/{band_totals[leaf_index]}",
+                    )
+            for future in done:
+                results.append(future.result())
+        if progress_callback:
+            progress_callback(total_bands, total_bands, "Leaf substacks complete")
+    return results
 
 
 def _extract_flow_shift(
@@ -1887,101 +1959,6 @@ def build_dither_shifts(
     )
 
     return normalized
-
-
-def build_reference_mask(
-    selected_frames: list[FrameInfo],
-    geometries: dict[Path, FrameGeometry],
-    normalization_factors: list[float],
-    height: int,
-    width: int,
-    config: StackingConfig,
-    dither_shifts: list[tuple[float, float] | None] | None,
-    executor: ThreadPoolExecutor | None,
-    cancel_event: threading.Event | None,
-) -> np.ndarray:
-    chunk = adapt_chunk_size(
-        config.effective_chunk_size,
-        len(selected_frames),
-        1,
-        min(config.memory_budget_mb, 512),
-        False,
-    )
-
-    coverage_map = np.zeros(
-        (height, width),
-        dtype=np.uint16,
-    )
-
-    for y1 in range(0, height, chunk):
-        check_cancel(cancel_event)
-        y2 = min(y1 + chunk, height)
-
-        for x1 in range(0, width, chunk):
-            check_cancel(cancel_event)
-            x2 = min(x1 + chunk, width)
-
-            coverage = np.zeros(
-                (y2 - y1, x2 - x1),
-                dtype=np.uint16,
-            )
-
-            args_list = [
-                (
-                    frame,
-                    geometries[frame.path],
-                    y1,
-                    y2,
-                    x1,
-                    x2,
-                    0 if frame.image_kind == "RGB" else None,
-                    normalization_factors[index],
-                    dither_shifts[index] if dither_shifts else None,
-                )
-                for index, frame in enumerate(selected_frames)
-            ]
-
-            if executor is None:
-                iterator = (
-                    (i, read_block_worker(args)) for i, args in enumerate(args_list)
-                )
-            else:
-                iterator = _bounded_parallel_reads(
-                    args_list,
-                    executor,
-                    max(
-                        1,
-                        min(
-                            len(args_list),
-                            executor._max_workers * config.effective_io_queue,
-                        ),
-                    ),
-                    cancel_event,
-                )
-
-            for _, item in iterator:
-                check_cancel(cancel_event)
-                coverage += item.mask.astype(
-                    np.uint16,
-                    copy=False,
-                )
-
-            coverage_map[y1:y2, x1:x2] = coverage
-
-    max_coverage = int(np.max(coverage_map))
-
-    if max_coverage <= 0:
-        return np.zeros(
-            (height, width),
-            dtype=bool,
-        )
-
-    threshold = max(
-        1,
-        int(math.ceil(max_coverage * 0.70)),
-    )
-
-    return coverage_map >= threshold
 
 
 def flatten_background(
@@ -2572,6 +2549,35 @@ def process_stacking(
 
             geometries[frame.path] = geometry
 
+        if config.cache_decompressed_fits:
+            cache_dir = config.input_dir / FITS_CACHE_DIR_NAME
+            compressed_frames = [
+                frame
+                for frame in selected_frames
+                if geometries[frame.path].science_compressed
+            ]
+            bypassed_uncompressed = len(selected_frames) - len(compressed_frames)
+            cache_stats = FitsCacheStats()
+            if compressed_frames:
+                cached_geometries, cache_stats = cache_decompressed_frames(
+                    compressed_frames,
+                    geometries,
+                    cache_dir,
+                    log,
+                    cancel_event,
+                )
+                geometries.update(cached_geometries)
+            reference_geometry = geometries[reference_frame.path]
+            log(
+                "[Stack] Raw FITS cache: "
+                f"{len(compressed_frames)} compressed candidates | "
+                f"{cache_stats.hits} hits | "
+                f"{cache_stats.rebuilt} rebuilt | "
+                f"{cache_stats.direct} direct | "
+                f"{bypassed_uncompressed} uncompressed bypassed | "
+                f"{cache_stats.skipped} skipped"
+            )
+
         height = reference_geometry.height
         width = reference_geometry.width
         channels = reference_geometry.channels
@@ -2642,179 +2648,68 @@ def process_stacking(
             log,
         )
 
-        effective_chunk = adapt_chunk_size(
-            config.effective_chunk_size,
-            len(selected_frames),
-            1,
-            config.memory_budget_mb,
-            config.rejection_method != "None",
-        )
-
-        log(
-            f"🚀 Streaming: workers={config.worker_count} | "
-            f"bloco={effective_chunk}×{effective_chunk} | "
-            f"orçamento≈{config.memory_budget_mb} MB | "
-            f"GPU={'CuPy' if HAS_CUPY else 'CPU'}"
-        )
-
-        if config.rejection_method == "None" and config.method in {
-            "Mean",
-            "Sum",
-            "Maximum",
-            "Minimum",
-        }:
-            log("⚡ Modo incremental ativo: não mantém stack global na RAM.")
-        else:
-            log("🧮 Mediana/rejeição: somente o bloco atual permanece na RAM.")
-
-        with ThreadPoolExecutor(
-            max_workers=config.worker_count,
-            thread_name_prefix="AstroStackIO",
-        ) as executor:
-            if reference_geometry.image_kind == "Mono":
-                result_2d = combine_channel_blocks(
-                    selected_frames=selected_frames,
-                    geometries=geometries,
-                    normalization_factors=normalization_factors,
-                    height=height,
-                    width=width,
-                    channel=None,
-                    config=config,
-                    executor=executor,
-                    cancel_event=cancel_event,
-                    progress_callback=progress,
-                    channel_label="Mono",
-                    dither_shifts=dither_shifts,
-                )
-
-                if result_2d is None:
-                    return {"status": "cancelled"}
-
-                output_result = result_2d
-
-            else:
-                output_result = np.zeros(
-                    (channels, height, width),
-                    dtype=np.float32,
-                )
-
-                for channel in range(channels):
-                    check_cancel(cancel_event)
-
-                    log(f"🎨 Processando canal {channel + 1}/{channels}...")
-
-                    channel_result = combine_channel_blocks(
-                        selected_frames=selected_frames,
-                        geometries=geometries,
-                        normalization_factors=normalization_factors,
-                        height=height,
-                        width=width,
-                        channel=channel,
-                        config=config,
-                        executor=executor,
-                        cancel_event=cancel_event,
-                        progress_callback=progress,
-                        channel_label=(f"Canal {channel + 1}/{channels}"),
-                        dither_shifts=dither_shifts,
-                    )
-
-                    if channel_result is None:
-                        return {"status": "cancelled"}
-
-                    output_result[channel] = channel_result
-                    del channel_result
-
-            check_cancel(cancel_event)
-
-            log("🛡️ Construindo máscara de validade...")
-
-            validity_mask = build_reference_mask(
+        leaf_workers = _hierarchical_worker_count(config, len(selected_frames))
+        log(f"Hierarchical stacking: {leaf_workers} bounded leaf workers")
+        config.output_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix=".astrostack-", dir=config.output_dir
+        ) as temp_dir:
+            substacks = _create_substacks(
                 selected_frames,
                 geometries,
                 normalization_factors,
+                dither_shifts,
+                config,
                 height,
                 width,
-                config,
-                dither_shifts,
-                executor,
+                channels,
+                Path(temp_dir),
+                progress,
+                log,
                 cancel_event,
             )
-
-        check_cancel(cancel_event)
-
-        if config.remove_background:
-            log("🌌 Removendo gradiente/background (modo explicitamente habilitado)...")
-
-            output_result = flatten_background(
-                output_result,
-                validity_mask,
+            substacks = _reduce_substacks_tree(
+                substacks,
+                config,
+                Path(temp_dir),
+                leaf_workers,
+                progress,
+                cancel_event,
             )
-        else:
-            log("🌌 Background preservado: remoção de gradiente desabilitada.")
+            progress(0, 1, "Combining substacks at root")
+            output_result, validity_mask, _ = _combine_substacks(
+                substacks,
+                config,
+                len(selected_frames),
+                cancel_event,
+            )
+            progress(1, 1, "Root stack complete")
 
         check_cancel(cancel_event)
-
-        log("✂️ Aplicando máscara de cobertura...")
-
+        if config.remove_background:
+            output_result = flatten_background(output_result, validity_mask)
         if output_result.ndim == 3:
             output_result[:, ~validity_mask] = 0.0
         else:
             output_result[~validity_mask] = 0.0
-
         output_result = np.nan_to_num(
-            output_result,
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        ).astype(
-            np.float32,
-            copy=False,
-        )
-
-        check_cancel(cancel_event)
-
-        source_header = load_source_header(reference_frame.path)
+            output_result, nan=0.0, posinf=0.0, neginf=0.0
+        ).astype(np.float32, copy=False)
 
         header = prepare_output_header(
-            source_header=source_header,
-            config=config,
-            n_frames=len(selected_frames),
-            n_frames_total=len(all_frames),
-            n_batches=len(batch_metadata),
-            avg_quality=avg_quality,
-            avg_star_count=avg_star_count,
-            avg_fwhm=avg_fwhm,
-        )
-
-        log(f"💾 Preparando saída {config.output_bit_depth}...")
-
-        data_to_save = convert_output_dtype(
-            output_result,
+            load_source_header(reference_frame.path),
             config,
+            len(selected_frames),
+            len(all_frames),
+            len(batch_metadata),
+            avg_quality,
+            avg_star_count,
+            avg_fwhm,
         )
-
-        config.output_dir.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
+        data_to_save = convert_output_dtype(output_result, config)
         output_path = config.output_dir / config.output_name
-
-        check_cancel(cancel_event)
-
-        log(f"💾 Salvando: {output_path}")
-
-        write_stack_output(
-            output_path,
-            data_to_save,
-            validity_mask,
-            header,
-            config,
-        )
-
-        check_cancel(cancel_event)
-
-        stats = {
+        write_stack_output(output_path, data_to_save, validity_mask, header, config)
+        return {
             "status": "success",
             "output_path": str(output_path),
             "n_frames": len(selected_frames),
@@ -2823,7 +2718,7 @@ def process_stacking(
             "method": config.method,
             "rejection": config.rejection_method,
             "selection_mode": config.selection_mode,
-            "selection_percentage": (config.selection_percentage),
+            "selection_percentage": config.selection_percentage,
             "selection_metric": config.selection_metric,
             "shape": tuple(output_result.shape),
             "dtype": str(data_to_save.dtype),
@@ -2835,30 +2730,18 @@ def process_stacking(
             "avg_quality": avg_quality,
             "avg_star_count": avg_star_count,
             "avg_fwhm": avg_fwhm,
-            "workers": config.worker_count,
-            "chunk_size": effective_chunk,
+            "workers": leaf_workers,
+            "chunk_size": "row-band",
             "memory_budget_mb": config.memory_budget_mb,
             "streaming": True,
-            "gpu": bool(HAS_CUPY),
+            "hierarchical": True,
+            "gpu": bool(config.use_gpu and HAS_CUPY),
             "background_removed": bool(config.remove_background),
             "dither_correction": bool(config.apply_dither_correction),
             "batches": {
                 name: meta["frame_count"] for name, meta in batch_metadata.items()
             },
         }
-
-        log("\n✅ Stacking concluído!")
-        log(f"📁 Resultado: {output_path}")
-        log(
-            f"📊 {len(selected_frames)} frames combinados "
-            f"(de {len(all_frames)} disponíveis)"
-        )
-        log(f"📁 {len(batch_metadata)} batches processados")
-        log(f"📈 Qualidade média: {avg_quality:.2f}")
-        log(f"📈 FWHM médio: {avg_fwhm:.2f}px")
-        log(f"💾 Profundidade: {config.output_bit_depth}")
-
-        return stats
 
     except StackingCancelled:
         log("\n🛑 Stacking cancelado pelo usuário.")
@@ -2997,6 +2880,8 @@ def _build_config_from_dict(
                 2,
             )
         ),
+        use_gpu=bool(config_dict.get("use_gpu", False)),
+        cache_decompressed_fits=bool(config_dict.get("cache_decompressed_fits", True)),
     )
 
 
@@ -3025,6 +2910,7 @@ def process_all_stacking(
 __all__ = [
     "HAS_CUPY",
     "BlockRead",
+    "FitsCacheStats",
     "FrameGeometry",
     "FrameInfo",
     "StackingCancelled",
