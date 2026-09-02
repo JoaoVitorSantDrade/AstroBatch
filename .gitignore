@@ -1,5 +1,11 @@
-*.json
 .venv
 __pycache__
 original_example/
 *.svg
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.astrostack_fits_cache/
+astro_config.json

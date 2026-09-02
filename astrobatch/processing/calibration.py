@@ -69,7 +69,7 @@ def _read_for_master(
 
 def _inspect_master_frame(filepath: Path) -> tuple[tuple[int, int], fits.Header, int]:
     """Read master geometry without retaining the image in RAM."""
-    with fits.open(filepath, memmap=True, ignore_missing_end=True) as hdul:
+    with fits.open(filepath, memmap=False, ignore_missing_end=True) as hdul:
         for index, hdu in enumerate(hdul):
             if hdu.is_image and hdu.shape is not None and len(hdu.shape) == 2:
                 return tuple(hdu.shape), _sanitize_float_header(hdu.header), index
@@ -199,7 +199,9 @@ def make_master(
         app_print(f"Nenhum frame encontrado em {folder_path.name} para criar Master.\n")
         return None
 
-    app_print(f"Inspecionando {len(files)} frames para gerar Master ({folder_path.name})...\n")
+    app_print(
+        f"Inspecionando {len(files)} frames para gerar Master ({folder_path.name})...\n"
+    )
     reference_shape, base_header, hdu_index = _inspect_master_frame(files[0])
     incompatible = []
     for index, filepath in enumerate(files[1:], start=1):
@@ -295,9 +297,13 @@ def calibrate_single_frame(
         data, header = load_fits_data(light_path)
 
         if master_dark is not None and master_dark.shape != data.shape:
-            raise ValueError(f"Master Dark possui dimensão incompatível: {master_dark.shape} vs {data.shape}")
+            raise ValueError(
+                f"Master Dark possui dimensão incompatível: {master_dark.shape} vs {data.shape}"
+            )
         if master_flat is not None and master_flat.shape != data.shape:
-            raise ValueError(f"Master Flat possui dimensão incompatível: {master_flat.shape} vs {data.shape}")
+            raise ValueError(
+                f"Master Flat possui dimensão incompatível: {master_flat.shape} vs {data.shape}"
+            )
         data = calibrate_inplace(
             np.ascontiguousarray(data, dtype=np.float32), master_dark, master_flat
         )

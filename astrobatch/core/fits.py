@@ -14,7 +14,10 @@ def discover_fits(directory: Path) -> list[Path]:
 
 
 def inspect_fits(path: Path) -> tuple[tuple[int, ...], fits.Header]:
-    with fits.open(path, memmap=True, ignore_missing_end=True) as hdul:
+    # Import must work for compressed, network-backed, and non-standard FITS
+    # files.  Astropy's mmap path is not supported by all HDU/data sources.
+    # This is a small metadata probe, so use the portable eager read path.
+    with fits.open(path, memmap=False, ignore_missing_end=True) as hdul:
         for hdu in hdul:
             if hdu.is_image and hdu.data is not None:
                 return tuple(hdu.data.shape), hdu.header.copy()

@@ -1380,7 +1380,7 @@ def _open_streaming_fits(path: Path) -> fits.HDUList:
     """Use mmap only when the science HDU can be read without FITS scaling."""
     with fits.open(
         path,
-        memmap=True,
+        memmap=False,
         lazy_load_hdus=True,
         do_not_scale_image_data=True,
     ) as probe:
