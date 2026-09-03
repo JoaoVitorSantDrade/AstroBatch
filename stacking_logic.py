@@ -33,7 +33,8 @@ from astropy.stats import SigmaClip
 from astropy.utils.exceptions import AstropyWarning
 from photutils.background import Background2D, MedianBackground
 
-from cpu_kernels import masked_extrema
+from app.engines import EngineDescriptor, EngineProfile, ExecutionBudget, registry
+from cpu_kernels import apply_scale_and_mask_inplace, masked_extrema, masked_sum_count, weighted_merge
 
 try:
     from pyinstrument import Profiler
@@ -90,6 +91,8 @@ class StackingConfig:
     normalization_max_samples: int = DEFAULT_NORMALIZATION_MAX_SAMPLES
     io_queue_factor: int = 2
     cache_decompressed_fits: bool = True
+    engine_profile: str = "Stable"
+    reducer_engine: str | None = None
 
     @property
     def worker_count(self) -> int:
@@ -1155,10 +1158,12 @@ def _nanmedian_axis0_no_warning(values: np.ndarray) -> np.ndarray:
     return result.reshape(values.shape[1:])
 
 
-def _combine_masked_cpu(
+def _combine_masked_impl(
     values: np.ndarray,
     masks: np.ndarray,
     combine_method: str,
+    profile: EngineProfile = EngineProfile.STABLE,
+    kernel_parallel: bool = False,
 ) -> np.ndarray:
     """Combine a block without materialising a NaN-filled float copy."""
     values = np.asarray(values, dtype=np.float32)
@@ -1167,6 +1172,16 @@ def _combine_masked_cpu(
     valid = masks & ~np.isnan(values)
 
     if combine_method in {"Mean", "Sum"}:
+        if profile is EngineProfile.FAST:
+            total, count = masked_sum_count(values, valid, parallel=kernel_parallel)
+            if combine_method == "Sum":
+                return total
+            return np.divide(
+                total,
+                count,
+                out=np.full(total.shape, np.nan, dtype=np.float32),
+                where=count > 0,
+            )
         total = np.sum(np.where(valid, values, np.float32(0.0)), axis=0)
         if combine_method == "Sum":
             return total
@@ -1184,6 +1199,45 @@ def _combine_masked_cpu(
     if combine_method == "Median":
         return _nanmedian_axis0_no_warning(np.where(valid, values, np.nan))
     raise ValueError(f"Unsupported combine method: {combine_method}")
+
+
+def _stable_stack_reducer(values: np.ndarray, masks: np.ndarray, method: str) -> np.ndarray:
+    return _combine_masked_impl(values, masks, method, EngineProfile.STABLE)
+
+
+def _fast_stack_reducer(
+    values: np.ndarray, masks: np.ndarray, method: str, kernel_parallel: bool = False
+) -> np.ndarray:
+    return _combine_masked_impl(values, masks, method, EngineProfile.FAST, kernel_parallel)
+
+
+def _register_stack_engines() -> None:
+    registry.register(
+        EngineDescriptor("stable-numpy", "stack.reducer", "Stable NumPy", frozenset({EngineProfile.STABLE, EngineProfile.FAST})),
+        _stable_stack_reducer,
+    )
+    registry.register(
+        EngineDescriptor("fast-numba", "stack.reducer", "Fast Numba", frozenset({EngineProfile.FAST}), capabilities=frozenset({"mean", "sum", "minimum", "maximum"})),
+        _fast_stack_reducer,
+    )
+
+
+def _combine_masked_cpu(
+    values: np.ndarray,
+    masks: np.ndarray,
+    combine_method: str,
+    engine_profile: str = "Stable",
+    reducer_engine: str | None = None,
+    kernel_parallel: bool = False,
+) -> np.ndarray:
+    _register_stack_engines()
+    profile = EngineProfile.coerce(engine_profile)
+    eligible_fast = combine_method in {"Mean", "Sum", "Minimum", "Maximum"}
+    engine_id = reducer_engine or ("fast-numba" if profile is EngineProfile.FAST and eligible_fast else "stable-numpy")
+    reducer = registry.resolve("stack.reducer", engine_id, profile)
+    if engine_id == "fast-numba":
+        return reducer(values, masks, combine_method, kernel_parallel)
+    return reducer(values, masks, combine_method)
 
 
 def _reject_cpu_all_valid(
@@ -1314,6 +1368,9 @@ def reject_and_combine_block(
     low: float,
     high: float,
     cancel_event: threading.Event | None = None,
+    engine_profile: str = "Stable",
+    reducer_engine: str | None = None,
+    kernel_parallel: bool = False,
 ) -> np.ndarray:
     check_cancel(cancel_event)
 
@@ -1324,7 +1381,9 @@ def reject_and_combine_block(
         rejection_method = "None"
 
     if rejection_method == "None":
-        result = _combine_masked_cpu(values, masks, combine_method)
+        result = _combine_masked_cpu(
+            values, masks, combine_method, engine_profile, reducer_engine, kernel_parallel
+        )
         return np.asarray(
             np.nan_to_num(result, nan=0.0, posinf=0.0, neginf=0.0),
             dtype=np.float32,
@@ -1500,15 +1559,18 @@ def _process_substack(
                             ),
                         )[:, :, 0]
                     raw = _restore_cached_physical_values(raw, geometry)
-                    if factors[index] != 1.0:
-                        raw *= np.float32(factors[index])
                     mask = np.isfinite(raw)
                     if frame.valid_mask is not None:
                         mask &= frame.valid_mask[y1:y2, :]
                     # Reuse the preallocated contiguous band slot instead of
                     # allocating a second full np.where result per frame.
                     values[index] = raw
-                    values[index][~mask] = np.float32(0.0)
+                    if EngineProfile.coerce(config.engine_profile) is EngineProfile.FAST:
+                        apply_scale_and_mask_inplace(values[index], mask, factors[index])
+                    else:
+                        if factors[index] != 1.0:
+                            values[index] *= np.float32(factors[index])
+                        values[index][~mask] = np.float32(0.0)
                     masks[index] = mask
                 report(
                     0,
@@ -1522,6 +1584,9 @@ def _process_substack(
                     config.rejection_low,
                     config.rejection_high,
                     cancel_event,
+                    config.engine_profile,
+                    config.reducer_engine,
+                    ExecutionBudget.for_pipeline(config.worker_count).kernel_parallel,
                 )
                 if channels == 1:
                     result[y1:y2] = combined
@@ -1584,12 +1649,15 @@ def _combine_substacks(
     final_mask = coverage >= threshold
 
     if config.method == "Mean" and config.rejection_method == "None":
-        weights = np.stack(counts).astype(np.float32)
-        if values.ndim == 4:
-            weights = weights[:, None, :, :]
-        result = np.sum(values * weights, axis=0) / np.maximum(
-            coverage if values.ndim == 3 else coverage[None, :, :], 1
-        )
+        if EngineProfile.coerce(config.engine_profile) is EngineProfile.FAST:
+            result = weighted_merge(values, np.stack(counts))
+        else:
+            weights = np.stack(counts).astype(np.float32)
+            if values.ndim == 4:
+                weights = weights[:, None, :, :]
+            result = np.sum(values * weights, axis=0) / np.maximum(
+                coverage if values.ndim == 3 else coverage[None, :, :], 1
+            )
     elif config.method == "Sum" and config.rejection_method == "None":
         result = np.sum(np.where(valid, values, 0.0), axis=0)
     else:
@@ -1602,6 +1670,9 @@ def _combine_substacks(
                 config.rejection_low,
                 config.rejection_high,
                 cancel_event,
+                config.engine_profile,
+                config.reducer_engine,
+                ExecutionBudget.for_pipeline(config.worker_count).kernel_parallel,
             )
         else:
             result = np.empty(values.shape[1:], dtype=np.float32)
@@ -1615,6 +1686,9 @@ def _combine_substacks(
                     config.rejection_low,
                     config.rejection_high,
                     cancel_event,
+                    config.engine_profile,
+                    config.reducer_engine,
+                    ExecutionBudget.for_pipeline(config.worker_count).kernel_parallel,
                 )
     return np.asarray(result, dtype=np.float32), final_mask, coverage
 
@@ -2711,6 +2785,8 @@ def _build_config_from_dict(
             )
         ),
         cache_decompressed_fits=bool(config_dict.get("cache_decompressed_fits", True)),
+        engine_profile=str(config_dict.get("engine_profile", "Stable")),
+        reducer_engine=config_dict.get("reducer_engine") or None,
     )
 
 

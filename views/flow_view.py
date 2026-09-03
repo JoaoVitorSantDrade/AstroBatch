@@ -79,8 +79,33 @@ class FlowView(BaseAstroView):
         ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(10, 8))
 
         # Botões de Ação - Local Flow
+        advanced = ttk.LabelFrame(
+            card_local, text="Engines (Avancado)", style="Section.TLabelframe", padding=8
+        )
+        advanced.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(0, 8))
+        ttk.Label(advanced, text="Perfil:").grid(row=0, column=0, sticky="w")
+        ttk.Combobox(
+            advanced, textvariable=self.app.flow_profile_var, values=["Stable", "Fast"],
+            state="readonly", width=12,
+        ).grid(row=0, column=1, sticky="w", padx=8)
+        ttk.Label(advanced, text="Detector:").grid(row=0, column=2, sticky="w")
+        ttk.Combobox(
+            advanced, textvariable=self.app.flow_detector_engine_var,
+            values=["", "dao", "opencv-contours", "opencv-components", "sep"],
+            state="readonly", width=20,
+        ).grid(row=0, column=3, sticky="w", padx=8)
+        ttk.Label(advanced, text="Fallback:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Combobox(
+            advanced, textvariable=self.app.flow_transform_fallback_var,
+            values=["Disabled", "astroalign-asterism"], state="readonly", width=20,
+        ).grid(row=1, column=1, sticky="w", padx=8, pady=(6, 0))
+        ttk.Label(
+            advanced, text="Fast escolhe OpenCV components quando Detector estiver vazio.",
+            style="Muted.TLabel",
+        ).grid(row=1, column=2, columnspan=2, sticky="w", pady=(6, 0))
+
         actions_local = ttk.Frame(card_local)
-        actions_local.grid(row=3, column=0, columnspan=4, sticky="ew")
+        actions_local.grid(row=4, column=0, columnspan=4, sticky="ew")
         actions_local.columnconfigure(2, weight=1)
 
         self.btn_select_anchor = ttk.Button(

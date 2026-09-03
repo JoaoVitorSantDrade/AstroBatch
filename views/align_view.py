@@ -109,6 +109,17 @@ class AlignView(BaseAstroView):
             width=16,
         ).grid(row=0, column=1, sticky="w", padx=8)
 
+        ttk.Label(params, text="Perfil:").grid(row=0, column=2, sticky="w", padx=(18, 0))
+        ttk.Combobox(
+            params, textvariable=self.app.align_profile_var, values=["Stable", "Fast"],
+            state="readonly", width=12,
+        ).grid(row=0, column=3, sticky="w", padx=8)
+        ttk.Label(params, text="Warp (Avancado):").grid(row=1, column=2, sticky="w", padx=(18, 0))
+        ttk.Combobox(
+            params, textvariable=self.app.align_warp_engine_var,
+            values=["", "opencv-stable", "opencv-fast"], state="readonly", width=18,
+        ).grid(row=1, column=3, sticky="w", padx=8)
+
         # ---> NOVA OPÇÃO: REGISTRO CROMÁTICO <---
         ttk.Checkbutton(
             params,

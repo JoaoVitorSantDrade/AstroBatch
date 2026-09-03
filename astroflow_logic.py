@@ -13,6 +13,9 @@ from astropy.utils.exceptions import AstropyWarning
 from photutils.detection import DAOStarFinder
 from scipy.spatial import KDTree
 
+from app.engines import EngineDescriptor, EngineProfile, EngineUnavailable, registry
+from app.engines.astroalign_fallback import estimate_asterism_transform
+
 warnings.simplefilter("ignore", category=AstropyWarning)
 
 
@@ -311,12 +314,126 @@ def detect_stars_opencv(
     return (coords, current_fwhm, metrics)
 
 
-def detect_stars(
-    data: np.ndarray, fwhm: float, sigma: float, max_stars: int, engine: str = "DAO"
+def detect_stars_opencv_components(
+    data: np.ndarray, fwhm: float, sigma: float, max_stars: int
 ) -> tuple[np.ndarray, float, dict]:
-    if str(engine).upper() == "OPENCV":
-        return detect_stars_opencv(data, fwhm, sigma, max_stars)
-    return detect_stars_dao(data, fwhm, sigma, max_stars)
+    """Fast native connected-components detector.
+
+    Unlike the compatibility OpenCV detector this does not create Python
+    contour/moment objects for every candidate.
+    """
+    mean_val, median_val, std_val = (
+        float(np.mean(data)), float(np.median(data)), float(np.std(data))
+    )
+    norm_img = cv2.normalize(data, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+    ksize = max(3, int(fwhm) | 1)
+    blurred = cv2.GaussianBlur(norm_img, (ksize, ksize), 0)
+    threshold = min(255.0, float(np.median(blurred)) + sigma * float(np.std(blurred)))
+    _, binary = cv2.threshold(blurred, threshold, 255, cv2.THRESH_BINARY)
+    _, _, stats, centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    areas = stats[1:, cv2.CC_STAT_AREA].astype(np.float32, copy=False)
+    centers = centroids[1:].astype(np.float32, copy=False)
+    valid = (areas > 2) & (areas < 1000) & np.isfinite(centers).all(axis=1)
+    areas, centers = areas[valid], centers[valid]
+    if len(areas):
+        order = np.argsort(areas)[::-1][:max_stars]
+        areas, centers = areas[order], centers[order]
+        height, width = data.shape[:2]
+        pixels = np.rint(centers).astype(np.intp)
+        pixels[:, 0] = np.clip(pixels[:, 0], 0, width - 1)
+        pixels[:, 1] = np.clip(pixels[:, 1], 0, height - 1)
+        fluxes = np.asarray(data[pixels[:, 1], pixels[:, 0]], dtype=np.float32)
+    else:
+        centers = np.empty((0, 2), dtype=np.float32)
+        fluxes = np.empty((0,), dtype=np.float32)
+    star_count = len(centers)
+    current_fwhm = float(np.mean(np.sqrt(areas / np.pi) * 2.0)) if len(areas) else 0.0
+    snr = float(np.mean(fluxes) / std_val) if len(fluxes) and std_val > 0 else 0.0
+    metrics = {
+        "star_count": star_count,
+        "fwhm": round(current_fwhm, 2),
+        "mean": round(mean_val, 2),
+        "median": round(median_val, 2),
+        "std": round(std_val, 2),
+        "background": round(median_val, 2),
+        "snr": round(snr, 2),
+        "min_flux": round(float(np.min(fluxes)), 2) if len(fluxes) else 0.0,
+        "max_flux": round(float(np.max(fluxes)), 2) if len(fluxes) else 0.0,
+        "valid": bool(star_count > 10 and 0 < current_fwhm < fwhm * 2.5),
+    }
+    return centers, current_fwhm, metrics
+
+
+def detect_stars_sep(
+    data: np.ndarray, fwhm: float, sigma: float, max_stars: int
+) -> tuple[np.ndarray, float, dict]:
+    """Optional SEP detector with a spatially varying background model."""
+    import sep
+
+    image = np.ascontiguousarray(data, dtype=np.float32)
+    background = sep.Background(image)
+    sources = sep.extract(image - background.back(), sigma, err=background.rms())
+    if len(sources):
+        order = np.argsort(sources["flux"])[::-1][:max_stars]
+        sources = sources[order]
+        coords = np.column_stack((sources["x"], sources["y"])).astype(np.float32)
+        fluxes = np.asarray(sources["flux"], dtype=np.float32)
+        fwhm_values = 2.0 * np.sqrt(np.maximum(sources["a"] * sources["b"], 0.0))
+        measured_fwhm = float(np.median(fwhm_values))
+    else:
+        coords, fluxes, measured_fwhm = np.empty((0, 2), np.float32), np.empty((0,), np.float32), 0.0
+    std_val = float(np.std(image))
+    metrics = {
+        "star_count": len(coords), "fwhm": round(measured_fwhm, 2),
+        "mean": round(float(np.mean(image)), 2), "median": round(float(np.median(image)), 2),
+        "std": round(std_val, 2), "background": round(float(background.globalback), 2),
+        "snr": round(float(np.mean(fluxes) / std_val), 2) if len(fluxes) and std_val > 0 else 0.0,
+        "min_flux": round(float(np.min(fluxes)), 2) if len(fluxes) else 0.0,
+        "max_flux": round(float(np.max(fluxes)), 2) if len(fluxes) else 0.0,
+        "valid": bool(len(coords) > 10 and 0 < measured_fwhm < fwhm * 2.5),
+    }
+    return coords, measured_fwhm, metrics
+
+
+def _register_flow_engines() -> None:
+    profile_both = frozenset({EngineProfile.STABLE, EngineProfile.FAST})
+    registry.register(EngineDescriptor("dao", "flow.detector", "DAO", profile_both), detect_stars_dao)
+    registry.register(EngineDescriptor("opencv-contours", "flow.detector", "OpenCV contours", profile_both), detect_stars_opencv)
+    registry.register(EngineDescriptor("opencv-components", "flow.detector", "OpenCV components", frozenset({EngineProfile.FAST})), detect_stars_opencv_components)
+    registry.register(EngineDescriptor("sep", "flow.detector", "SEP / Source Extractor", frozenset({EngineProfile.FAST}), optional_dependency="sep"), detect_stars_sep)
+    registry.register(EngineDescriptor("astroalign-asterism", "flow.transform_fallback", "Astroalign asterisms", profile_both, optional_dependency="astroalign"), estimate_asterism_transform)
+
+
+def _flow_detector_choice(config: dict) -> str:
+    choice = config.get("detector_engine") or config.get("engine", "DAO")
+    if (
+        EngineProfile.coerce(config.get("engine_profile", "Stable")) is EngineProfile.FAST
+        and not config.get("detector_engine")
+        and str(choice).upper() == "DAO"
+    ):
+        return "opencv-components"
+    return str(choice)
+
+
+def detect_stars(
+    data: np.ndarray,
+    fwhm: float,
+    sigma: float,
+    max_stars: int,
+    engine: str = "DAO",
+    profile: str = "Stable",
+) -> tuple[np.ndarray, float, dict]:
+    """V1-compatible detector adapter resolved through the V2 registry."""
+    _register_flow_engines()
+    normalized = str(engine).strip().lower()
+    aliases = {
+        "dao": "dao", "opencv": "opencv-contours", "opencv-contours": "opencv-contours",
+        "opencv-components": "opencv-components", "sep": "sep",
+    }
+    engine_id = aliases.get(normalized, "dao")
+    selected_profile = EngineProfile.coerce(profile)
+    detector = registry.resolve("flow.detector", engine_id, selected_profile)
+    return detector(data, fwhm, sigma, max_stars)
 
 
 # ============================================================
@@ -486,6 +603,7 @@ def _process_single_frame(
     max_stars_val: int,
     min_stars: int,
     engine_val: str,
+    engine_profile: str = "Stable",
 ) -> tuple[str, dict | None]:
     try:
         data, header = load_fits_data(filepath)
@@ -497,7 +615,7 @@ def _process_single_frame(
 
         while current_sigma >= 3.0:
             stars, measured_fwhm, metrics = detect_stars(
-                working_data, fwhm_val, current_sigma, max_stars_val, engine_val
+                working_data, fwhm_val, current_sigma, max_stars_val, engine_val, engine_profile
             )
             best_stars, best_fwhm, best_metrics = stars, measured_fwhm, metrics
             if len(stars) >= target_stars:
@@ -579,7 +697,9 @@ def process_local_flow(batch_dir: Path, config: dict, app_print) -> dict:
     max_stars_val = int(config.get("max_stars", 250))
     matching_radius = float(config.get("matching_radius", 25.0))
     ransac_thresh = float(config.get("ransac", 4.0))
-    engine_val = config.get("engine", "DAO")
+    engine_val = _flow_detector_choice(config)
+    engine_profile = str(config.get("engine_profile", "Stable"))
+    fallback_engine = config.get("transform_fallback", "Disabled")
 
     limits = {
         "min_stars": int(config.get("min_stars", 4)),
@@ -596,7 +716,7 @@ def process_local_flow(batch_dir: Path, config: dict, app_print) -> dict:
         cpu_count = getattr(os, "process_cpu_count", os.cpu_count)() or 1
     except Exception:
         cpu_count = os.cpu_count() or 1
-    worker_count = max(1, min(2, cpu_count / 4))
+    worker_count = max(1, min(2, cpu_count // 4))
 
     prepared_frames = {}
     with ThreadPoolExecutor(
@@ -611,6 +731,7 @@ def process_local_flow(batch_dir: Path, config: dict, app_print) -> dict:
                 max_stars_val,
                 limits["min_stars"],
                 engine_val,
+                engine_profile,
             ): filepath
             for filepath in files
         }
@@ -640,6 +761,8 @@ def process_local_flow(batch_dir: Path, config: dict, app_print) -> dict:
         "mode": "incremental_chain",
         "workers": worker_count,
         "engine": engine_val,
+        "engine_profile": str(config.get("engine_profile", "Stable")),
+        "transform_fallback": fallback_engine,
         "parameters": {
             "fwhm": fwhm_val,
             "sigma": sigma_val,
@@ -787,6 +910,32 @@ def process_local_flow(batch_dir: Path, config: dict, app_print) -> dict:
                 and metrics.get("rms", 999.0) < best_metrics.get("rms", 999.0)
             ):
                 best_metrics = metrics
+
+        if not accepted and str(fallback_engine).lower() in {"astroalign", "astroalign-asterism"}:
+            try:
+                _register_flow_engines()
+                fallback = registry.resolve("flow.transform_fallback", "astroalign-asterism")
+                relative_homogeneous, metrics = fallback(current_frame["stars"], previous_frame["stars"])
+                rel_matrix = np.asarray(relative_homogeneous[:2, :], dtype=np.float64)
+                valid, reason = validate_transform(rel_matrix, metrics, limits)
+                if valid:
+                    accepted = True
+                    ref_matrix = np.asarray(flow_data["frames"][previous_name]["matrix"], dtype=np.float64)
+                    cumulative_matrix = ref_matrix @ relative_homogeneous
+                    previous_rms = float(flow_data["frames"][previous_name].get("cumulative_rms", 0.0))
+                    metrics["cumulative_rms"] = float(np.sqrt(previous_rms**2 + float(metrics["rms"]) ** 2))
+                    flow_data["frames"][current_name] = {
+                        "status": "accepted", "matrix": cumulative_matrix.tolist(),
+                        "relative_matrix": relative_homogeneous.tolist(), "relative_to": previous_name,
+                        "fwhm": current_frame["fwhm"], "star_count": len(current_frame["stars"]), **metrics,
+                    }
+                    app_print(f"[{current_name}] OK (astroalign_asterism) <- {previous_name} | "
+                              f"{metrics['inliers']}/{metrics['matches']} asterism matches | RMS={metrics['rms']:.3f}px\n")
+                else:
+                    best_metrics = {**metrics, "reason": reason}
+            except Exception as exc:
+                # Optional engines must never stop a normal Flow execution.
+                app_print(f"[{current_name}] Astroalign fallback unavailable: {exc}\n")
 
         if accepted:
             previous_name = current_name
@@ -1097,7 +1246,7 @@ def _matrix_difference_score(first: np.ndarray, second: np.ndarray) -> float:
 
 
 def _detect_anchor_stars_task(
-    info: dict, fwhm_val: float, base_sigma: float, engine_val: str
+    info: dict, fwhm_val: float, base_sigma: float, engine_val: str, engine_profile: str = "Stable"
 ):
     """Worker independente por batch: usado para paralelizar a fase de detecção de
     estrelas-âncora do Global Flow (anteriormente sequencial)."""
@@ -1109,7 +1258,7 @@ def _detect_anchor_stars_task(
 
     while current_sigma >= 2.8:
         g_stars, g_fwhm, _ = detect_stars(
-            working_data, fwhm_val, current_sigma, 250, engine_val
+            working_data, fwhm_val, current_sigma, 250, engine_val, engine_profile
         )
         best_stars, best_fwhm = g_stars, g_fwhm
         if len(g_stars) >= 35:
@@ -1219,7 +1368,8 @@ def process_all_flows(
     anchors_info.sort(key=lambda x: x["batch_name"].lower())
 
     base_sigma = float(config.get("sigma", 5.0))
-    engine_val = config.get("engine", "DAO")
+    engine_val = _flow_detector_choice(config)
+    engine_profile = str(config.get("engine_profile", "Stable"))
     fwhm_val = float(config.get("fwhm", 4.0))
 
     app_print("\n[GLOBAL] Gerando imagens sintéticas para Pareamento Global...\n")
@@ -1237,7 +1387,7 @@ def process_all_flows(
     ) as executor:
         futures = {
             executor.submit(
-                _detect_anchor_stars_task, info, fwhm_val, base_sigma, engine_val
+                _detect_anchor_stars_task, info, fwhm_val, base_sigma, engine_val, engine_profile
             ): info
             for info in anchors_info
         }
@@ -1555,10 +1705,11 @@ def preview_star_detection(
     fwhm_val = float(config.get("fwhm", 4.0))
     sigma_val = float(config.get("sigma", 5.0))
     max_stars_val = int(config.get("max_stars", 250))
-    engine_val = config.get("engine", "DAO")
+    engine_val = _flow_detector_choice(config)
 
     stars, measured_fwhm, _ = detect_stars(
-        working_data, fwhm_val, sigma_val, max_stars_val, engine_val
+        working_data, fwhm_val, sigma_val, max_stars_val, engine_val,
+        str(config.get("engine_profile", "Stable")),
     )
     _, median, std = sigma_clipped_stats(working_data, sigma=3.0)
     median, std = float(median), float(std)

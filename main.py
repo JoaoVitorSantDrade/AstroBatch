@@ -4,6 +4,7 @@
 import json
 import queue
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
@@ -29,9 +30,9 @@ class AstroProcessManager(tk.Tk):
 
     BG = "#ffffff"
     PANEL = "#ffffff"
-    BORDER = "#d9dde3"
-    TEXT = "#20242a"
-    MUTED = "#68717d"
+    BORDER = "#d5dde8"
+    TEXT = "#172033"
+    MUTED = "#526070"
     ACCENT = "#2563eb"
     ACCENT_ACTIVE = "#1d4ed8"
     DANGER = "#dc2626"
@@ -57,6 +58,7 @@ class AstroProcessManager(tk.Tk):
 
     def _start_cpu_kernel_warmup(self) -> None:
         """Compile/cache CPU kernels without delaying the UI startup."""
+
         def warm() -> None:
             try:
                 from cpu_kernels import warm_cpu_kernels
@@ -68,6 +70,7 @@ class AstroProcessManager(tk.Tk):
         threading.Thread(target=warm, name="cpu_kernel_warmup", daemon=True).start()
 
         self.after(50, self._drain_log_queue)
+        self.after(500, self._tick_operation_clock)
         self.after(100, self._update_global_master_options)
         self.after(150, self.refresh_flow_reference_preview)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -77,6 +80,12 @@ class AstroProcessManager(tk.Tk):
         self.batch_dir_var = tk.StringVar()
         self.status_var = tk.StringVar(value="Pronto.")
         self.progress_var = tk.DoubleVar(value=0.0)
+        self.progress_detail_var = tk.StringVar(value="Aguardando uma operacao.")
+        self.elapsed_var = tk.StringVar(value="")
+        self.console_autoscroll_var = tk.BooleanVar(value=True)
+        self._operation_started_at = None
+        self._progress_current = 0
+        self._progress_total = 0
 
         # ---------- Calibration ----------
         self.calib_input_var = tk.StringVar()
@@ -110,6 +119,9 @@ class AstroProcessManager(tk.Tk):
         self.flow_min_inliers_var = tk.IntVar(value=4)
         self.flow_min_ratio_var = tk.DoubleVar(value=0.15)
         self.flow_engine_var = tk.StringVar(value="DAO")
+        self.flow_profile_var = tk.StringVar(value="Stable")
+        self.flow_detector_engine_var = tk.StringVar(value="")
+        self.flow_transform_fallback_var = tk.StringVar(value="Disabled")
 
         # ---------- AstroAlign ----------
         self.align_output_dir_var = tk.StringVar()
@@ -122,6 +134,8 @@ class AstroProcessManager(tk.Tk):
         self.align_keep_header_var = tk.BooleanVar(value=True)
         self.align_delete_intermediates_var = tk.BooleanVar(value=False)
         self.align_compress_output_var = tk.BooleanVar(value=True)
+        self.align_profile_var = tk.StringVar(value="Stable")
+        self.align_warp_engine_var = tk.StringVar(value="")
 
         # ---- AstroStack ----
         # ---- Diretórios ----
@@ -155,6 +169,8 @@ class AstroProcessManager(tk.Tk):
         self.stack_output_name_var = tk.StringVar(value="stacked_image.fits")
         self.stack_output_bit_depth_var = tk.StringVar(value="16-bit")
         self.stack_compress_var = tk.BooleanVar(value=True)
+        self.stack_profile_var = tk.StringVar(value="Stable")
+        self.stack_reducer_engine_var = tk.StringVar(value="")
 
         # Registry atualizado
         self.config_registry = {
@@ -193,6 +209,9 @@ class AstroProcessManager(tk.Tk):
                 "min_ratio": self.flow_min_ratio_var,
                 "debug_images": self.flow_debug_var,
                 "engine": self.flow_engine_var,
+                "engine_profile": self.flow_profile_var,
+                "detector_engine": self.flow_detector_engine_var,
+                "transform_fallback": self.flow_transform_fallback_var,
             },
             "AstroAlign": {
                 "output_dir": self.align_output_dir_var,
@@ -205,6 +224,8 @@ class AstroProcessManager(tk.Tk):
                 "keep_header": self.align_keep_header_var,
                 "delete_intermediates": self.align_delete_intermediates_var,
                 "compress_output": self.align_compress_output_var,
+                "engine_profile": self.align_profile_var,
+                "warp_engine": self.align_warp_engine_var,
             },
             "AstroStack": {
                 # ---- Diretórios ----
@@ -229,6 +250,8 @@ class AstroProcessManager(tk.Tk):
                 "output_name": self.stack_output_name_var,
                 "output_bit_depth": self.stack_output_bit_depth_var,
                 "compress_output": self.stack_compress_var,
+                "engine_profile": self.stack_profile_var,
+                "reducer_engine": self.stack_reducer_engine_var,
             },
         }
 
@@ -238,6 +261,13 @@ class AstroProcessManager(tk.Tk):
             style.theme_use("clam")
         except tk.TclError:
             pass
+
+        # Tk's native listbox theme does not always inherit ttk combobox
+        # colors, so set it explicitly as well.
+        self.option_add("*TCombobox*Listbox.background", "#ffffff")
+        self.option_add("*TCombobox*Listbox.foreground", self.TEXT)
+        self.option_add("*TCombobox*Listbox.selectBackground", "#dbeafe")
+        self.option_add("*TCombobox*Listbox.selectForeground", self.TEXT)
 
         style.configure(
             ".", font=("Segoe UI", 10), background=self.BG, foreground=self.TEXT
@@ -276,8 +306,35 @@ class AstroProcessManager(tk.Tk):
             foreground=self.TEXT,
             font=("Segoe UI Semibold", 10),
         )
-        style.configure("TEntry", padding=(8, 6))
-        style.configure("TCombobox", padding=(7, 5))
+        # Explicit field colors prevent platform themes from rendering typed
+        # values with low contrast or inheriting the panel background.
+        style.configure(
+            "TEntry",
+            padding=(8, 6),
+            foreground=self.TEXT,
+            fieldbackground="#ffffff",
+            insertcolor=self.TEXT,
+        )
+        style.map(
+            "TEntry",
+            fieldbackground=[("disabled", "#eef2f7"), ("!disabled", "#ffffff")],
+            foreground=[("disabled", "#7a8798"), ("!disabled", self.TEXT)],
+        )
+        style.configure(
+            "TCombobox",
+            padding=(7, 5),
+            foreground=self.TEXT,
+            fieldbackground="#ffffff",
+            background="#ffffff",
+            arrowcolor=self.TEXT,
+        )
+        style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", "#ffffff"), ("disabled", "#eef2f7")],
+            foreground=[("readonly", self.TEXT), ("disabled", "#7a8798")],
+            selectbackground=[("readonly", "#dbeafe")],
+            selectforeground=[("readonly", self.TEXT)],
+        )
         style.configure("TButton", padding=(12, 7), font=("Segoe UI Semibold", 9))
         style.configure(
             "Accent.TButton", background=self.ACCENT, foreground="white", borderwidth=0
@@ -315,8 +372,23 @@ class AstroProcessManager(tk.Tk):
             borderwidth=0,
             thickness=7,
         )
-        style.configure("TCheckbutton", background=self.PANEL)
-        style.configure("TRadiobutton", background=self.PANEL)
+        style.configure("TCheckbutton", background=self.PANEL, foreground=self.TEXT)
+        style.map(
+            "TCheckbutton",
+            foreground=[("disabled", "#7a8798"), ("!disabled", self.TEXT)],
+        )
+        style.configure("TRadiobutton", background=self.PANEL, foreground=self.TEXT)
+        style.map(
+            "TRadiobutton",
+            foreground=[("disabled", "#7a8798"), ("!disabled", self.TEXT)],
+        )
+        style.configure(
+            "TSpinbox",
+            foreground=self.TEXT,
+            fieldbackground="#ffffff",
+            insertcolor=self.TEXT,
+        )
+        style.configure("TNotebook", tabmargins=(4, 4, 4, 0))
 
     def _create_widgets(self):
         self.columnconfigure(0, weight=1)
@@ -383,25 +455,49 @@ class AstroProcessManager(tk.Tk):
 
         status_line = ttk.Frame(footer)
         status_line.grid(row=0, column=0, sticky="ew")
-        status_line.columnconfigure(1, weight=1)
+        status_line.columnconfigure(0, weight=1)
 
         ttk.Label(
             status_line, textvariable=self.status_var, font=("Segoe UI Semibold", 9)
         ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            status_line, textvariable=self.elapsed_var, style="Muted.TLabel"
+        ).grid(row=0, column=1, sticky="e", padx=(12, 0))
         self.progress_bar = ttk.Progressbar(
             status_line, variable=self.progress_var, maximum=100, mode="determinate"
         )
-        self.progress_bar.grid(row=0, column=1, sticky="ew", padx=(14, 0))
+        self.progress_bar.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(5, 0))
+        ttk.Label(
+            status_line, textvariable=self.progress_detail_var, style="Muted.TLabel"
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(3, 0))
 
         console_frame = ttk.LabelFrame(
-            footer, text="Console", style="Section.TLabelframe", padding=7
+            footer, text="Atividade", style="Section.TLabelframe", padding=7
         )
         console_frame.grid(row=1, column=0, sticky="ew", pady=(8, 0))
         console_frame.columnconfigure(0, weight=1)
 
+        console_toolbar = ttk.Frame(console_frame)
+        console_toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        console_toolbar.columnconfigure(0, weight=1)
+        ttk.Label(
+            console_toolbar,
+            text="Mensagens de processamento, avisos e erros",
+            style="Muted.TLabel",
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(
+            console_toolbar, text="Acompanhar", variable=self.console_autoscroll_var
+        ).grid(row=0, column=1, padx=(8, 0))
+        ttk.Button(console_toolbar, text="Copiar", command=self.copy_console).grid(
+            row=0, column=2, padx=(8, 0)
+        )
+        ttk.Button(console_toolbar, text="Limpar", command=self.clear_console).grid(
+            row=0, column=3, padx=(8, 0)
+        )
+
         self.console_text = scrolledtext.ScrolledText(
             console_frame,
-            height=7,
+            height=9,
             state=tk.DISABLED,
             font=("Cascadia Mono", 9),
             bg="#17191c",
@@ -410,7 +506,11 @@ class AstroProcessManager(tk.Tk):
             relief="flat",
             borderwidth=0,
         )
-        self.console_text.grid(row=0, column=0, sticky="ew")
+        self.console_text.grid(row=1, column=0, sticky="ew")
+        self.console_text.tag_configure("error", foreground="#ff8a8a")
+        self.console_text.tag_configure("warning", foreground="#f7c948")
+        self.console_text.tag_configure("success", foreground="#7ee787")
+        self.console_text.tag_configure("system", foreground="#8ab4f8")
 
     def refresh_flow_reference_preview(self):
         if hasattr(self, "tab_flow"):
@@ -509,42 +609,101 @@ class AstroProcessManager(tk.Tk):
     def print_to_console(self, text: str):
         self.log_queue.put(str(text))
 
+    def clear_console(self):
+        self.console_text.configure(state=tk.NORMAL)
+        self.console_text.delete("1.0", tk.END)
+        self.console_text.configure(state=tk.DISABLED)
+
+    def copy_console(self):
+        content = self.console_text.get("1.0", "end-1c")
+        self.clipboard_clear()
+        self.clipboard_append(content)
+        self.status_var.set("Atividade copiada para a area de transferencia.")
+
+    @staticmethod
+    def _console_tag(text: str) -> str:
+        normalized = text.casefold()
+        if "erro" in normalized or "error" in normalized or "falhou" in normalized:
+            return "error"
+        if "aviso" in normalized or "warning" in normalized or "cancel" in normalized:
+            return "warning"
+        if "conclu" in normalized or "finaliz" in normalized or "sucesso" in normalized:
+            return "success"
+        return "system"
+
     def _drain_log_queue(self):
         try:
             while True:
                 text = self.log_queue.get_nowait()
+                stamped_text = f"[{time.strftime('%H:%M:%S')}] {text}"
                 self.console_text.configure(state=tk.NORMAL)
-                self.console_text.insert(tk.END, text)
+                self.console_text.insert(tk.END, stamped_text, self._console_tag(text))
                 try:
                     lines = int(self.console_text.index("end-1c").split(".")[0])
                     if lines > 5000:
                         self.console_text.delete("1.0", "1000.0")
                 except Exception:
                     pass
-                self.console_text.see(tk.END)
+                if self.console_autoscroll_var.get():
+                    self.console_text.see(tk.END)
                 self.console_text.configure(state=tk.DISABLED)
         except queue.Empty:
             pass
         finally:
             self.after(50, self._drain_log_queue)
 
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        seconds = max(0, round(seconds))
+        minutes, seconds = divmod(seconds, 60)
+        hours, minutes = divmod(minutes, 60)
+        if hours:
+            return f"{hours:d}:{minutes:02d}:{seconds:02d}"
+        return f"{minutes:02d}:{seconds:02d}"
+
+    def _refresh_operation_clock(self):
+        if self._operation_started_at is not None:
+            elapsed = time.monotonic() - self._operation_started_at
+            self.elapsed_var.set(f"Tempo: {self._format_duration(elapsed)}")
+
+    def _tick_operation_clock(self):
+        self._refresh_operation_clock()
+        self.after(500, self._tick_operation_clock)
+
     def update_progress(self, current: int, total: int, phase_text: str = ""):
         def update():
             if total > 0:
-                self.progress_var.set((current / total) * 100.0)
+                safe_current = max(0, min(current, total))
+                value = (safe_current / total) * 100.0
+                self.progress_var.set(value)
+                self._progress_current = safe_current
+                self._progress_total = total
+                detail = f"{safe_current}/{total} itens  |  {value:.0f}%"
+                if safe_current > 0 and self._operation_started_at is not None:
+                    elapsed = time.monotonic() - self._operation_started_at
+                    eta = elapsed * (total - safe_current) / safe_current
+                    detail += f"  |  previsao: {self._format_duration(eta)}"
+                self.progress_detail_var.set(detail)
             else:
                 self.progress_var.set(0.0)
+                self._progress_current = 0
+                self._progress_total = 0
+                self.progress_detail_var.set("Preparando operacao...")
             if phase_text:
                 self.status_var.set(phase_text)
+            self._refresh_operation_clock()
 
         self.after(0, update)
 
     def _lock_ui(self, module_name: str):
         self.save_settings()
-        self.console_text.configure(state=tk.NORMAL)
-        self.console_text.delete("1.0", tk.END)
-        self.console_text.configure(state=tk.DISABLED)
+        self.clear_console()
         self.progress_var.set(0)
+        self.progress_detail_var.set("Preparando operacao...")
+        self._progress_current = 0
+        self._progress_total = 0
+        self._operation_started_at = time.monotonic()
+        self._refresh_operation_clock()
         self.cancel_event.clear()
 
         buttons = [
@@ -552,6 +711,7 @@ class AstroProcessManager(tk.Tk):
             self.btn_run_batch,
             self.btn_run_flow,
             self.btn_run_align,
+            self.btn_run_stack,
         ]
         for button in buttons:
             if hasattr(button, "configure"):
@@ -562,6 +722,7 @@ class AstroProcessManager(tk.Tk):
             self.btn_cancel_batch,
             self.btn_cancel_flow,
             self.btn_cancel_align,
+            self.btn_cancel_stack,
         ]
         for button in cancel_buttons:
             if hasattr(button, "configure"):
@@ -572,6 +733,7 @@ class AstroProcessManager(tk.Tk):
             "Batch": self.btn_cancel_batch,
             "Flow": self.btn_cancel_flow,
             "Align": self.btn_cancel_align,
+            "Stack": self.btn_cancel_stack,
         }
 
         if module_name in cancel_map and hasattr(cancel_map[module_name], "configure"):
@@ -584,6 +746,7 @@ class AstroProcessManager(tk.Tk):
             self.btn_run_batch,
             self.btn_run_flow,
             self.btn_run_align,
+            self.btn_run_stack,
         ]
         for button in buttons:
             if hasattr(button, "configure"):
@@ -594,12 +757,28 @@ class AstroProcessManager(tk.Tk):
             self.btn_cancel_batch,
             self.btn_cancel_flow,
             self.btn_cancel_align,
+            self.btn_cancel_stack,
         ]
         for button in cancel_buttons:
             if hasattr(button, "configure"):
                 button.configure(state="disabled")
 
-        self.progress_var.set(100)
+        self._operation_started_at = None
+
+    def _finish_operation(self, outcome: str, status: str):
+        """Finalize an operation without presenting failures as 100% complete."""
+        if outcome == "success":
+            self.progress_var.set(100)
+            self.progress_detail_var.set("Concluido  |  100%")
+        elif outcome == "cancelled":
+            self.progress_detail_var.set(f"Cancelado em {self.progress_var.get():.0f}%")
+        else:
+            self.progress_detail_var.set(
+                f"Interrompido em {self.progress_var.get():.0f}% - consulte Atividade"
+            )
+        self.status_var.set(status)
+        self.print_to_console(f"[GUI] {status}\n")
+        self._unlock_ui()
 
     # --------------------------------------------------------
     # AstroCalibration, AstroBatch, AstroFlow Methods [Abreviação mantida idêntica]
@@ -634,21 +813,20 @@ class AstroProcessManager(tk.Tk):
     def _run_calibration_worker(self, config):
         from calibration_logic import run_calibration_pipeline
 
+        outcome = "failed"
+        status = "Erro no AstroCalibration."
         try:
             run_calibration_pipeline(
                 config, self.print_to_console, self.update_progress, self.cancel_event
             )
-            status = (
-                "Calibration cancelado."
-                if self.cancel_event.is_set()
-                else "AstroCalibration concluído."
-            )
-            self.after(0, lambda: self.status_var.set(status))
+            if self.cancel_event.is_set():
+                outcome, status = "cancelled", "Calibration cancelado."
+            else:
+                outcome, status = "success", "AstroCalibration concluido."
         except Exception as exc:
             self.print_to_console(f"\nERRO FATAL NO ASTROCALIBRATION:\n{exc}\n")
-            self.after(0, lambda: self.status_var.set("Erro no AstroCalibration."))
         finally:
-            self.after(0, self._unlock_ui)
+            self.after(0, lambda: self._finish_operation(outcome, status))
 
     def start_batch_processing(self):
         if self.worker and self.worker.is_alive():
@@ -678,21 +856,26 @@ class AstroProcessManager(tk.Tk):
     def run_batch_logic(self, config):
         from batch_logic import process_fits_logic
 
+        outcome = "failed"
+        status = "Erro no AstroBatch."
         try:
             processed, batches = process_fits_logic(
                 config, self.print_to_console, self.update_progress, self.cancel_event
             )
-            status = (
-                f"Batch cancelado. {processed} processados."
-                if self.cancel_event.is_set()
-                else f"AstroBatch concluído. {processed} processados, {batches} batches."
-            )
-            self.after(0, lambda: self.status_var.set(status))
+            if self.cancel_event.is_set():
+                outcome, status = (
+                    "cancelled",
+                    f"Batch cancelado. {processed} processados.",
+                )
+            else:
+                outcome, status = (
+                    "success",
+                    f"AstroBatch concluido. {processed} processados, {batches} batches.",
+                )
         except Exception as exc:
             self.print_to_console(f"\nERRO FATAL NO ASTROBATCH:\n{exc}\n")
-            self.after(0, lambda: self.status_var.set("Erro no AstroBatch."))
         finally:
-            self.after(0, self._unlock_ui)
+            self.after(0, lambda: self._finish_operation(outcome, status))
 
     def start_flow_processing(self):
         if self.worker and self.worker.is_alive():
@@ -714,6 +897,9 @@ class AstroProcessManager(tk.Tk):
             "min_ratio": self.flow_min_ratio_var.get(),
             "max_stars": 150,
             "engine": self.flow_engine_var.get(),
+            "engine_profile": self.flow_profile_var.get(),
+            "detector_engine": self.flow_detector_engine_var.get(),
+            "transform_fallback": self.flow_transform_fallback_var.get(),
         }
         self.save_settings()
         self._lock_ui("Flow")
@@ -725,6 +911,8 @@ class AstroProcessManager(tk.Tk):
     def run_flow_logic(self, batch_dir, config):
         from astroflow_logic import process_all_flows
 
+        outcome = "failed"
+        status = "Erro no AstroFlow."
         try:
             process_all_flows(
                 batch_dir,
@@ -733,17 +921,14 @@ class AstroProcessManager(tk.Tk):
                 self.update_progress,
                 self.cancel_event,
             )
-            status = (
-                "AstroFlow cancelado."
-                if self.cancel_event.is_set()
-                else "AstroFlow concluído."
-            )
-            self.after(0, lambda: self.status_var.set(status))
+            if self.cancel_event.is_set():
+                outcome, status = "cancelled", "AstroFlow cancelado."
+            else:
+                outcome, status = "success", "AstroFlow concluido."
         except Exception as exc:
             self.print_to_console(f"\nERRO FATAL NO ASTROFLOW:\n{exc}\n")
-            self.after(0, lambda: self.status_var.set("Erro no AstroFlow."))
         finally:
-            self.after(0, self._unlock_ui)
+            self.after(0, lambda: self._finish_operation(outcome, status))
 
     # ========================================================
     # Align (Agora recebe parâmetros de Debayer)
@@ -771,6 +956,8 @@ class AstroProcessManager(tk.Tk):
                 "keep_header": self.align_keep_header_var.get(),
                 "delete_intermediates": self.align_delete_intermediates_var.get(),
                 "compress_output": self.align_compress_output_var.get(),
+                "engine_profile": self.align_profile_var.get(),
+                "warp_engine": self.align_warp_engine_var.get(),
             }
 
         except Exception as exc:
@@ -789,6 +976,8 @@ class AstroProcessManager(tk.Tk):
     def run_align_logic(self, base_dir, output_dir, config_dict):
         from astroalign_logic import process_all_alignments
 
+        outcome = "failed"
+        status = "Erro no AstroAlign."
         try:
             process_all_alignments(
                 base_dir,
@@ -804,13 +993,13 @@ class AstroProcessManager(tk.Tk):
                 if self.cancel_event.is_set()
                 else "AstroAlign concluído."
             )
-            self.after(0, lambda: self.status_var.set(status))
+            outcome = "cancelled" if self.cancel_event.is_set() else "success"
 
         except Exception as exc:
             self.print_to_console(f"\nERRO FATAL NO ASTROALIGN:\n{exc}\n")
             self.after(0, lambda: self.status_var.set("Erro no AstroAlign."))
         finally:
-            self.after(0, self._unlock_ui)
+            self.after(0, lambda: self._finish_operation(outcome, status))
 
     # Método para iniciar stacking:
 
@@ -873,6 +1062,8 @@ class AstroProcessManager(tk.Tk):
             "output_bit_depth": self.stack_output_bit_depth_var.get(),
             "compress_output": self.stack_compress_var.get(),
             "apply_dither_correction": self.stack_dither_correction_var.get(),
+            "engine_profile": self.stack_profile_var.get(),
+            "reducer_engine": self.stack_reducer_engine_var.get(),
         }
 
         self._lock_ui("Stack")
@@ -884,6 +1075,8 @@ class AstroProcessManager(tk.Tk):
     def run_stacking_logic(self, input_dir, config):
         from stacking_logic import process_all_stacking
 
+        outcome = "failed"
+        status = "Erro no AstroStack."
         try:
             # O stacking_logic agora recebe o input_dir diretamente
             result = process_all_stacking(
@@ -895,6 +1088,10 @@ class AstroProcessManager(tk.Tk):
             )
 
             if result and result.get("status") == "success":
+                outcome = "success"
+                status = (
+                    f"AstroStack concluido. {result['n_frames']} frames combinados."
+                )
                 self.after(
                     0,
                     lambda: self.status_var.set(
@@ -904,6 +1101,12 @@ class AstroProcessManager(tk.Tk):
                 self.print_to_console("\n✅ Stacking concluído!\n")
                 self.print_to_console(f"📁 Imagem salva em: {result['output_path']}\n")
             else:
+                outcome = "cancelled" if self.cancel_event.is_set() else "failed"
+                status = (
+                    "AstroStack cancelado."
+                    if self.cancel_event.is_set()
+                    else "AstroStack falhou - consulte Atividade."
+                )
                 reason = (
                     result.get("reason", "erro desconhecido")
                     if result
@@ -919,7 +1122,7 @@ class AstroProcessManager(tk.Tk):
             self.print_to_console(traceback.format_exc())
             self.after(0, lambda: self.status_var.set("Erro no AstroStack."))
         finally:
-            self.after(0, self._unlock_ui)
+            self.after(0, lambda: self._finish_operation(outcome, status))
 
     # --------------------------------------------------------
     # Funções de GUI Auxiliares (Preview, Chart, Combo Global Master)
@@ -962,6 +1165,8 @@ class AstroProcessManager(tk.Tk):
             "sigma": self.flow_sigma_var.get(),
             "max_stars": 250,
             "engine": self.flow_engine_var.get(),
+            "engine_profile": self.flow_profile_var.get(),
+            "detector_engine": self.flow_detector_engine_var.get(),
         }
 
         try:

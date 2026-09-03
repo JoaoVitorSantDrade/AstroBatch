@@ -360,6 +360,18 @@ class StackingView(BaseAstroView):
         # ============================================================
         # 8. Ações
         # ============================================================
+        ttk.Label(output_frame, text="Perfil de engine:").grid(
+            row=3, column=0, sticky="w", pady=(8, 0)
+        )
+        ttk.Combobox(
+            output_frame, textvariable=self.app.stack_profile_var,
+            values=["Stable", "Fast"], state="readonly", width=14,
+        ).grid(row=3, column=1, sticky="w", padx=8, pady=(8, 0))
+        ttk.Combobox(
+            output_frame, textvariable=self.app.stack_reducer_engine_var,
+            values=["", "stable-numpy", "fast-numba"], state="readonly", width=16,
+        ).grid(row=3, column=2, sticky="w", padx=(8, 0), pady=(8, 0))
+
         actions = ttk.Frame(inner)
         actions.grid(row=7, column=0, sticky="ew", pady=(0, 10))
         actions.columnconfigure(0, weight=1)

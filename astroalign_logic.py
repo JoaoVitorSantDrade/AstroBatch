@@ -14,6 +14,9 @@ from astropy.io import fits
 from astropy.utils.exceptions import AstropyWarning
 from skimage.transform import AffineTransform, warp
 
+from app.engines import EngineProfile, registry
+from app.engines.align import register_align_engines
+
 # Suprime todos os avisos de verificação de cabeçalho do Astropy
 warnings.simplefilter("ignore", category=AstropyWarning)
 
@@ -69,6 +72,8 @@ class AlignConfig:
     keep_header: bool
     delete_intermediates: bool
     compress_output: bool
+    engine_profile: str = "Stable"
+    warp_engine: str | None = None
 
 
 def _build_align_config(
@@ -88,6 +93,8 @@ def _build_align_config(
         keep_header=bool(config_dict.get("keep_header", True)),
         delete_intermediates=bool(config_dict.get("delete_intermediates", False)),
         compress_output=bool(config_dict.get("compress_output", True)),
+        engine_profile=str(config_dict.get("engine_profile", "Stable")),
+        warp_engine=config_dict.get("warp_engine") or None,
     )
 
 
@@ -330,6 +337,8 @@ def _warp_affine_cpu(
     data: np.ndarray,
     matrix: np.ndarray,
     interpolation_mode: str,
+    engine_profile: str = "Stable",
+    warp_engine: str | None = None,
 ) -> np.ndarray:
     """Apply one affine transform to a mono or interleaved RGB image.
 
@@ -338,19 +347,13 @@ def _warp_affine_cpu(
     matrix maps source coordinates to output coordinates, matching
     ``warp(..., tform.inverse)`` used previously.
     """
-    height, width = data.shape[:2]
-    interpolation = CV2_INTERPOLATION_MODES.get(interpolation_mode)
-    if interpolation is None:
-        raise ValueError(f"No native affine path for {interpolation_mode!r}")
-    warped = cv2.warpAffine(
-        np.asarray(data, dtype=np.float32),
-        np.asarray(matrix[:2, :], dtype=np.float64),
-        (width, height),
-        flags=interpolation,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=0.0,
+    register_align_engines()
+    profile = EngineProfile.coerce(engine_profile)
+    engine_id = warp_engine or (
+        "opencv-fast" if profile is EngineProfile.FAST else "opencv-stable"
     )
-    return np.asarray(warped, dtype=np.float32)
+    engine = registry.resolve("align.warp", engine_id, profile)
+    return engine(data, matrix, interpolation_mode)
 
 
 def warp_frame(
@@ -358,6 +361,8 @@ def warp_frame(
     final_matrix: np.ndarray,
     interpolation_mode: str,
     rgb_registration: bool = False,
+    engine_profile: str = "Stable",
+    warp_engine: str | None = None,
 ) -> np.ndarray:
     """
     Aplica a transformação afim global e, opcionalmente, executa
@@ -374,12 +379,17 @@ def warp_frame(
         "lanczos": 3,
     }
     order = order_map.get(interpolation_mode, 3)
-    has_native_path = interpolation_mode in CV2_INTERPOLATION_MODES
+    profile = EngineProfile.coerce(engine_profile)
+    has_native_path = (
+        interpolation_mode in CV2_INTERPOLATION_MODES or profile is EngineProfile.FAST
+    )
 
     if data.ndim == 3:
         if has_native_path:
             # OpenCV handles interleaved channels in one native call.
-            output = _warp_affine_cpu(data, final_matrix, interpolation_mode)
+            output = _warp_affine_cpu(
+                data, final_matrix, interpolation_mode, engine_profile, warp_engine
+            )
         else:
             # OpenCV's cubic kernel is not numerically compatible with the
             # prior skimage order=3 kernel, so retain it for these modes.
@@ -396,6 +406,17 @@ def warp_frame(
 
         # 2. Nível 1: Micro-Registro RGB pós-warp
         if rgb_registration and data.shape[2] >= 3:
+            if profile is EngineProfile.FAST:
+                reference = output[:, :, 1]
+                height, width = reference.shape
+                for channel in (0, 2):
+                    shift, _ = cv2.phaseCorrelate(reference, output[:, :, channel])
+                    matrix = np.array([[1.0, 0.0, shift[0]], [0.0, 1.0, shift[1]]])
+                    output[:, :, channel] = cv2.warpAffine(
+                        output[:, :, channel], matrix, (width, height),
+                        flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0.0,
+                    )
+                return np.asarray(output, dtype=np.float32)
             from skimage.registration import phase_cross_correlation
 
             # O Canal Verde (índice 1) é nossa referência fixa e opticamente mais nítida
@@ -428,7 +449,9 @@ def warp_frame(
         return output
     else:
         if has_native_path:
-            return _warp_affine_cpu(data, final_matrix, interpolation_mode)
+            return _warp_affine_cpu(
+                data, final_matrix, interpolation_mode, engine_profile, warp_engine
+            )
         return warp(
             data,
             tform.inverse,
@@ -656,6 +679,8 @@ def _process_single_alignment(
             final_matrix,
             interpolation_mode,
             rgb_registration=config.rgb_registration,
+            engine_profile=config.engine_profile,
+            warp_engine=config.warp_engine,
         )
 
         # ----------------------------------------------------
@@ -995,6 +1020,82 @@ def process_all_alignments(
 
     total_processed = 0
     total_failed = 0
+
+    # V2 scheduler: flatten accepted frames from every batch into one bounded
+    # executor. This avoids leaving CPU idle when individual batches are small
+    # and prevents the old nested batch/frame thread pools.
+    tasks: list[tuple[Path, str, dict, np.ndarray, Path, str]] = []
+    task_counts: dict[Path, int] = {}
+    batch_failures: dict[Path, int] = {}
+    for batch_folder in batches_with_flow:
+        local_flow = load_local_flow(batch_folder) or {}
+        batch_entry = global_flow.get("batches", {}).get(batch_folder.name, {})
+        global_matrix = batch_entry.get("matrix")
+        if global_matrix is None:
+            continue
+        valid_frames = {
+            fname: finfo
+            for fname, finfo in local_flow.get("frames", {}).items()
+            if finfo.get("status", "accepted") == "accepted" and finfo.get("matrix") is not None
+        }
+        output_dir = align_config.output_dir / batch_folder.name
+        interpolation_mode = INTERPOLATION_MODES.get(align_config.interpolation, "lanczos")
+        task_counts[batch_folder] = len(valid_frames)
+        batch_failures[batch_folder] = 0
+        for fname, finfo in valid_frames.items():
+            tasks.append((batch_folder, fname, finfo, global_matrix, output_dir, interpolation_mode))
+
+    if len(tasks) != total_frames:
+        total_frames = len(tasks)
+        progress_state["total"] = total_frames
+    if not tasks:
+        app_print("Nenhum frame valido para alinhamento.\n")
+        return (0, 0)
+
+    with ThreadPoolExecutor(
+        max_workers=get_optimal_worker_count(), thread_name_prefix="astroalign-v2"
+    ) as executor:
+        futures = {
+            executor.submit(
+                _process_single_alignment, fname, finfo, batch_folder, output_dir,
+                global_matrix, interpolation_mode, align_config,
+            ): batch_folder
+            for batch_folder, fname, finfo, global_matrix, output_dir, interpolation_mode in tasks
+        }
+        for future in as_completed(futures):
+            if cancel_event.is_set():
+                for pending in futures:
+                    pending.cancel()
+                break
+            batch_folder = futures[future]
+            try:
+                frame_name, error = future.result()
+            except Exception as exc:
+                frame_name, error = "unknown", f"Erro inesperado: {exc}"
+            progress_state["done"] += 1
+            if error:
+                batch_failures[batch_folder] += 1
+                total_failed += 1
+                app_print(f"  [{frame_name}] {error}\n")
+            else:
+                total_processed += 1
+            done = progress_state["done"]
+            if done % 10 == 0 or done == progress_state["total"]:
+                app_progress(done, progress_state["total"], f"Alinhando frames ({done}/{progress_state['total']})...")
+
+    if align_config.delete_intermediates and not align_config.dry_run and not cancel_event.is_set():
+        for batch_folder, failed in batch_failures.items():
+            if failed == 0:
+                try:
+                    shutil.rmtree(batch_folder)
+                    app_print(f"[{batch_folder.name}] Batch original limpo com sucesso.\n")
+                except Exception as exc:
+                    app_print(f"[{batch_folder.name}] Erro ao apagar intermediarios: {exc}\n")
+
+    if not cancel_event.is_set():
+        app_progress(total_frames, total_frames, "Concluido.")
+    app_print(f"\n>>> AstroAlign Finalizado! {total_processed} frames alinhados, {total_failed} falhas. <<<\n")
+    return (total_processed, total_failed)
 
     # --------------------------------------------------------
     # Processamento das Batches
