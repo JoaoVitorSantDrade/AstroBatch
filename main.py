@@ -15,6 +15,11 @@ import numpy as np
 # Imports da lógica de processamento
 # ============================================================
 from batch_logic import ProcessingConfig
+from app.application.runner import PipelineRunner
+from app.application.log_buffer import ActivityBuffer
+from app.application.commands import ResourceSettings
+from app.application.pipelines import execute_pipeline
+from app.infrastructure.json_store import SettingsRepository
 from views.align_view import AlignView
 from views.batch_view import BatchView
 
@@ -22,11 +27,16 @@ from views.batch_view import BatchView
 from views.calibration_view import CalibrationView
 from views.flow_view import FlowView
 from views.stacking_view import StackingView
+from views.hdr_view import HDRView
+from views.hdr_model import HDRViewModel
+from views.scrollable_host import ScrollableHost
 
 
 class AstroProcessManager(tk.Tk):
     APP_NAME = "Astro Process Manager"
     CONFIG_FILE = Path("astro_config.json")
+    PIPELINE_BUTTONS = (("Calibration", "calib"), ("Batch", "batch"), ("Flow", "flow"),
+                        ("Align", "align"), ("Stack", "stack"), ("HDR", "hdr"))
 
     BG = "#ffffff"
     PANEL = "#ffffff"
@@ -42,12 +52,14 @@ class AstroProcessManager(tk.Tk):
 
         self.title(self.APP_NAME)
         self.geometry("1120x900")
-        self.minsize(940, 1020)
+        self.minsize(940, 700)
         self.configure(bg=self.BG)
 
-        self.log_queue = queue.Queue()
+        self.log_queue = ActivityBuffer()
         self.worker = None
-        self.cancel_event = threading.Event()
+        self.runner = PipelineRunner(self.print_to_console)
+        self.cancel_event = self.runner.cancel_event
+        self._closing = False
         self.custom_anchors = {}
 
         self._init_variables()
@@ -70,6 +82,7 @@ class AstroProcessManager(tk.Tk):
         threading.Thread(target=warm, name="cpu_kernel_warmup", daemon=True).start()
 
         self.after(50, self._drain_log_queue)
+        self.after(50, self._drain_operation_events)
         self.after(500, self._tick_operation_clock)
         self.after(100, self._update_global_master_options)
         self.after(150, self.refresh_flow_reference_preview)
@@ -96,6 +109,9 @@ class AstroProcessManager(tk.Tk):
         self.flat_path_var = tk.StringVar()
         self.calib_create_master_var = tk.BooleanVar(value=True)
         self.calib_overwrite_var = tk.BooleanVar(value=False)
+        self.hdr_input_var = tk.StringVar(); self.hdr_output_var = tk.StringVar()
+        self.hdr_saturation_var = tk.StringVar(); self.hdr_noise_var = tk.DoubleVar(value=1.0)
+        self.hdr_rowband_var = tk.IntVar(value=256); self.hdr_exptime_var = tk.StringVar()
 
         # ---------- AstroBatch ----------
         self.batch_input_dir_var = tk.StringVar()
@@ -136,6 +152,10 @@ class AstroProcessManager(tk.Tk):
         self.align_compress_output_var = tk.BooleanVar(value=True)
         self.align_profile_var = tk.StringVar(value="Stable")
         self.align_warp_engine_var = tk.StringVar(value="")
+        self.resource_memory_var = tk.IntVar(value=512)
+        self.resource_workers_var = tk.IntVar(value=2)
+        self.align_quality_gate_var = tk.BooleanVar(value=False)
+        self.align_quality_shift_var = tk.DoubleVar(value=1.5)
 
         # ---- AstroStack ----
         # ---- Diretórios ----
@@ -147,6 +167,9 @@ class AstroProcessManager(tk.Tk):
         self.stack_selection_percentage_var = tk.DoubleVar(value=80.0)
         self.stack_selection_percentage_text_var = tk.StringVar(value="80%")
         self.stack_selection_metric_var = tk.StringVar(value="quality")
+        self.stack_trail_filter_var = tk.BooleanVar(value=False)
+        self.stack_min_roundness_var = tk.DoubleVar(value=0.65)
+        self.stack_min_shape_stars_var = tk.IntVar(value=5)
 
         # ---- Combinação ----
         self.stack_method_var = tk.StringVar(value="Median")
@@ -235,6 +258,9 @@ class AstroProcessManager(tk.Tk):
                 "selection_mode": self.stack_selection_mode_var,
                 "selection_percentage": self.stack_selection_percentage_var,
                 "selection_metric": self.stack_selection_metric_var,
+                "trail_filter_enabled": self.stack_trail_filter_var,
+                "min_roundness": self.stack_min_roundness_var,
+                "min_shape_stars": self.stack_min_shape_stars_var,
                 # ---- Combinação ----
                 "method": self.stack_method_var,
                 # ---- Rejeição de Outliers ----
@@ -253,6 +279,9 @@ class AstroProcessManager(tk.Tk):
                 "engine_profile": self.stack_profile_var,
                 "reducer_engine": self.stack_reducer_engine_var,
             },
+            "Resources": {"memory_mb": self.resource_memory_var, "workers": self.resource_workers_var},
+            "AlignQuality": {"enabled": self.align_quality_gate_var, "max_shift": self.align_quality_shift_var},
+            "AstroHDR": {"input_dir": self.hdr_input_var, "output_path": self.hdr_output_var, "saturation": self.hdr_saturation_var, "noise_floor": self.hdr_noise_var, "row_band": self.hdr_rowband_var, "exptime_override": self.hdr_exptime_var},
         }
 
     def _configure_style(self):
@@ -403,7 +432,7 @@ class AstroProcessManager(tk.Tk):
         )
         ttk.Label(
             header,
-            text="Calibração  →  Batch  →  Flow  →  Align + Debayer",
+            text="Calibração  →  Batch  →  Flow  →  Align + Debayer  →  Stack / HDR",
             style="Subtitle.TLabel",
         ).grid(row=1, column=0, sticky="w", pady=(2, 0))
 
@@ -426,6 +455,13 @@ class AstroProcessManager(tk.Tk):
             command=lambda: self.browse_dir(self.batch_dir_var),
         ).grid(row=0, column=2)
 
+        resources = ttk.Frame(global_frame)
+        resources.grid(row=1, column=0, columnspan=3, sticky="w", pady=(8,0))
+        ttk.Label(resources, text="Flow / Align: workers máx.").pack(side="left")
+        ttk.Entry(resources, textvariable=self.resource_workers_var, width=6).pack(side="left", padx=8)
+        ttk.Label(resources, text="RAM estimada (MiB)").pack(side="left")
+        ttk.Entry(resources, textvariable=self.resource_memory_var, width=9).pack(side="left", padx=8)
+
         notebook_container = ttk.Frame(self)
         notebook_container.grid(row=2, column=0, sticky="nsew", padx=22, pady=(0, 10))
         notebook_container.columnconfigure(0, weight=1)
@@ -434,17 +470,34 @@ class AstroProcessManager(tk.Tk):
         self.notebook = ttk.Notebook(notebook_container)
         self.notebook.grid(row=0, column=0, sticky="nsew")
 
-        self.tab_calib = CalibrationView(self.notebook, app=self)
-        self.tab_batch = BatchView(self.notebook, app=self)
-        self.tab_flow = FlowView(self.notebook, app=self)
-        self.tab_align = AlignView(self.notebook, app=self)
+        self._tab_hosts = {}
+        for key, label, view_type in (("calib", "1  Calibration", CalibrationView),
+                                     ("batch", "2  Batch", BatchView),
+                                     ("flow", "3  Flow", FlowView),
+                                     ("align", "4  Align", AlignView)):
+            host = ScrollableHost(self.notebook)
+            view = view_type(host.canvas, app=self)
+            host.mount(view)
+            setattr(self, f"tab_{key}", view)
+            self._tab_hosts[key] = host
+            self.notebook.add(host, text=label)
+        # Stack already owns a scroll canvas, so it needs no second wrapper.
         self.tab_stack = StackingView(self.notebook, app=self)
-
-        self.notebook.add(self.tab_calib, text="1  Calibration")
-        self.notebook.add(self.tab_batch, text="2  Batch")
-        self.notebook.add(self.tab_flow, text="3  Flow")
-        self.notebook.add(self.tab_align, text="4  Align")
         self.notebook.add(self.tab_stack, text="5  Stack")
+        hdr_model = HDRViewModel(
+            self.hdr_input_var, self.hdr_output_var, self.hdr_saturation_var,
+            self.hdr_noise_var, self.hdr_rowband_var, self.hdr_exptime_var,
+            lambda: self.browse_dir(self.hdr_input_var),
+            lambda: self.browse_save_file(self.hdr_output_var),
+            self.use_align_output_for_hdr, self.start_hdr, self.cancel_processing)
+        hdr_host = ScrollableHost(self.notebook)
+        self.tab_hdr = HDRView(hdr_host.canvas, hdr_model)
+        hdr_host.mount(self.tab_hdr)
+        self._tab_hosts["hdr"] = hdr_host
+        self.btn_run_hdr = self.tab_hdr.run_button
+        self.btn_cancel_hdr = self.tab_hdr.cancel_button
+
+        self.notebook.add(hdr_host, text="6  HDR")
 
         self._build_footer()
 
@@ -542,6 +595,24 @@ class AstroProcessManager(tk.Tk):
             return
         self.browse_file(var)
 
+    def browse_save_file(self, variable):
+        path = filedialog.asksaveasfilename(parent=self, defaultextension=".fits",
+                                          filetypes=[("FITS", "*.fits *.fit *.fts")])
+        if path:
+            variable.set(path)
+            self.save_settings()
+
+    def use_align_output_for_hdr(self):
+        path = self.align_output_dir_var.get().strip()
+        if not path:
+            self.status_var.set("Defina a saída do Align antes de enviá-la ao HDR.")
+            return False
+        self.hdr_input_var.set(path)
+        self.notebook.select(self._tab_hosts["hdr"])
+        self.save_settings()
+        self.status_var.set("HDR: pasta do Align selecionada. Escolha o arquivo de saída.")
+        return True
+
     def load_settings(self):
         if not self.CONFIG_FILE.exists():
             return
@@ -551,6 +622,8 @@ class AstroProcessManager(tk.Tk):
 
             for module, variables in self.config_registry.items():
                 module_data = data.get(module, {})
+                if not isinstance(module_data, dict):
+                    continue
                 for key, variable in variables.items():
                     if key in module_data:
                         try:
@@ -632,12 +705,19 @@ class AstroProcessManager(tk.Tk):
         return "system"
 
     def _drain_log_queue(self):
+        # Yield to input/painting even when workers continuously produce logs.
+        insert_args = []
         try:
-            while True:
+            for _ in range(200):
                 text = self.log_queue.get_nowait()
                 stamped_text = f"[{time.strftime('%H:%M:%S')}] {text}"
+                insert_args.extend((stamped_text, self._console_tag(text)))
+        except queue.Empty:
+            pass
+        try:
+            if insert_args:
                 self.console_text.configure(state=tk.NORMAL)
-                self.console_text.insert(tk.END, stamped_text, self._console_tag(text))
+                self.console_text.insert(tk.END, *insert_args)
                 try:
                     lines = int(self.console_text.index("end-1c").split(".")[0])
                     if lines > 5000:
@@ -646,10 +726,9 @@ class AstroProcessManager(tk.Tk):
                     pass
                 if self.console_autoscroll_var.get():
                     self.console_text.see(tk.END)
-                self.console_text.configure(state=tk.DISABLED)
-        except queue.Empty:
-            pass
         finally:
+            if insert_args:
+                self.console_text.configure(state=tk.DISABLED)
             self.after(50, self._drain_log_queue)
 
     @staticmethod
@@ -674,7 +753,7 @@ class AstroProcessManager(tk.Tk):
         def update():
             if total > 0:
                 safe_current = max(0, min(current, total))
-                value = (safe_current / total) * 100.0
+                value = min(99.0, (safe_current / total) * 100.0)
                 self.progress_var.set(value)
                 self._progress_current = safe_current
                 self._progress_total = total
@@ -695,6 +774,13 @@ class AstroProcessManager(tk.Tk):
 
         self.after(0, update)
 
+    def _operation_buttons(self):
+        return [(stage, getattr(self, f"btn_run_{suffix}"), getattr(self, f"btn_cancel_{suffix}"))
+                for stage, suffix in self.PIPELINE_BUTTONS]
+
+    def _resource_settings(self):
+        return ResourceSettings.from_values(self.resource_workers_var.get(), self.resource_memory_var.get())
+
     def _lock_ui(self, module_name: str):
         self.save_settings()
         self.clear_console()
@@ -706,64 +792,51 @@ class AstroProcessManager(tk.Tk):
         self._refresh_operation_clock()
         self.cancel_event.clear()
 
-        buttons = [
-            self.btn_run_calib,
-            self.btn_run_batch,
-            self.btn_run_flow,
-            self.btn_run_align,
-            self.btn_run_stack,
-        ]
-        for button in buttons:
-            if hasattr(button, "configure"):
-                button.configure(state="disabled")
-
-        cancel_buttons = [
-            self.btn_cancel_calib,
-            self.btn_cancel_batch,
-            self.btn_cancel_flow,
-            self.btn_cancel_align,
-            self.btn_cancel_stack,
-        ]
-        for button in cancel_buttons:
-            if hasattr(button, "configure"):
-                button.configure(state="disabled")
-
-        cancel_map = {
-            "Calibration": self.btn_cancel_calib,
-            "Batch": self.btn_cancel_batch,
-            "Flow": self.btn_cancel_flow,
-            "Align": self.btn_cancel_align,
-            "Stack": self.btn_cancel_stack,
-        }
-
-        if module_name in cancel_map and hasattr(cancel_map[module_name], "configure"):
-            cancel_map[module_name].configure(state="normal")
+        for stage, run_button, cancel_button in self._operation_buttons():
+            run_button.configure(state="disabled")
+            cancel_button.configure(state="normal" if stage == module_name else "disabled")
         self.status_var.set(f"Processando Astro{module_name}...")
 
     def _unlock_ui(self):
-        buttons = [
-            self.btn_run_calib,
-            self.btn_run_batch,
-            self.btn_run_flow,
-            self.btn_run_align,
-            self.btn_run_stack,
-        ]
-        for button in buttons:
-            if hasattr(button, "configure"):
-                button.configure(state="normal")
-
-        cancel_buttons = [
-            self.btn_cancel_calib,
-            self.btn_cancel_batch,
-            self.btn_cancel_flow,
-            self.btn_cancel_align,
-            self.btn_cancel_stack,
-        ]
-        for button in cancel_buttons:
-            if hasattr(button, "configure"):
-                button.configure(state="disabled")
+        for _, run_button, cancel_button in self._operation_buttons():
+            run_button.configure(state="normal")
+            cancel_button.configure(state="disabled")
 
         self._operation_started_at = None
+
+
+    def _start_operation(self, stage, *args):
+        if self.runner.busy:
+            return
+        self._lock_ui(stage)
+        try:
+            self.worker = self.runner.start(
+                stage, lambda log, progress, cancel: execute_pipeline(stage, args, log, progress, cancel))
+        except Exception as exc:
+            self._finish_operation("failed", f"{stage}: {exc}")
+
+    def _drain_operation_events(self):
+        if self._closing:
+            return
+        progress, result = self.runner.drain()
+        if progress is not None:
+            self.update_progress(progress.current, progress.total, progress.phase)
+        if result is not None:
+            # Progress rendering is scheduled before completion on the Tk queue.
+            self.after(0, lambda result=result: self._finish_operation(result.outcome, result.message))
+        self.after(50, self._drain_operation_events)
+
+    def _run_legacy_stage(self, stage, *args):
+        """Synchronous bridge retained for callers migrating to the runner."""
+        try:
+            result = execute_pipeline(stage, args, self.print_to_console,
+                                      getattr(self, "update_progress", lambda *a: None),
+                                      getattr(self, "cancel_event", threading.Event()))
+            outcome, message = result.outcome, result.message
+        except Exception as exc:
+            self.print_to_console(f"[{stage}] {exc}\n")
+            outcome, message = "failed", f"{stage}: {exc}"
+        self.after(0, lambda: self._finish_operation(outcome, message))
 
     def _finish_operation(self, outcome: str, status: str):
         """Finalize an operation without presenting failures as 100% complete."""
@@ -804,29 +877,11 @@ class AstroProcessManager(tk.Tk):
         except Exception as exc:
             messagebox.showerror("Parâmetros inválidos", str(exc), parent=self)
             return
-        self._lock_ui("Calibration")
-        self.worker = threading.Thread(
-            target=self._run_calibration_worker, args=(config,), daemon=True
-        )
-        self.worker.start()
+        self._start_operation("Calibration", config)
 
     def _run_calibration_worker(self, config):
-        from calibration_logic import run_calibration_pipeline
-
-        outcome = "failed"
-        status = "Erro no AstroCalibration."
-        try:
-            run_calibration_pipeline(
-                config, self.print_to_console, self.update_progress, self.cancel_event
-            )
-            if self.cancel_event.is_set():
-                outcome, status = "cancelled", "Calibration cancelado."
-            else:
-                outcome, status = "success", "AstroCalibration concluido."
-        except Exception as exc:
-            self.print_to_console(f"\nERRO FATAL NO ASTROCALIBRATION:\n{exc}\n")
-        finally:
-            self.after(0, lambda: self._finish_operation(outcome, status))
+        """Compatibility entry point; UI launches use PipelineRunner."""
+        AstroProcessManager._run_legacy_stage(self, "Calibration", config)
 
     def start_batch_processing(self):
         if self.worker and self.worker.is_alive():
@@ -847,35 +902,11 @@ class AstroProcessManager(tk.Tk):
         except Exception as exc:
             messagebox.showerror("Parâmetros inválidos", str(exc), parent=self)
             return
-        self._lock_ui("Batch")
-        self.worker = threading.Thread(
-            target=self.run_batch_logic, args=(config,), daemon=True
-        )
-        self.worker.start()
+        self._start_operation("Batch", config)
 
     def run_batch_logic(self, config):
-        from batch_logic import process_fits_logic
-
-        outcome = "failed"
-        status = "Erro no AstroBatch."
-        try:
-            processed, batches = process_fits_logic(
-                config, self.print_to_console, self.update_progress, self.cancel_event
-            )
-            if self.cancel_event.is_set():
-                outcome, status = (
-                    "cancelled",
-                    f"Batch cancelado. {processed} processados.",
-                )
-            else:
-                outcome, status = (
-                    "success",
-                    f"AstroBatch concluido. {processed} processados, {batches} batches.",
-                )
-        except Exception as exc:
-            self.print_to_console(f"\nERRO FATAL NO ASTROBATCH:\n{exc}\n")
-        finally:
-            self.after(0, lambda: self._finish_operation(outcome, status))
+        """Compatibility entry point; UI launches use PipelineRunner."""
+        AstroProcessManager._run_legacy_stage(self, "Batch", config)
 
     def start_flow_processing(self):
         if self.worker and self.worker.is_alive():
@@ -884,60 +915,46 @@ class AstroProcessManager(tk.Tk):
         if not batch_dir.is_dir():
             messagebox.showerror("Erro", "Pasta Base não encontrada.", parent=self)
             return
-        config = {
-            "custom_anchors": dict(self.custom_anchors),
-            "global_master": self.flow_global_master_var.get(),
-            "fwhm": self.flow_fwhm_var.get(),
-            "sigma": self.flow_sigma_var.get(),
-            "matching_radius": self.flow_matching_radius_var.get(),
-            "ransac": self.flow_ransac_var.get(),
-            "debug_images": self.flow_debug_var.get(),
-            "min_stars": self.flow_min_stars_var.get(),
-            "min_inliers": self.flow_min_inliers_var.get(),
-            "min_ratio": self.flow_min_ratio_var.get(),
-            "max_stars": 150,
-            "engine": self.flow_engine_var.get(),
-            "engine_profile": self.flow_profile_var.get(),
-            "detector_engine": self.flow_detector_engine_var.get(),
-            "transform_fallback": self.flow_transform_fallback_var.get(),
-        }
+        try:
+            self._resource_settings()
+            config = {
+                "custom_anchors": dict(self.custom_anchors),
+                "global_master": self.flow_global_master_var.get(),
+                "fwhm": self.flow_fwhm_var.get(),
+                "sigma": self.flow_sigma_var.get(),
+                "matching_radius": self.flow_matching_radius_var.get(),
+                "ransac": self.flow_ransac_var.get(),
+                "debug_images": self.flow_debug_var.get(),
+                "min_stars": self.flow_min_stars_var.get(),
+                "min_inliers": self.flow_min_inliers_var.get(),
+                "min_ratio": self.flow_min_ratio_var.get(),
+                "max_stars": 150,
+                "engine": self.flow_engine_var.get(),
+                "engine_profile": self.flow_profile_var.get(),
+                "detector_engine": self.flow_detector_engine_var.get(),
+                "transform_fallback": self.flow_transform_fallback_var.get(),
+                "memory_budget_mb": self.resource_memory_var.get(),
+                "flow_workers": self.resource_workers_var.get(),
+            }
+        except (tk.TclError, TypeError, ValueError) as exc:
+            messagebox.showerror("Parâmetros inválidos", str(exc), parent=self)
+            return
         self.save_settings()
-        self._lock_ui("Flow")
-        self.worker = threading.Thread(
-            target=self.run_flow_logic, args=(batch_dir, config), daemon=True
-        )
-        self.worker.start()
+        self._start_operation("Flow", batch_dir, config)
 
     def run_flow_logic(self, batch_dir, config):
-        from astroflow_logic import process_all_flows
+        """Compatibility entry point; UI launches use PipelineRunner."""
+        AstroProcessManager._run_legacy_stage(self, "Flow", batch_dir, config)
 
-        outcome = "failed"
-        status = "Erro no AstroFlow."
-        try:
-            process_all_flows(
-                batch_dir,
-                config,
-                self.print_to_console,
-                self.update_progress,
-                self.cancel_event,
-            )
-            if self.cancel_event.is_set():
-                outcome, status = "cancelled", "AstroFlow cancelado."
-            else:
-                outcome, status = "success", "AstroFlow concluido."
-        except Exception as exc:
-            self.print_to_console(f"\nERRO FATAL NO ASTROFLOW:\n{exc}\n")
-        finally:
-            self.after(0, lambda: self._finish_operation(outcome, status))
-
-    # ========================================================
-    # Align (Agora recebe parâmetros de Debayer)
-    # ========================================================
     def start_align_processing(self):
         if self.worker and self.worker.is_alive():
             return
 
         try:
+            self._resource_settings()
+            shift = float(self.align_quality_shift_var.get())
+            if not np.isfinite(shift) or shift < 0:
+                raise ValueError("Desvio residual deve ser finito e não negativo.")
             base_dir = Path(self.batch_dir_var.get()).expanduser().resolve()
             output_dir = Path(self.align_output_dir_var.get()).expanduser().resolve()
 
@@ -958,53 +975,84 @@ class AstroProcessManager(tk.Tk):
                 "compress_output": self.align_compress_output_var.get(),
                 "engine_profile": self.align_profile_var.get(),
                 "warp_engine": self.align_warp_engine_var.get(),
+                "memory_budget_mb": self.resource_memory_var.get(),
+                "workers": self.resource_workers_var.get(),
+                "quality_gate": self.align_quality_gate_var.get(),
+                "quality_max_shift": self.align_quality_shift_var.get(),
             }
 
         except Exception as exc:
             messagebox.showerror("Parâmetros inválidos", str(exc), parent=self)
             return
 
-        self._lock_ui("Align")
-
-        self.worker = threading.Thread(
-            target=self.run_align_logic,
-            args=(base_dir, output_dir, config),
-            daemon=True,
-        )
-        self.worker.start()
+        self._start_operation("Align", base_dir, output_dir, config)
 
     def run_align_logic(self, base_dir, output_dir, config_dict):
-        from astroalign_logic import process_all_alignments
+        """Compatibility entry point; UI launches use PipelineRunner."""
+        AstroProcessManager._run_legacy_stage(self, "Align", base_dir, output_dir, config_dict)
 
-        outcome = "failed"
-        status = "Erro no AstroAlign."
+    def start_hdr(self):
+        if self.worker and self.worker.is_alive(): return
         try:
-            process_all_alignments(
-                base_dir,
-                output_dir,
-                config_dict,
-                self.print_to_console,
-                self.update_progress,
-                self.cancel_event,
-            )
-
-            status = (
-                "AstroAlign cancelado."
-                if self.cancel_event.is_set()
-                else "AstroAlign concluído."
-            )
-            outcome = "cancelled" if self.cancel_event.is_set() else "success"
-
-        except Exception as exc:
-            self.print_to_console(f"\nERRO FATAL NO ASTROALIGN:\n{exc}\n")
-            self.after(0, lambda: self.status_var.set("Erro no AstroAlign."))
-        finally:
-            self.after(0, lambda: self._finish_operation(outcome, status))
-
-    # Método para iniciar stacking:
+            from hdr_logic import build_hdr_config
+            folder_text = self.hdr_input_var.get().strip()
+            folder = Path(folder_text)
+            if not folder_text or not folder.is_dir():
+                raise ValueError("Selecione a pasta dos FITS já alinhados.")
+            output_text = self.hdr_output_var.get().strip()
+            if not output_text:
+                raise ValueError("Selecione o arquivo de saída.")
+            output = Path(output_text).resolve()
+            paths = sorted(p for p in folder.iterdir() if p.suffix.lower() in {".fit", ".fits", ".fts"} and p.resolve() != output)
+            if len(paths) < 2:
+                raise ValueError("São necessários pelo menos dois FITS alinhados.")
+            config = {"input_paths": paths, "output_path": output_text,
+                      "noise_floor": self.hdr_noise_var.get(), "row_band": self.hdr_rowband_var.get()}
+            if self.hdr_saturation_var.get(): config["saturation"] = float(self.hdr_saturation_var.get())
+            if self.hdr_exptime_var.get(): config["exposure_override"] = float(self.hdr_exptime_var.get())
+            if not np.isfinite(float(config["noise_floor"])) or float(config["noise_floor"]) <= 0: raise ValueError("Ruído inválido")
+            if config["row_band"] <= 0: raise ValueError("A faixa de linhas deve ser positiva.")
+            for key in ("saturation", "exposure_override"):
+                if key in config and (not np.isfinite(config[key]) or config[key] <= 0):
+                    raise ValueError(f"{key}: informe um número positivo e finito.")
+            build_hdr_config(config)
+        except (tk.TclError, OSError, TypeError, ValueError) as exc:
+            messagebox.showerror("HDR", str(exc)); return
+        self._start_operation("HDR", config)
 
     def start_stacking(self):
         if self.worker and self.worker.is_alive():
+            return
+
+        # ---- Verifica os critérios de triagem de frames sem guiagem ----
+        try:
+            trail_filter_enabled = bool(self.stack_trail_filter_var.get())
+            min_roundness = float(self.stack_min_roundness_var.get())
+            min_shape_stars_value = float(self.stack_min_shape_stars_var.get())
+            if not np.isfinite(min_shape_stars_value) or not min_shape_stars_value.is_integer():
+                raise ValueError("O mínimo de estrelas medidas deve ser inteiro.")
+            min_shape_stars = int(min_shape_stars_value)
+        except (tk.TclError, TypeError, ValueError):
+            messagebox.showerror(
+                "Parâmetros inválidos",
+                "Informe uma roundness mínima entre 0 e 1 e pelo menos 1 estrela medida.",
+                parent=self,
+            )
+            return
+
+        if not np.isfinite(min_roundness) or not 0.0 <= min_roundness <= 1.0:
+            messagebox.showerror(
+                "Parâmetros inválidos",
+                "A roundness mínima b/a deve ser um número finito entre 0 e 1.",
+                parent=self,
+            )
+            return
+        if not 1 <= min_shape_stars <= 64:
+            messagebox.showerror(
+                "Parâmetros inválidos",
+                "O mínimo de estrelas medidas deve ficar entre 1 e 64.",
+                parent=self,
+            )
             return
 
         # ---- Verifica pasta de entrada ----
@@ -1052,6 +1100,9 @@ class AstroProcessManager(tk.Tk):
             "selection_mode": self.stack_selection_mode_var.get(),
             "selection_percentage": self.stack_selection_percentage_var.get(),
             "selection_metric": self.stack_selection_metric_var.get(),
+            "trail_filter_enabled": trail_filter_enabled,
+            "min_roundness": min_roundness,
+            "min_shape_stars": min_shape_stars,
             "method": self.stack_method_var.get(),
             "rejection_method": self.stack_rejection_method_var.get(),
             "rejection_low": self.stack_rejection_low_var.get(),
@@ -1066,67 +1117,51 @@ class AstroProcessManager(tk.Tk):
             "reducer_engine": self.stack_reducer_engine_var.get(),
         }
 
-        self._lock_ui("Stack")
-        self.worker = threading.Thread(
-            target=self.run_stacking_logic, args=(input_dir, config), daemon=True
+        self._start_operation("Stack", input_dir, config)
+
+    def use_align_output_for_stack(self):
+        """Use a saída do AstroAlign como entrada apenas após clique explícito."""
+
+        align_output = self.align_output_dir_var.get().strip()
+        if not align_output:
+            message = (
+                "A saída do AstroAlign ainda não foi definida. "
+                "Informe essa pasta na aba AstroAlign antes de usá-la aqui."
+            )
+            self.status_var.set(message)
+            self.print_to_console(f"[Stack] {message}\n")
+            return False
+
+        self.stack_input_dir_var.set(align_output)
+        self.save_settings()
+        self.status_var.set("Entrada do AstroStack definida pela saída do AstroAlign.")
+        self.print_to_console(
+            f"[Stack] Entrada definida pela saída do AstroAlign: {align_output}\n"
         )
-        self.worker.start()
+        return True
+
+    def apply_unguided_preset(self):
+        """Apply the documented preset for screening unguided subframes."""
+
+        self.stack_trail_filter_var.set(True)
+        self.stack_min_roundness_var.set(0.65)
+        self.stack_min_shape_stars_var.set(5)
+        self.stack_selection_mode_var.set("All")
+        self.stack_method_var.set("Mean")
+        self.stack_rejection_method_var.set("SigmaClip")
+        self.stack_profile_var.set("Stable")
+        self.save_settings()
+        message = (
+            "Preset 'Subs sem guiagem' aplicado: filtro ativo, roundness 0.65, "
+            "mínimo de 5 estrelas, seleção All, Mean, SigmaClip e Stable."
+        )
+        self.status_var.set(message)
+        self.print_to_console(f"[Stack] {message}\n")
 
     def run_stacking_logic(self, input_dir, config):
-        from stacking_logic import process_all_stacking
+        """Compatibility entry point; UI launches use PipelineRunner."""
+        AstroProcessManager._run_legacy_stage(self, "Stack", input_dir, config)
 
-        outcome = "failed"
-        status = "Erro no AstroStack."
-        try:
-            # O stacking_logic agora recebe o input_dir diretamente
-            result = process_all_stacking(
-                input_dir,  # Pasta com frames alinhados
-                config,
-                self.update_progress,
-                self.print_to_console,
-                self.cancel_event,
-            )
-
-            if result and result.get("status") == "success":
-                outcome = "success"
-                status = (
-                    f"AstroStack concluido. {result['n_frames']} frames combinados."
-                )
-                self.after(
-                    0,
-                    lambda: self.status_var.set(
-                        f"AstroStack concluído. {result['n_frames']} frames combinados."
-                    ),
-                )
-                self.print_to_console("\n✅ Stacking concluído!\n")
-                self.print_to_console(f"📁 Imagem salva em: {result['output_path']}\n")
-            else:
-                outcome = "cancelled" if self.cancel_event.is_set() else "failed"
-                status = (
-                    "AstroStack cancelado."
-                    if self.cancel_event.is_set()
-                    else "AstroStack falhou - consulte Atividade."
-                )
-                reason = (
-                    result.get("reason", "erro desconhecido")
-                    if result
-                    else "erro desconhecido"
-                )
-                self.after(
-                    0, lambda: self.status_var.set(f"AstroStack falhou: {reason}")
-                )
-        except Exception as exc:
-            self.print_to_console(f"\n❌ ERRO FATAL NO ASTROSTACK:\n{exc}\n")
-            import traceback
-
-            self.print_to_console(traceback.format_exc())
-            self.after(0, lambda: self.status_var.set("Erro no AstroStack."))
-        finally:
-            self.after(0, lambda: self._finish_operation(outcome, status))
-
-    # --------------------------------------------------------
-    # Funções de GUI Auxiliares (Preview, Chart, Combo Global Master)
-    # --------------------------------------------------------
     def show_astroflow_preview(self):
         import cv2
         from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg

@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
+import threading
+from main import AstroProcessManager
 
 
 ROOT = Path(__file__).parents[1]
@@ -26,8 +30,22 @@ class OperationFeedbackContractTests(unittest.TestCase):
         self.assertNotIn("self.progress_var.set(100)\n\n    #", self.source)
 
     def test_stack_buttons_follow_the_same_locking_contract_as_other_stages(self) -> None:
-        self.assertGreaterEqual(self.source.count("self.btn_run_stack,"), 2)
-        self.assertGreaterEqual(self.source.count("self.btn_cancel_stack,"), 2)
+        app = SimpleNamespace(PIPELINE_BUTTONS=AstroProcessManager.PIPELINE_BUTTONS,
+                              save_settings=Mock(), clear_console=Mock(), progress_var=Mock(),
+                              progress_detail_var=Mock(), _refresh_operation_clock=Mock(),
+                              cancel_event=threading.Event(), status_var=Mock())
+        for _, suffix in app.PIPELINE_BUTTONS:
+            setattr(app, f"btn_run_{suffix}", Mock())
+            setattr(app, f"btn_cancel_{suffix}", Mock())
+        app._operation_buttons = lambda: AstroProcessManager._operation_buttons(app)
+        AstroProcessManager._lock_ui(app, "Stack")
+        for stage, run, cancel in app._operation_buttons():
+            run.configure.assert_called_with(state="disabled")
+            cancel.configure.assert_called_with(state="normal" if stage == "Stack" else "disabled")
+        AstroProcessManager._unlock_ui(app)
+        for _, run, cancel in app._operation_buttons():
+            run.configure.assert_called_with(state="normal")
+            cancel.configure.assert_called_with(state="disabled")
 
     def test_activity_log_has_readable_controls_and_severity_tags(self) -> None:
         for token in (

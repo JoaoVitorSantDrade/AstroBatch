@@ -66,7 +66,10 @@ class StackingConfig:
 
     selection_mode: Literal["All", "BestPercentage"] = "BestPercentage"
     selection_percentage: float = 80.0
-    selection_metric: Literal["quality", "fwhm", "star_count", "snr"] = "quality"
+    selection_metric: Literal["quality", "fwhm", "star_count", "snr", "roundness"] = "quality"
+    trail_filter_enabled: bool = False
+    min_roundness: float = 0.65
+    min_shape_stars: int = 5
 
     method: Literal["Median", "Mean", "Sum", "Maximum", "Minimum"] = "Median"
 
@@ -347,13 +350,23 @@ def inspect_fits(filepath: Path) -> FrameGeometry:
 def load_frame_metrics(filepath: Path) -> dict[str, Any]:
     metrics_path = filepath.parent / f"{filepath.stem}_metrics.json"
 
-    if not metrics_path.exists():
-        return {}
-
+    metrics = {}
     try:
-        return load_json(metrics_path)
+        if metrics_path.exists():
+            metrics = load_json(metrics_path)
     except Exception:
-        return {}
+        pass
+    # Keep post-warp quality namespaced: it must not overwrite Flow's star RMS
+    # or silently change frame selection in existing configurations.
+    try:
+        alignment_path = filepath.with_suffix(filepath.suffix + ".align.json")
+        if alignment_path.exists():
+            report = load_json(alignment_path)
+            metrics["alignment_quality"] = report.get("quality", {})
+            metrics["alignment_decision"] = report.get("decision", "unverified")
+    except (OSError, ValueError, TypeError):
+        pass
+    return metrics
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -462,6 +475,19 @@ def build_frame_infos(
     return result
 
 
+def trail_exclusion_reason(frame: FrameInfo, config: StackingConfig) -> str | None:
+    """Unknown shape is never silently accepted by the opt-in trail filter."""
+    if not config.trail_filter_enabled:
+        return None
+    roundness = _safe_float(frame.metrics.get("roundness"), -1.0)
+    count = _safe_float(frame.metrics.get("shape_star_count"), 0.0)
+    if not 0 < roundness <= 1 or count < config.min_shape_stars:
+        return "missing_shape_measurement"
+    if roundness < config.min_roundness:
+        return "elongated_stars"
+    return None
+
+
 def select_frames(
     all_frames: list[FrameInfo],
     config: StackingConfig,
@@ -469,6 +495,9 @@ def select_frames(
     if not all_frames:
         return []
 
+    all_frames = [frame for frame in all_frames if trail_exclusion_reason(frame, config) is None]
+    # Metadata inspection completes out of order; ties must be reproducible.
+    all_frames = sorted(all_frames, key=lambda frame: (str(frame.path).casefold(), str(frame.path)))
     if config.selection_mode == "All":
         return list(all_frames)
 
@@ -482,6 +511,9 @@ def select_frames(
         reverse = False
     elif metric_name == "star_count":
         key = lambda frame: frame.star_count
+        reverse = True
+    elif metric_name == "roundness":
+        key = lambda frame: _safe_float(frame.metrics.get("roundness"), 0.0)
         reverse = True
     else:
         key = lambda frame: frame.snr
@@ -499,13 +531,16 @@ def select_frames(
         if metric_name == "fwhm":
             if value <= 0:
                 continue
+        elif metric_name == "roundness":
+            if not 0 < value <= 1:
+                continue
         elif value <= 0:
             continue
 
         valid.append(frame)
 
     if not valid:
-        valid = list(all_frames)
+        valid = [] if metric_name == "roundness" else list(all_frames)
 
     percentage = max(
         1.0,
@@ -517,6 +552,48 @@ def select_frames(
     n_select = min(n_select, len(valid))
 
     return valid[:n_select]
+
+
+def write_selection_report(
+    all_frames: list[FrameInfo], selected_frames: list[FrameInfo], config: StackingConfig,
+) -> Path:
+    """Persist selection decisions before cache conversion or image reduction."""
+    selected = {frame.path for frame in selected_frames}
+    entries = []
+    for frame in sorted(all_frames, key=lambda frame: str(frame.path)):
+        reason = trail_exclusion_reason(frame, config)
+        if frame.path in selected:
+            reason = "selected"
+        elif reason is None:
+            reason = "not_selected_by_metric"
+        entries.append({
+            "path": str(frame.path), "batch": frame.batch,
+            "selected": frame.path in selected, "reason": reason,
+            "roundness": _safe_float(frame.metrics.get("roundness"), None),
+            "shape_star_count": _safe_float(frame.metrics.get("shape_star_count"), 0),
+            "fwhm": _safe_float(frame.fwhm, None),
+            "quality": _safe_float(frame.quality, None),
+        })
+    report = {
+        "schema_version": 1, "stage": "selection_before_stacking",
+        "total_frames": len(all_frames), "selected_frames": len(selected_frames),
+        "settings": {"trail_filter_enabled": config.trail_filter_enabled,
+                     "min_roundness": config.min_roundness,
+                     "min_shape_stars": config.min_shape_stars,
+                     "selection_mode": config.selection_mode,
+                     "selection_metric": config.selection_metric,
+                     "selection_percentage": config.selection_percentage},
+        "frames": entries,
+    }
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+    path = config.output_dir / f"{Path(config.output_name).stem}_selection.json"
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False), encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return path
 
 
 def _read_hdu_section(
@@ -2037,6 +2114,9 @@ def prepare_output_header(
     header = source_header.copy()
 
     cards = {
+        "TRAILFLT": (config.trail_filter_enabled, "Reject elongated or unmeasured stars"),
+        "MINROUND": (config.min_roundness, "Minimum second-moment axis ratio b/a"),
+        "MINSHAPE": (config.min_shape_stars, "Minimum measured stars for trail filter"),
         "STACKING": (config.method, "AstroStack combine method"),
         "STACK_NFR": (n_frames, "Frames combined"),
         "STACK_TOT": (n_frames_total, "Frames available"),
@@ -2263,6 +2343,10 @@ def load_source_header(filepath: Path) -> fits.Header:
 
 
 def _validate_config(config: StackingConfig) -> None:
+    if not math.isfinite(config.min_roundness) or not 0 <= config.min_roundness <= 1:
+        raise ValueError("A circularidade mínima deve estar entre 0 e 1.")
+    if not isinstance(config.min_shape_stars, int) or not 1 <= config.min_shape_stars <= 64:
+        raise ValueError("O mínimo de estrelas medidas deve ser um inteiro entre 1 e 64.")
     if config.method not in {
         "Median",
         "Mean",
@@ -2398,6 +2482,14 @@ def process_stacking(
             config,
         )
 
+        report_path = write_selection_report(all_frames, selected_frames, config)
+        log(f"[Stack] Relatório de seleção: {report_path}")
+        if config.trail_filter_enabled:
+            excluded = [trail_exclusion_reason(frame, config) for frame in all_frames]
+            log(f"[Stack] Sem guiagem: {excluded.count('elongated_stars')} frames alongados; "
+                f"{excluded.count('missing_shape_measurement')} sem medição confiável. "
+                "Execute Flow novamente para medir dados antigos.")
+
         log(
             f"✅ Selecionados {len(selected_frames)} "
             f"frames de {len(all_frames)} disponíveis."
@@ -2408,6 +2500,7 @@ def process_stacking(
             return {
                 "status": "error",
                 "reason": "insufficient_frames",
+                "selection_report": str(report_path),
             }
 
         check_cancel(cancel_event)
@@ -2620,6 +2713,7 @@ def process_stacking(
         return {
             "status": "success",
             "output_path": str(output_path),
+            "selection_report": str(report_path),
             "n_frames": len(selected_frames),
             "n_frames_total": len(all_frames),
             "n_batches": len(batch_metadata),
@@ -2680,6 +2774,9 @@ def _build_config_from_dict(
     input_dir: Path,
     config_dict: dict[str, Any],
 ) -> StackingConfig:
+    shape_count = float(config_dict.get("min_shape_stars", 5))
+    if not math.isfinite(shape_count) or not shape_count.is_integer() or not 1 <= shape_count <= 64:
+        raise ValueError("O mínimo de estrelas medidas deve ser um inteiro entre 1 e 64.")
     workers = None
 
     if config_dict.get("workers") is not None:
@@ -2706,6 +2803,9 @@ def _build_config_from_dict(
             "selection_metric",
             "quality",
         ),
+        trail_filter_enabled=bool(config_dict.get("trail_filter_enabled", False)),
+        min_roundness=float(config_dict.get("min_roundness", 0.65)),
+        min_shape_stars=int(shape_count),
         method=config_dict.get(
             "method",
             "Median",

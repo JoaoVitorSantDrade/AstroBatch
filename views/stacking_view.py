@@ -61,9 +61,14 @@ class StackingView(BaseAstroView):
 
         # Mouse wheel
         def on_mousewheel(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            widget = self.winfo_containing(event.x_root, event.y_root)
+            while widget is not None:
+                if widget is self:
+                    canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+                    break
+                widget = widget.master
 
-        canvas.bind_all("<MouseWheel>", on_mousewheel)
+        canvas.bind_all("<MouseWheel>", on_mousewheel, add="+")
 
         # ============================================================
         # 1. Diretórios (NOVO!)
@@ -86,12 +91,17 @@ class StackingView(BaseAstroView):
             text="Selecionar",
             command=lambda: self.app.browse_dir(self.app.stack_input_dir_var),
         ).grid(row=0, column=2, pady=5)
+        ttk.Button(
+            dirs_frame,
+            text="Usar saída do Align",
+            command=self.app.use_align_output_for_stack,
+        ).grid(row=0, column=3, padx=(8, 0), pady=5)
 
         ttk.Label(
             dirs_frame,
             text="Use a pasta de saída do AstroAlign (ex: .../aligned) ou a pasta com as batches já alinhadas",
             style="Muted.TLabel",
-        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(0, 8))
 
         # Pasta de saída (onde salvar a imagem empilhada)
         ttk.Label(dirs_frame, text="Pasta de saída:").grid(
@@ -108,7 +118,7 @@ class StackingView(BaseAstroView):
 
         ttk.Label(
             dirs_frame, text="Onde a imagem empilhada será salva", style="Muted.TLabel"
-        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(0, 0))
+        ).grid(row=3, column=0, columnspan=4, sticky="w", pady=(0, 0))
 
         # ============================================================
         # 2. Seleção de Frames
@@ -145,7 +155,7 @@ class StackingView(BaseAstroView):
         self.selection_metric_combo = ttk.Combobox(
             selection_frame,
             textvariable=self.app.stack_selection_metric_var,
-            values=["quality", "fwhm", "star_count", "snr"],
+            values=["quality", "fwhm", "star_count", "snr", "roundness"],
             state="readonly",
             width=16,
         )
@@ -155,17 +165,81 @@ class StackingView(BaseAstroView):
 
         ttk.Label(
             selection_frame,
-            text="'quality' = estrelas / FWHM (recomendado)",
+            text="'quality' = estrelas / FWHM | 'roundness' = b/a",
             style="Muted.TLabel",
         ).grid(row=1, column=2, sticky="w", padx=(8, 0), pady=(8, 0))
 
+        # Triagem opcional de frames sem guiagem
+        ttk.Checkbutton(
+            selection_frame,
+            text="Rejeitar subs com rastros",
+            variable=self.app.stack_trail_filter_var,
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(12, 0))
+
+        ttk.Label(
+            selection_frame,
+            text="Ativo rejeita medições desconhecidas; em datasets antigos, rode o AstroFlow novamente antes do filtro.",
+            style="Muted.TLabel",
+            wraplength=420,
+            justify="left",
+        ).grid(row=2, column=2, sticky="w", padx=(8, 0), pady=(12, 0))
+
+        ttk.Label(selection_frame, text="Roundness mínima (b/a):").grid(
+            row=3, column=0, sticky="w", pady=(8, 0)
+        )
+        ttk.Spinbox(
+            selection_frame,
+            from_=0.0,
+            to=1.0,
+            increment=0.01,
+            textvariable=self.app.stack_min_roundness_var,
+            width=8,
+        ).grid(row=3, column=1, sticky="w", padx=8, pady=(8, 0))
+        ttk.Label(
+            selection_frame,
+            text="1 = estrela circular; valores menores aceitam formas mais alongadas.",
+            style="Muted.TLabel",
+        ).grid(row=3, column=2, sticky="w", padx=(8, 0), pady=(8, 0))
+
+        ttk.Label(selection_frame, text="Mínimo de estrelas medidas:").grid(
+            row=4, column=0, sticky="w", pady=(8, 0)
+        )
+        ttk.Spinbox(
+            selection_frame,
+            from_=1,
+            to=64,
+            increment=1,
+            textvariable=self.app.stack_min_shape_stars_var,
+            width=8,
+        ).grid(row=4, column=1, sticky="w", padx=8, pady=(8, 0))
+        ttk.Label(
+            selection_frame,
+            text="Evita decidir a forma com poucas estrelas detectadas.",
+            style="Muted.TLabel",
+            wraplength=420,
+            justify="left",
+        ).grid(row=4, column=2, sticky="w", padx=(8, 0), pady=(8, 0))
+
+        ttk.Button(
+            selection_frame,
+            text="Preset: Subs sem guiagem",
+            command=self.app.apply_unguided_preset,
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        ttk.Label(
+            selection_frame,
+            text="Define filtro 0.65, 5 estrelas, All, Mean, SigmaClip e Stable; All mantém todos os aprovados.",
+            style="Muted.TLabel",
+            wraplength=420,
+            justify="left",
+        ).grid(row=5, column=2, sticky="w", padx=(8, 0), pady=(12, 0))
+
         # Percentual
         ttk.Label(selection_frame, text="Percentual:").grid(
-            row=2, column=0, sticky="w", pady=(8, 0)
+            row=6, column=0, sticky="w", pady=(8, 0)
         )
 
         percent_frame = ttk.Frame(selection_frame)
-        percent_frame.grid(row=2, column=1, sticky="w", padx=8, pady=(8, 0))
+        percent_frame.grid(row=6, column=1, sticky="w", padx=8, pady=(8, 0))
 
         ttk.Scale(
             percent_frame,

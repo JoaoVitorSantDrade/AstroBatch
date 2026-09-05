@@ -4,6 +4,7 @@ import queue
 import re
 import shutil
 import threading
+import uuid
 import warnings
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -26,6 +27,11 @@ RESAMPLE_MODES = {
     "Bilinear": cv2.INTER_LINEAR,
     "Lanczos": cv2.INTER_LANCZOS4,
 }
+
+# ``meanStdDev`` has enough work to amortize its call overhead on the larger
+# frames used by the batch workflow.  Smaller finite frames retain the
+# in-place NumPy reduction, which is faster for the short-sub workload.
+_MEAN_STDDEV_MIN_PIXELS = 1_000_000
 
 
 @dataclass(frozen=True)
@@ -105,17 +111,44 @@ def comparison_score(current: np.ndarray, previous: np.ndarray) -> float:
             f"Imagens incompatíveis para comparação: {current.shape} vs {previous.shape}"
         )
 
-    # P1: Otimizar comparison_score usando rotinas subjacentes do OpenCV/Numpy
+    # OpenCV keeps the subtraction in the input dtype, matching the previous
+    # implementation's saturation and floating-point overflow behavior.
     diff = cv2.subtract(current, previous)
+    if diff is None or diff.size == 0:
+        return math.nan
 
-    # Verificação hiper-rápida de NaNs/Infs que só executa a máscara pesada se der positivo
-    if np.isnan(diff).any() or np.isinf(diff).any():
-        valid = np.isfinite(diff)
-        if not valid.any():
-            return math.nan
+    # One finite scan replaces the old NaN scan, Inf scan, and (for the
+    # common finite case) the second finite scan.  A mask lets OpenCV reduce
+    # mixed frames without allocating a compacted copy of all valid pixels.
+    valid = np.isfinite(diff)
+    if valid.all():
+        if (
+            diff.dtype == np.float32
+            and diff.ndim == 2
+            and diff.size >= _MEAN_STDDEV_MIN_PIXELS
+        ):
+            mean, stddev = cv2.meanStdDev(diff)
+            score = float(stddev[0, 0])
+            if score > abs(float(mean[0, 0])) * 1e-4:
+                return score
+            # E[x²]-E[x]² loses precision when the background difference
+            # dominates the variance. Use a centered reduction in that case.
+            return float(np.std(diff, dtype=np.float64))
+    elif not valid.any():
+        return math.nan
+    elif diff.dtype == np.float32 and diff.ndim == 2 and diff.size >= _MEAN_STDDEV_MIN_PIXELS:
+        mean, stddev = cv2.meanStdDev(diff, mask=valid.astype(np.uint8))
+        score = float(stddev[0, 0])
+        if score > abs(float(mean[0, 0])) * 1e-4:
+            return score
+        return float(np.std(diff[valid], dtype=np.float64))
+    else:
+        # Prepared batch images are 2D.  Keep the historical flattening
+        # behavior for callers that provide another shape.
         diff = diff[valid]
 
-    # In-place centralização e cálculo do RMS de forma direta (RMS vetorial)
+    # Preserve the established float32 reduction for small finite arrays and
+    # non-2D inputs; it also remains the fallback for numeric edge cases.
     diff -= np.mean(diff)
     return float(np.linalg.norm(diff) / math.sqrt(diff.size))
 
@@ -161,6 +194,27 @@ def prepare_fits_file(
         return filepath, None, f"Erro ao processar {filepath.name}: {exc}"
 
 
+def transfer_batch_file(src: Path, dst: Path, action: str, overwrite: bool) -> None:
+    """Keep the previous destination intact until its replacement is complete."""
+    if src.resolve() == dst.resolve() or (dst.exists() and src.samefile(dst)):
+        raise ValueError("Origem e destino apontam para o mesmo arquivo.")
+    if dst.exists():
+        if not overwrite:
+            raise FileExistsError(f"Destino já existe: {dst}")
+        temporary = dst.with_name(f".{dst.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            shutil.copy2(str(src), str(temporary))
+            os.replace(temporary, dst)
+            if action == "move":
+                src.unlink()
+        finally:
+            temporary.unlink(missing_ok=True)
+    elif action == "copy":
+        shutil.copy2(str(src), str(dst))
+    else:
+        shutil.move(str(src), str(dst))
+
+
 def file_mover_worker(
     move_queue: queue.Queue,
     app_print,
@@ -171,6 +225,7 @@ def file_mover_worker(
     while True:
         item = move_queue.get()
         if item is None:
+            move_queue.task_done()
             break
 
         src, dst, action, overwrite = item
@@ -180,14 +235,9 @@ def file_mover_worker(
             continue
 
         try:
-            if dst.exists() and overwrite:
-                dst.unlink()
-
-            if action == "copy":
-                shutil.copy2(str(src), str(dst))
-            else:
-                shutil.move(str(src), str(dst))
+            transfer_batch_file(src, dst, action, overwrite)
         except Exception as exc:
+            move_state["failed"] += 1
             verbo = "copiar" if action == "copy" else "mover"
             app_print(f"Erro ao {verbo} {src.name}: {exc}\n")
         finally:
@@ -239,7 +289,7 @@ def process_fits_logic(
     worker_count = get_optimal_worker_count()
     prefetch_count = min(len(files), max(worker_count * 2, worker_count + 2))
 
-    move_state = {"moved": 0, "total": total_files}
+    move_state = {"moved": 0, "total": total_files, "failed": 0}
     move_queue = queue.Queue()
     mover_thread = threading.Thread(
         target=file_mover_worker,
@@ -264,96 +314,110 @@ def process_fits_logic(
             next_submit = 0
             next_yield = 0
 
-            while next_yield < len(files):
-                if cancel_event.is_set():
-                    break
-
-                # Produz (Pre-fetch buffer)
-                while next_submit < len(files) and len(futures) < prefetch_count:
-                    futures[next_submit] = executor.submit(
-                        prepare_fits_file, files[next_submit], config
-                    )
-                    next_submit += 1
-
-                # Consome ordenadamente
-                future = futures.pop(next_yield)
-                yield next_yield, files[next_yield], future.result()
-                next_yield += 1
-
-    # O pipeline principal reage como consumidor rigorosamente assíncrono
-    for idx, filepath, result in generate_prepared_frames():
-        if cancel_event.is_set():
-            app_print("\nCancelamento solicitado...\n")
-            break
-
-        try:
-            _, prepared, error_message = result
-        except Exception as exc:
-            prepared = None
-            error_message = f"Erro inesperado no worker para {filepath.name}: {exc}"
-
-        next_process = idx + 1
-        app_progress(
-            next_process,
-            total_files,
-            f"Analisando deriva ({next_process}/{total_files})...",
-        )
-
-        if error_message:
-            app_print(error_message + "\n")
-            continue
-
-        if prepared is None:
-            continue
-
-        if previous_data is not None:
             try:
-                score = comparison_score(prepared, previous_data)
-            except ValueError as exc:
-                app_print(f"Aviso: {filepath.name}: {exc}\n")
-                previous_data = prepared
-                score_history.clear()
+                while next_yield < len(files):
+                    if cancel_event.is_set():
+                        break
+
+                    # Produz (Pre-fetch buffer)
+                    while next_submit < len(files) and len(futures) < prefetch_count:
+                        futures[next_submit] = executor.submit(
+                            prepare_fits_file, files[next_submit], config
+                        )
+                        next_submit += 1
+
+                    # Consome ordenadamente
+                    future = futures.pop(next_yield)
+                    yield next_yield, files[next_yield], future.result()
+                    next_yield += 1
+
+            finally:
+                for pending in futures.values():
+                    pending.cancel()
+
+    frames = generate_prepared_frames()
+    try:
+        # O pipeline principal reage como consumidor rigorosamente assíncrono
+        for idx, filepath, result in frames:
+            if cancel_event.is_set():
+                app_print("\nCancelamento solicitado...\n")
+                break
+
+            try:
+                _, prepared, error_message = result
+            except Exception as exc:
+                prepared = None
+                error_message = f"Erro inesperado no worker para {filepath.name}: {exc}"
+
+            next_process = idx + 1
+            app_progress(
+                next_process,
+                total_files,
+                f"Analisando deriva ({next_process}/{total_files})...",
+            )
+
+            if error_message:
+                app_print(error_message + "\n")
                 continue
 
-            if math.isfinite(score):
-                if len(score_history) >= 5:
-                    baseline = float(np.median(score_history))
-                    if baseline > np.finfo(np.float32).eps:
-                        limit = baseline * config.threshold_factor
-                        if score > limit:
-                            batch_num += 1
-                            current_batch_dir = output_dir / f"batch_{batch_num:03d}"
-                            if not config.dry_run:
-                                current_batch_dir.mkdir(parents=True, exist_ok=True)
+            if prepared is None:
+                continue
 
-                            app_print("\n>>> MOVIMENTO BRUSCO DETECTADO <<<\n")
-                            app_print(
-                                f"Arquivo: {filepath.name} | Score: {score:.4f} | Baseline: {baseline:.4f} | Limite: {limit:.4f}\n"
-                            )
-                            app_print(f"Criando Batch {batch_num:03d}...\n")
-                            score_history.clear()
-                score_history.append(score)
+            if previous_data is not None:
+                try:
+                    score = comparison_score(prepared, previous_data)
+                except ValueError as exc:
+                    app_print(f"Aviso: {filepath.name}: {exc}\n")
+                    previous_data = prepared
+                    score_history.clear()
+                    continue
 
-        # P0: Não Manter Prepared Frames em Memória - Substitui o array liberando-o no Garbage Collector
-        previous_data = prepared
+                if math.isfinite(score):
+                    if len(score_history) >= 5:
+                        baseline = float(np.median(score_history))
+                        if baseline > np.finfo(np.float32).eps:
+                            limit = baseline * config.threshold_factor
+                            if score > limit:
+                                batch_num += 1
+                                current_batch_dir = output_dir / f"batch_{batch_num:03d}"
+                                if not config.dry_run:
+                                    current_batch_dir.mkdir(parents=True, exist_ok=True)
 
+                                app_print("\n>>> MOVIMENTO BRUSCO DETECTADO <<<\n")
+                                app_print(
+                                    f"Arquivo: {filepath.name} | Score: {score:.4f} | Baseline: {baseline:.4f} | Limite: {limit:.4f}\n"
+                                )
+                                app_print(f"Criando Batch {batch_num:03d}...\n")
+                                score_history.clear()
+                    score_history.append(score)
+
+            # P0: Não Manter Prepared Frames em Memória - Substitui o array liberando-o no Garbage Collector
+            previous_data = prepared
+
+            if not config.dry_run:
+                destination = current_batch_dir / filepath.name
+                if destination.exists() and not config.overwrite:
+                    app_print(f"ERRO: destino já existe, arquivo ignorado: {destination}\n")
+                else:
+                    action = "copy" if config.copy_files else "move"
+                    move_queue.put((filepath, destination, action, config.overwrite))
+                    queued_for_move += 1
+
+            processed += 1
+
+    finally:
+        frames.close()
         if not config.dry_run:
-            destination = current_batch_dir / filepath.name
-            if destination.exists() and not config.overwrite:
-                app_print(f"ERRO: destino já existe, arquivo ignorado: {destination}\n")
-            else:
-                action = "copy" if config.copy_files else "move"
-                move_queue.put((filepath, destination, action, config.overwrite))
-                queued_for_move += 1
+            move_state["total"] = queued_for_move
+            app_print("\nAguardando finalização das movimentações de disco...\n")
+            move_queue.put(None)
+            mover_thread.join()
 
-        processed += 1
-
-    if not config.dry_run:
-        move_state["total"] = queued_for_move
-        app_print("\nAguardando finalização das movimentações de disco...\n")
-        move_queue.put(None)
-        mover_thread.join()
-
+    if cancel_event.is_set():
+        app_print(f"\nCancelado. {processed} arquivos analisados.\n")
+        return processed, batch_num
+    if move_state["failed"]:
+        raise OSError(f"Falha ao salvar {move_state['failed']} arquivo(s); consulte Atividade.")
     app_progress(100, 100, "Concluído.")
     app_print(
         f"\nFinalizado! {processed} arquivos processados em {batch_num} batches.\n"

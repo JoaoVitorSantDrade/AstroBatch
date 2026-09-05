@@ -3,6 +3,7 @@ import json
 import os
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import deque
 from pathlib import Path
 
 import cv2
@@ -14,9 +15,21 @@ from photutils.detection import DAOStarFinder
 from scipy.spatial import KDTree
 
 from app.engines import EngineDescriptor, EngineProfile, EngineUnavailable, registry
+from app.engines.execution import ExecutionBudget
 from app.engines.astroalign_fallback import estimate_asterism_transform
+from frame_quality import measure_star_shapes
 
 warnings.simplefilter("ignore", category=AstropyWarning)
+
+
+def max_science_frame_bytes(filepath: Path) -> int:
+    """Estimate science image bytes from FITS headers without loading pixels."""
+    with fits.open(filepath, memmap=False, lazy_load_hdus=True) as hdul:
+        for hdu in hdul:
+            if getattr(hdu, "is_image", False) and getattr(hdu, "shape", None):
+                shape = tuple(int(v) for v in hdu.shape)
+                return int(np.prod(shape, dtype=np.int64)) * 4
+    return 0
 
 
 # ============================================================
@@ -622,12 +635,20 @@ def _process_single_frame(
                 break
             current_sigma -= 0.5
 
+        # Shape quality is derived once from the final detector selection. It
+        # supplements (and does not replace) the detector's existing FWHM and
+        # validity semantics.
+        best_metrics = {**best_metrics, **measure_star_shapes(working_data, best_stars)}
+
         if len(best_stars) < min_stars:
             return (
                 filepath.name,
                 {
                     "path": filepath,
-                    "data": data,
+                    # The raw science array is not consumed after detection;
+                    # dropping it keeps all prepared frames from retaining a
+                    # full-resolution copy while phase_data remains available.
+                    "data": None,
                     "phase_data": None,
                     "stars": best_stars,
                     "fwhm": best_fwhm,
@@ -642,7 +663,7 @@ def _process_single_frame(
             filepath.name,
             {
                 "path": filepath,
-                "data": data,
+                "data": None,
                 "phase_data": phase_data,
                 "stars": best_stars,
                 "fwhm": best_fwhm,
@@ -666,7 +687,61 @@ def _process_single_frame(
         )
 
 
-def process_local_flow(batch_dir: Path, config: dict, app_print) -> dict:
+def _shape_metrics_for_frame(frame: dict | None) -> dict:
+    """Return shape measurements for persistence in flow frame metadata."""
+    if not isinstance(frame, dict):
+        return {}
+    metrics = frame.get("metrics")
+    if not isinstance(metrics, dict):
+        return {}
+    return {
+        key: metrics[key]
+        for key in ("roundness", "shape_star_count", "shape_fwhm", "elongation")
+        if key in metrics
+    }
+
+
+def _classify_flow_confidence(metrics: dict, limits: dict) -> str:
+    """Classify an accepted transform using observable registration evidence."""
+    response = float(metrics.get("phase_response", 0.0))
+    coverage = float(metrics.get("inlier_ratio", 0.0))
+    rms = float(metrics.get("rms", 999.0))
+    spatial = float(metrics.get("spatial_inlier_coverage", 0.0))
+    if coverage >= max(float(limits.get("min_ratio", 0.15)) * 2.0, 0.5) and rms <= float(limits.get("max_rms", 4.0)) * 0.5 and response >= 0.15 and spatial >= 0.01:
+        return "accepted"
+    return "low_confidence"
+
+
+def _flow_confidence_reason(metrics: dict, limits: dict) -> str:
+    return (f"phase_response={float(metrics.get('phase_response', 0.0)):.4f}; "
+            f"inlier_coverage={float(metrics.get('inlier_ratio', 0.0)):.3f}; "
+            f"rms={float(metrics.get('rms', 999.0)):.3f}; "
+            f"spatial_coverage={float(metrics.get('spatial_inlier_coverage', 0.0)):.4f}; "
+            "motion=plausible")
+
+
+def _spatial_inlier_coverage(ref_stars, current_stars, matrix, shape, residual_threshold=4.0) -> float:
+    """Fraction of image area covered by inlier convex hull, as a quality cue."""
+    if matrix is None or len(ref_stars) < 3 or len(current_stars) < 3:
+        return 0.0
+    transformed = cv2.transform(np.asarray(current_stars, np.float32).reshape(-1, 1, 2), matrix).reshape(-1, 2)
+    residual = np.linalg.norm(transformed - np.asarray(ref_stars), axis=1)
+    inliers = transformed[residual <= residual_threshold]
+    if len(inliers) < 3:
+        return 0.0
+    hull = cv2.contourArea(cv2.convexHull(np.asarray(inliers, np.float32)))
+    height, width = shape[:2]
+    return float(np.clip(hull / max(float(height * width), 1.0), 0.0, 1.0))
+
+
+def process_local_flow(batch_dir: Path, config: dict, app_print, cancellation_event=None) -> dict:
+    """Build local flow metadata with bounded preparation and cooperative cancellation.
+
+    ``cancellation_event`` is intentionally duck typed (``is_set``), keeping
+    compatibility with threading.Event and the application's cancellation token.
+    """
+    def cancelled() -> bool:
+        return bool(cancellation_event is not None and cancellation_event.is_set())
     files = sorted(
         [
             p
@@ -716,34 +791,44 @@ def process_local_flow(batch_dir: Path, config: dict, app_print) -> dict:
         cpu_count = getattr(os, "process_cpu_count", os.cpu_count)() or 1
     except Exception:
         cpu_count = os.cpu_count() or 1
-    worker_count = max(1, min(2, cpu_count // 4))
+    requested_workers = max(1, min(8, int(config.get("flow_workers", min(2, max(1, cpu_count // 4))))))
+    # Header-only estimate: reserve roughly 40 bytes per pixel for detector,
+    # luminance, phase and transient matching buffers.
+    memory_budget_mb = max(64, int(config.get("memory_budget_mb", 512)))
+    try:
+        estimated = max(1, max(max_science_frame_bytes(p) for p in files)) * 10
+        budget = ExecutionBudget.for_frame_pipeline(requested_workers, memory_budget_mb, estimated)
+        worker_count = budget.worker_count
+    except OSError:
+        raise ValueError("Could not inspect FITS dimensions for the Flow memory budget")
 
-    prepared_frames = {}
-    with ThreadPoolExecutor(
-        max_workers=worker_count, thread_name_prefix="astroflow"
-    ) as executor:
-        futures = {
-            executor.submit(
-                _process_single_frame,
-                filepath,
-                fwhm_val,
-                sigma_val,
-                max_stars_val,
-                limits["min_stars"],
-                engine_val,
-                engine_profile,
-            ): filepath
-            for filepath in files
-        }
-        for future in as_completed(futures):
-            filepath = futures[future]
+    # Prepare the anchor synchronously, then stream all other frames through a
+    # bounded FIFO. No collection of phase images is built.
+    _, anchor = _process_single_frame(anchor_file, fwhm_val, sigma_val, max_stars_val,
+                                      limits["min_stars"], engine_val, engine_profile)
+
+    def bounded_prepare():
+        others = (p for p in files if p.name != anchor_file.name)
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="astroflow") as executor:
+            pending = deque()
+            for _ in range(budget.max_in_flight):
+                try: p = next(others)
+                except StopIteration: break
+                pending.append((executor.submit(_process_single_frame, p, fwhm_val, sigma_val,
+                    max_stars_val, limits["min_stars"], engine_val, engine_profile), p))
             try:
-                fname, result = future.result()
-                prepared_frames[fname] = result
-            except Exception as exc:
-                app_print(f"[{filepath.name}] Erro no worker: {exc}\n")
-
-    anchor = prepared_frames.get(anchor_file.name)
+                while pending:
+                    if cancelled(): return
+                    future, path = pending.popleft()
+                    try: yield path, future.result()[1]
+                    except Exception as exc:
+                        app_print(f"[{path.name}] Erro no worker: {exc}\n")
+                    try: p = next(others)
+                    except StopIteration: continue
+                    pending.append((executor.submit(_process_single_frame, p, fwhm_val, sigma_val,
+                        max_stars_val, limits["min_stars"], engine_val, engine_profile), p))
+            finally:
+                for future, _ in pending: future.cancel()
     if (
         anchor is None
         or anchor.get("status") == "error"
@@ -782,6 +867,9 @@ def process_local_flow(batch_dir: Path, config: dict, app_print) -> dict:
 
     flow_data["frames"][anchor_file.name] = {
         "status": "accepted",
+        "confidence": "reference",
+        "confidence_reason": "Coordinate reference; not an independently verified registration",
+        "recovery_method": "reference",
         "matrix": np.eye(3).tolist(),
         "relative_to": None,
         "matches": len(anchor["stars"]),
@@ -795,16 +883,18 @@ def process_local_flow(batch_dir: Path, config: dict, app_print) -> dict:
         "cumulative_rms": 0.0,
         "star_count": len(anchor["stars"]),
         "fwhm": anchor["fwhm"],
+        **_shape_metrics_for_frame(anchor),
     }
 
     previous_name = anchor_file.name
     previous_frame = anchor
     temporal_history: list[tuple[float, float, float]] = []
 
-    for index in range(1, len(files)):
-        current_file = files[index]
+    # Start at the first file so a manual anchor in the middle cannot silently
+    # drop the leading frames. The anchor remains an identity observation.
+    for current_file, current_frame in bounded_prepare():
+        if cancelled(): return {}
         current_name = current_file.name
-        current_frame = prepared_frames.get(current_name)
 
         if (
             current_frame is None
@@ -813,14 +903,23 @@ def process_local_flow(batch_dir: Path, config: dict, app_print) -> dict:
         ):
             flow_data["frames"][current_name] = {
                 "status": "rejected",
+                "confidence": "rejected",
+                "confidence_reason": "insufficient_stars_or_error",
                 "reason": "insufficient_stars_or_error",
+                **_shape_metrics_for_frame(current_frame),
             }
             continue
 
+        phase_shift = (0.0, 0.0)
+        phase_response = 0.0
+        if previous_frame.get("phase_data") is not None and current_frame.get("phase_data") is not None:
+            phase_shift, phase_response = cv2.phaseCorrelate(previous_frame["phase_data"], current_frame["phase_data"])
         attempts = [
             ("normal", previous_frame, matching_radius, previous_name),
             ("relaxed_radius", previous_frame, matching_radius * 2.0, previous_name),
         ]
+        if previous_name != anchor_file.name:
+            attempts.append(("anchor", anchor, matching_radius * 2.0, anchor_file.name))
         accepted = False
         best_metrics = {
             "reason": "phase_correlation_failed",
@@ -837,15 +936,21 @@ def process_local_flow(batch_dir: Path, config: dict, app_print) -> dict:
             ):
                 continue
 
-            shift, response = cv2.phaseCorrelate(
-                ref_frame["phase_data"], current_frame["phase_data"]
-            )
-            dx, dy = shift
+            if attempt_name == "anchor":
+                anchor_shift, anchor_response = cv2.phaseCorrelate(anchor["phase_data"], current_frame["phase_data"])
+                dx, dy, response = anchor_shift[0], anchor_shift[1], anchor_response
+            else:
+                dx, dy, response = phase_shift[0], phase_shift[1], phase_response
             m_ref, m_cur = _match_incremental_stars(
                 ref_frame["stars"], current_frame["stars"], (dx, dy), radius
             )
             rel_matrix, metrics = _estimate_incremental_transform(
                 m_ref, m_cur, ransac_thresh, limits["min_stars"]
+            )
+            metrics["spatial_inlier_coverage"] = _spatial_inlier_coverage(
+                m_ref, m_cur, rel_matrix,
+                current_frame["phase_data"].shape if current_frame.get("phase_data") is not None else (1, 1),
+                residual_threshold=ransac_thresh,
             )
 
             metrics["phase_shift"] = [round(float(dx), 3), round(float(dy), 3)]
@@ -853,12 +958,13 @@ def process_local_flow(batch_dir: Path, config: dict, app_print) -> dict:
             valid, reason = validate_transform(rel_matrix, metrics, limits)
 
             # Validação Temporal por Inércia
-            if valid and rel_matrix is not None:
+            if valid and rel_matrix is not None and attempt_name != "anchor":
                 tx, ty, rot, sc = extract_geometric_properties(rel_matrix)
                 if len(temporal_history) >= 4:
-                    med_dx = np.median([h[0] for h in temporal_history[:8]])
-                    med_dy = np.median([h[1] for h in temporal_history[:8]])
-                    med_rot = np.median([h[2] for h in temporal_history[:8]])
+                    recent = temporal_history[-8:]
+                    med_dx = np.median([h[0] for h in recent])
+                    med_dy = np.median([h[1] for h in recent])
+                    med_rot = np.median([h[2] for h in recent])
                     if (
                         abs(tx - med_dx) > 120.0
                         or abs(ty - med_dy) > 120.0
@@ -883,6 +989,8 @@ def process_local_flow(batch_dir: Path, config: dict, app_print) -> dict:
 
                 flow_data["frames"][current_name] = {
                     "status": "accepted",
+                    "confidence": _classify_flow_confidence(metrics, limits),
+                    "confidence_reason": _flow_confidence_reason(metrics, limits),
                     "matrix": cumulative_matrix.tolist(),
                     "relative_matrix": relative_homogeneous.tolist(),
                     "relative_to": ref_name,
@@ -890,12 +998,15 @@ def process_local_flow(batch_dir: Path, config: dict, app_print) -> dict:
                     "cumulative_rms": cumulative_rms,
                     "fwhm": current_frame["fwhm"],
                     "star_count": len(current_frame["stars"]),
+                    **_shape_metrics_for_frame(current_frame),
                     **metrics,
                 }
 
-                if len(temporal_history) < 8:
-                    tx, ty, rot, _ = extract_geometric_properties(rel_matrix)
+                tx, ty, rot, _ = extract_geometric_properties(rel_matrix)
+                if attempt_name != "anchor":
                     temporal_history.append((tx, ty, rot))
+                if len(temporal_history) > 8:
+                    del temporal_history[:-8]
 
                 app_print(
                     f"[{current_name}] OK ({attempt_name}) <- {ref_name} | "
@@ -926,8 +1037,12 @@ def process_local_flow(batch_dir: Path, config: dict, app_print) -> dict:
                     metrics["cumulative_rms"] = float(np.sqrt(previous_rms**2 + float(metrics["rms"]) ** 2))
                     flow_data["frames"][current_name] = {
                         "status": "accepted", "matrix": cumulative_matrix.tolist(),
+                        "confidence": "low_confidence",
+                        "confidence_reason": "Asterism transform passed geometry checks; spatial/phase confidence not calibrated",
+                        "recovery_method": "astroalign_asterism",
                         "relative_matrix": relative_homogeneous.tolist(), "relative_to": previous_name,
                         "fwhm": current_frame["fwhm"], "star_count": len(current_frame["stars"]), **metrics,
+                        **_shape_metrics_for_frame(current_frame),
                     }
                     app_print(f"[{current_name}] OK (astroalign_asterism) <- {previous_name} | "
                               f"{metrics['inliers']}/{metrics['matches']} asterism matches | RMS={metrics['rms']:.3f}px\n")
@@ -938,11 +1053,17 @@ def process_local_flow(batch_dir: Path, config: dict, app_print) -> dict:
                 app_print(f"[{current_name}] Astroalign fallback unavailable: {exc}\n")
 
         if accepted:
+            # Release the predecessor's full phase image once it is no longer
+            # needed; this bounds phase memory to the anchor and current frame.
+            if previous_name != anchor_file.name:
+                previous_frame["phase_data"] = None
             previous_name = current_name
             previous_frame = current_frame
         else:
             flow_data["frames"][current_name] = {
                 "status": "rejected",
+                "confidence": "rejected",
+                "confidence_reason": best_metrics.get("reason", "unknown"),
                 "reason": best_metrics.get("reason", "unknown"),
                 "matches": best_metrics.get("matches", 0),
                 "inliers": best_metrics.get("inliers", 0),
@@ -952,12 +1073,15 @@ def process_local_flow(batch_dir: Path, config: dict, app_print) -> dict:
                 "phase_response": best_metrics.get("phase_response", 0.0),
                 "fwhm": current_frame["fwhm"],
                 "star_count": len(current_frame["stars"]),
+                **_shape_metrics_for_frame(current_frame),
             }
             app_print(
                 f"[{current_name}] REJEITADO: {best_metrics.get('reason', 'unknown')} | "
                 f"inliers={best_metrics.get('inliers', 0)} | RMS={best_metrics.get('rms', 999.0):.3f}px\n"
             )
 
+    if cancelled():
+        return {}
     # Recentralização se a âncora manual não for o 1º frame
     selected_reference_info = flow_data["frames"].get(chosen_anchor_name)
     if selected_reference_info and selected_reference_info.get("status") == "accepted":
@@ -1011,7 +1135,7 @@ def process_local_flow(batch_dir: Path, config: dict, app_print) -> dict:
     return {
         "batch_name": batch_dir.name,
         "anchor_path": anchor_file,
-        "anchor_data": anchor["phase_data"],
+        "anchor_data": None,
         "anchor_stars": anchor["stars"],
         "star_count": len(anchor["stars"]),
         "fwhm": anchor["fwhm"],
@@ -1336,30 +1460,21 @@ def process_all_flows(
         except Exception:
             cpu_count = os.cpu_count() or 1
 
-        local_workers = max(1, min(4, cpu_count))
-        with ThreadPoolExecutor(
-            max_workers=local_workers, thread_name_prefix="astroflow-batch"
-        ) as executor:
-            futures = {
-                executor.submit(
-                    process_local_flow,
-                    batch_folder,
-                    config,
-                    lambda message: app_print(message),
-                ): batch_folder
-                for batch_folder in batch_folders
-            }
-            for future in as_completed(futures):
-                if cancel_event.is_set():
-                    return
-                batch_folder = futures[future]
-                try:
-                    info = future.result()
-                    if info:
-                        anchors_info.append(info)
-                    app_print(f"Flow Local Finalizado: {batch_folder.name}\n")
-                except Exception as exc:
-                    app_print(f"Erro em {batch_folder.name}: {exc}\n")
+        local_workers = max(1, min(8, int(config.get("flow_workers", min(2, cpu_count)))))
+        local_config = {**config, "flow_workers": local_workers}
+        for batch_folder in batch_folders:
+            if cancel_event.is_set():
+                return
+            try:
+                info = process_local_flow(
+                    batch_folder, local_config, lambda message: app_print(message),
+                    cancellation_event=cancel_event,
+                )
+                if info:
+                    anchors_info.append(info)
+                app_print(f"Flow Local Finalizado: {batch_folder.name}\n")
+            except Exception as exc:
+                app_print(f"Erro em {batch_folder.name}: {exc}\n")
 
     if not anchors_info:
         app_print("Nenhum Flow Local válido foi produzido ou encontrado.\n")
@@ -1380,31 +1495,17 @@ def process_all_flows(
         cpu_count = os.cpu_count() or 1
     global_workers = max(1, min(8, cpu_count))
 
-    # Detecção de estrelas-âncora por batch é independente entre si: paraleliza
-    # (antes era um loop sequencial de I/O + CPU, um dos principais gargalos).
-    with ThreadPoolExecutor(
-        max_workers=global_workers, thread_name_prefix="astroflow-anchor"
-    ) as executor:
-        futures = {
-            executor.submit(
-                _detect_anchor_stars_task, info, fwhm_val, base_sigma, engine_val, engine_profile
-            ): info
-            for info in anchors_info
-        }
-        for future in as_completed(futures):
-            if cancel_event.is_set():
-                return
-            info, shape, best_stars, best_fwhm, stopped_sigma, phase_data = (
-                future.result()
-            )
-            info["shape"] = shape
-            info["anchor_stars"] = best_stars
-            info["star_count"] = len(best_stars)
-            info["fwhm"] = best_fwhm
-            info["anchor_data"] = phase_data
-            app_print(
-                f"  -> {info['batch_name']}: {len(best_stars):02d} estrelas base | (Sigma parou em {stopped_sigma:.1f})\n"
-            )
+    # Global matching consumes star catalogues only. Decode one anchor at a
+    # time rather than retaining an entire session of unused phase images.
+    for info in anchors_info:
+        if cancel_event.is_set():
+            return
+        info, shape, best_stars, best_fwhm, stopped_sigma, phase_data = _detect_anchor_stars_task(
+            info, fwhm_val, base_sigma, engine_val, engine_profile)
+        info.update(shape=shape, anchor_stars=best_stars,
+                    star_count=len(best_stars), fwhm=best_fwhm, anchor_data=None)
+        del phase_data
+        app_print(f"  -> {info['batch_name']}: {len(best_stars):02d} estrelas base\n")
 
     global_master_cfg = config.get("global_master", "Auto")
     if str(global_master_cfg).lower() == "auto":
@@ -1668,13 +1769,18 @@ def process_all_flows(
     }
 
     global_path = base_dir / "global_flow.json"
-    with global_path.open("w", encoding="utf-8") as f:
-        json.dump(global_flow, f, indent=4, ensure_ascii=False)
+    if cancel_event.is_set():
+        return {"status": "cancelled"}
+    from app.infrastructure.json_store import atomic_json_write
+    atomic_json_write(global_path, global_flow)
 
     app_progress(total_batches, total_batches, "AstroFlow Finalizado.")
     app_print(
         f"\n>>> AstroFlow Finalizado. {len(accepted_batches)}/{len(anchors_info)} Batches aceitas no Global Flow. <<<\n"
     )
+    return {"status": "partial" if rejected_batches else "success",
+            "message": f"Flow: {len(accepted_batches)}/{len(anchors_info)} batches aceitas.",
+            "output_path": str(global_path)}
 
 
 # ============================================================

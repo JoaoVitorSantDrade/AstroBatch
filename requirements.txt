@@ -12,3 +12,5 @@ numba
 bottleneck
 pyinstrument
 py-spy
+sep
+astroalign

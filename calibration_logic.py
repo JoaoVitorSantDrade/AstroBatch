@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import threading
+import tempfile
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -49,7 +50,7 @@ def load_fits_data(filepath: Path) -> tuple[np.ndarray, fits.Header]:
         ignore_missing_end=True,
     ) as hdul:
         for hdu in hdul:
-            if hdu.is_image and hdu.data is not None and hdu.data.ndim == 2:
+            if hdu.is_image and hdu.name not in {"VALID_MASK", "SAT_MASK", "DISAGREE", "HDR_META"} and hdu.data is not None and hdu.data.ndim == 2:
                 data = np.asarray(
                     hdu.data,
                     dtype=np.float32,
@@ -71,7 +72,7 @@ def _inspect_master_frame(filepath: Path) -> tuple[tuple[int, int], fits.Header,
     """Read master geometry without retaining the image in RAM."""
     with fits.open(filepath, memmap=True, ignore_missing_end=True) as hdul:
         for index, hdu in enumerate(hdul):
-            if hdu.is_image and hdu.shape is not None and len(hdu.shape) == 2:
+            if hdu.is_image and hdu.name not in {"VALID_MASK", "SAT_MASK", "DISAGREE", "HDR_META"} and hdu.shape is not None and len(hdu.shape) == 2:
                 return tuple(hdu.shape), _sanitize_float_header(hdu.header), index
     raise ValueError(f"Imagem 2D não encontrada em {filepath.name}")
 
@@ -136,6 +137,8 @@ def save_uint16_fits(
     output_path: Path,
     data_min: float,
     data_max: float,
+    valid_mask: np.ndarray | None = None,
+    sat_mask: np.ndarray | None = None,
 ) -> None:
     """Persist a FITS 16-bit image using the provided shared value range."""
     output_path.parent.mkdir(
@@ -157,14 +160,18 @@ def save_uint16_fits(
     )
 
     hdul = fits.HDUList([hdu])
-
-    hdul.writeto(
-        str(output_path),
-        overwrite=True,
-        output_verify="ignore",
-    )
-
-    hdul.close()
+    if valid_mask is not None:
+        hdul.append(fits.ImageHDU(np.asarray(valid_mask, np.uint8), name="VALID_MASK"))
+    if sat_mask is not None:
+        hdul.append(fits.ImageHDU(np.asarray(sat_mask, np.uint8), name="SAT_MASK"))
+    fd, temporary = tempfile.mkstemp(prefix=f".{output_path.name}.", suffix=".tmp", dir=output_path.parent)
+    os.close(fd)
+    try:
+        hdul.writeto(temporary, overwrite=True, output_verify="ignore")
+        os.replace(temporary, output_path)
+    finally:
+        hdul.close()
+        Path(temporary).unlink(missing_ok=True)
 
 
 def _safe_median(data: np.ndarray) -> float:
@@ -293,6 +300,18 @@ def calibrate_single_frame(
 
     try:
         data, header = load_fits_data(light_path)
+        from app.infrastructure.fits_masks import read_science_masks
+        spatial_shape = data.shape[-2:] if data.ndim == 3 else data.shape
+        valid, saturated = read_science_masks(light_path, spatial_shape)
+        threshold = header.get("SATURATE", header.get("SATLEVEL"))
+        if threshold is not None:
+            clipped = data >= float(threshold)
+            saturated |= np.any(clipped, axis=0) if data.ndim == 3 else clipped
+            header["SATKNOWN"] = True
+        # The calibrated plane will have a different encoding; preserve the
+        # source classification in a mask, never reuse its numeric threshold.
+        header.remove("SATURATE", ignore_missing=True)
+        header.remove("SATLEVEL", ignore_missing=True)
 
         if master_dark is not None and master_dark.shape != data.shape:
             raise ValueError(f"Master Dark possui dimensão incompatível: {master_dark.shape} vs {data.shape}")
@@ -314,7 +333,9 @@ def calibrate_single_frame(
         # Eles podem indicar problema real no Flat/Dark e não devem ser
         # escondidos nesta etapa do workflow.
 
-        save_uint16_fits(data, header, out_path, *normalization_range)
+        finite = np.isfinite(data)
+        valid &= np.all(finite, axis=0) if data.ndim == 3 else finite
+        save_uint16_fits(data, header, out_path, *normalization_range, valid_mask=valid, sat_mask=saturated)
 
         return None
 
@@ -366,6 +387,9 @@ def run_calibration_pipeline(
     """
 
     input_dir = Path(config["input_dir"])
+    for enabled, key in (("apply_dark", "dark_path"), ("apply_flat", "flat_path")):
+        if config.get(enabled) and (not config.get(key) or not Path(config[key]).exists()):
+            raise ValueError(f"{key}: caminho de calibração obrigatório e válido")
 
     output_dir = Path(config["output_dir"])
 
@@ -601,3 +625,6 @@ def run_calibration_pipeline(
         f"{skipped} ignorados, "
         f"{failed} erros. <<<\n"
     )
+    return {"status": "partial" if failed and saved else "failed" if failed else "success",
+            "saved": saved, "skipped": skipped, "failed": failed,
+            "message": f"Calibration: {saved} salvos, {skipped} ignorados, {failed} erros."}

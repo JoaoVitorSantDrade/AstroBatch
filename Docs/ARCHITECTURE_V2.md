@@ -1,5 +1,37 @@
 # AstroBatch V2 Architecture Path
 
+## Implemented migration foundation (2026-09-05)
+
+The following are now active code paths, superseding the corresponding
+"next" steps in the historical sequence below:
+
+- `app/application/runner.py`: one worker/cancellation/completion policy for
+  all six stages, immutable progress/results, coalesced progress and UI polling.
+- `app/application/pipelines.py`: lazy pipeline adapters with explicit success,
+  partial, failed and cancelled outcomes. Workers do not call Tk.
+- `app/application/commands.py`: validated resource settings independent of Tk.
+- `app/application/log_buffer.py`: bounded, nonblocking recent activity.
+- `app/infrastructure/json_store.py`: versioned settings and atomic JSON writes.
+- `app/infrastructure/fits_masks.py`: shared scientific mask loading.
+- `views/hdr_model.py` and `views/hdr_view.py`: first passive form, supplied
+  variables and commands without a reference to the root controller.
+- `views/scrollable_host.py`: reusable scoped scrolling for legacy and new forms.
+
+`main.py` composes these pieces and retains compatibility worker entry points.
+It still owns the other form variables and preview/anchor dialogs. This is an
+incremental migration, not a completed separation of every view and command.
+
+For a new feature, add its domain callable and validated command, adapt its
+result in `execute_pipeline`, provide a passive view model, and register its
+view/buttons in the composition root. Do not create another per-stage thread,
+Tk callback from a worker, or independent settings writer. Test its adapter and
+command without Tk, then test the native form binding and shared lifecycle.
+
+Next: migrate the remaining views and preview lifecycle, extract the remaining
+typed commands, then consolidate stage registration. Preserve field parity
+before changing the visual design. Current verification is recorded in
+`Docs/WORKFLOW_REVIEW.md` (126 tests passed for this delivery).
+
 ## Why change now
 
 The application currently works as a single Tk controller: `main.py` owns Tk

@@ -165,7 +165,15 @@ class AlignView(BaseAstroView):
 
         # 4. Ações
         actions = ttk.Frame(self)
-        actions.grid(row=3, column=0, sticky="ew")
+        quality = ttk.LabelFrame(self, text="Verificação após alinhamento", padding=8)
+        quality.grid(row=3, column=0, sticky="ew", pady=5)
+        ttk.Checkbutton(quality, text="Rejeitar desalinhamento residual", variable=self.app.align_quality_gate_var).grid(row=0, column=0, sticky="w")
+        for column, label, variable in (
+            (1, "Desvio máx. (px)", self.app.align_quality_shift_var),
+        ):
+            ttk.Label(quality, text=label).grid(row=0, column=column, padx=6)
+            ttk.Entry(quality, textvariable=variable, width=12).grid(row=1, column=column, padx=6)
+        actions.grid(row=4, column=0, sticky="ew")
 
         self.app.btn_run_align, self.app.btn_cancel_align = self._action_bar(
             actions,
