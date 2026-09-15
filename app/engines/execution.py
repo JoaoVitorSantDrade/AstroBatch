@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 import math
 
+from cpu_runtime import physical_core_count, recommended_numba_threads
+
 
 def science_frame_bytes(path: Path) -> int:
     """Float32 science-plane size, inspecting headers without decoding pixels."""
@@ -25,9 +27,19 @@ class ExecutionBudget:
     kernel_parallel: bool
     in_flight_limit: int | None = None
 
+    @property
+    def kernel_threads(self) -> int:
+        """Threads available to an independent Numba reduction.
+
+        Frame workers own the CPU when more than one worker is active; only a
+        single-worker reduction may use the physical-core Numba pool.
+        """
+
+        return recommended_numba_threads() if self.kernel_parallel else 1
+
     @classmethod
     def for_pipeline(cls, worker_count: int) -> "ExecutionBudget":
-        workers = max(1, int(worker_count))
+        workers = max(1, min(8, physical_core_count(), int(worker_count)))
         # Parallel kernels are reserved for the final single-worker reduction.
         # Frame/leaf parallelism otherwise owns the available CPU cores.
         return cls(worker_count=workers, kernel_parallel=workers == 1)
@@ -36,7 +48,7 @@ class ExecutionBudget:
     def for_frame_pipeline(cls, requested_workers: int, memory_budget_mb: int,
                            frame_bytes: int, reserved_frames: int = 2) -> "ExecutionBudget":
         """Return a conservative CPU/in-flight budget for frame pipelines."""
-        workers = max(1, int(requested_workers))
+        workers = max(1, min(8, physical_core_count(), int(requested_workers)))
         budget = max(64, int(memory_budget_mb)) * 1024 * 1024
         slots = int(budget // max(int(frame_bytes), 1))
         available = slots - max(int(reserved_frames), 0)
@@ -51,3 +63,11 @@ class ExecutionBudget:
     @property
     def max_in_flight(self) -> int:
         return self.in_flight_limit if self.in_flight_limit is not None else self.worker_count * 2
+
+    def as_dict(self) -> dict[str, int | bool]:
+        return {
+            "worker_count": self.worker_count,
+            "kernel_parallel": self.kernel_parallel,
+            "kernel_threads": self.kernel_threads,
+            "max_in_flight": self.max_in_flight,
+        }

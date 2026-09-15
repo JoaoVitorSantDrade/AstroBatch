@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import numpy as np
 
-from frame_quality import measure_star_shapes
+from frame_quality import _median_finite, measure_star_shapes
 
 
 def _add_gaussian(image: np.ndarray, x: float, y: float, sx: float, sy: float) -> None:
@@ -15,6 +15,13 @@ def _add_gaussian(image: np.ndarray, x: float, y: float, sx: float, sy: float) -
 
 
 class FrameQualityTests(unittest.TestCase):
+    def test_finite_median_matches_numpy_for_shape_vectors(self) -> None:
+        rng = np.random.default_rng(922)
+        for dtype in (np.float32, np.float64):
+            for size in range(1, 290):
+                values = rng.normal(size=size).astype(dtype)
+                self.assertEqual(_median_finite(values), float(np.median(values)))
+
     def test_circular_stars_are_round_and_trailed_stars_are_elongated(self) -> None:
         coords = np.asarray(
             [[20, 20], [40, 20], [60, 20], [20, 40], [40, 40], [60, 40], [20, 60], [40, 60], [60, 60]],

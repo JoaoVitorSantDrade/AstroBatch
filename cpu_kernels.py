@@ -1,13 +1,22 @@
 """CPU kernels with deterministic, cacheable Numba compilation.
 
-Kernels deliberately avoid ``fastmath`` and parallel reductions: numerical
-compatibility takes priority over reassociation-based SIMD speedups.
+Kernels deliberately avoid ``fastmath`` and keep every per-pixel frame/leaf
+traversal in its established order. Independent output pixels may be split
+with ``prange`` once the working set is large enough to amortize scheduling.
 """
 
 from __future__ import annotations
 
 import numpy as np
 from numba import njit, prange
+
+from cpu_runtime import configure_numba_threads, configure_opencv_threads
+
+
+# Parallel scheduling is worthwhile only once a leaf contains several million
+# pixel comparisons; below that point the launch overhead is slower than the
+# serial, cache-friendly traversal.
+_PARALLEL_MIN_ELEMENTS = 4 * 1024 * 1024
 
 
 def as_c_float32(values: np.ndarray) -> np.ndarray:
@@ -20,7 +29,7 @@ def as_c_uint8(values: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(values, dtype=np.uint8)
 
 
-@njit(cache=True)
+@njit(cache=True, nogil=True)
 def _calibrate_inplace(
     data: np.ndarray,
     dark: np.ndarray,
@@ -63,7 +72,7 @@ def calibrate_inplace(
     return data
 
 
-@njit(cache=True)
+@njit(cache=True, nogil=True)
 def _masked_extrema(
     values: np.ndarray, masks: np.ndarray, maximum: bool
 ) -> np.ndarray:
@@ -83,12 +92,48 @@ def _masked_extrema(
     return result
 
 
-def masked_extrema(values: np.ndarray, masks: np.ndarray, maximum: bool) -> np.ndarray:
+@njit(cache=True, parallel=True, nogil=True)
+def _masked_extrema_parallel(
+    values: np.ndarray, masks: np.ndarray, maximum: bool
+) -> np.ndarray:
+    """Independent-pixel extrema with stable frame traversal.
+
+    ``prange`` distributes output rows, while the frame loop remains in the
+    same order as ``_masked_extrema``.  This preserves bitwise selection
+    semantics and lets Numba/LLVM use the host SIMD path for large planes.
+    """
+
+    frames, height, width = values.shape
+    result = np.empty((height, width), dtype=np.float32)
+    for y in prange(height):
+        for x in range(width):
+            found = False
+            candidate = np.float32(0.0)
+            for frame in range(frames):
+                value = values[frame, y, x]
+                if masks[frame, y, x] != 0 and not np.isnan(value):
+                    if not found or (value > candidate if maximum else value < candidate):
+                        candidate = value
+                        found = True
+            result[y, x] = candidate if found else np.nan
+    return result
+
+
+def masked_extrema(
+    values: np.ndarray,
+    masks: np.ndarray,
+    maximum: bool,
+    parallel: bool = False,
+) -> np.ndarray:
     """Bitwise-safe masked min/max: selections, not reordered reductions."""
-    return _masked_extrema(as_c_float32(values), as_c_uint8(masks), maximum)
+    prepared_values = as_c_float32(values)
+    prepared_masks = as_c_uint8(masks)
+    if parallel and prepared_values.size >= _PARALLEL_MIN_ELEMENTS:
+        return _masked_extrema_parallel(prepared_values, prepared_masks, maximum)
+    return _masked_extrema(prepared_values, prepared_masks, maximum)
 
 
-@njit(cache=True)
+@njit(cache=True, nogil=True)
 def _masked_sum_count(values: np.ndarray, masks: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     frames, height, width = values.shape
     totals = np.zeros((height, width), dtype=np.float32)
@@ -103,7 +148,7 @@ def _masked_sum_count(values: np.ndarray, masks: np.ndarray) -> tuple[np.ndarray
     return totals, counts
 
 
-@njit(cache=True, parallel=True)
+@njit(cache=True, parallel=True, nogil=True)
 def _masked_sum_count_parallel(
     values: np.ndarray, masks: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -130,12 +175,12 @@ def masked_sum_count(
     """One-pass masked reduction without allocating a temporary ``where`` array."""
     prepared_values = as_c_float32(values)
     prepared_masks = as_c_uint8(masks)
-    if parallel:
+    if parallel and prepared_values.size >= _PARALLEL_MIN_ELEMENTS:
         return _masked_sum_count_parallel(prepared_values, prepared_masks)
     return _masked_sum_count(prepared_values, prepared_masks)
 
 
-@njit(cache=True)
+@njit(cache=True, nogil=True)
 def _apply_scale_and_mask(data: np.ndarray, mask: np.ndarray, factor: np.float32) -> None:
     height, width = data.shape
     for y in range(height):
@@ -156,7 +201,7 @@ def apply_scale_and_mask_inplace(
     return data
 
 
-@njit(cache=True, parallel=True)
+@njit(cache=True, parallel=True, nogil=True)
 def _weighted_merge_mono(values: np.ndarray, counts: np.ndarray) -> np.ndarray:
     leaves, height, width = values.shape
     result = np.zeros((height, width), dtype=np.float32)
@@ -173,11 +218,50 @@ def _weighted_merge_mono(values: np.ndarray, counts: np.ndarray) -> np.ndarray:
     return result
 
 
-@njit(cache=True, parallel=True)
+@njit(cache=True, parallel=True, nogil=True)
 def _weighted_merge_rgb(values: np.ndarray, counts: np.ndarray) -> np.ndarray:
     leaves, channels, height, width = values.shape
     result = np.zeros((channels, height, width), dtype=np.float32)
     for y in prange(height):
+        for x in range(width):
+            total = np.uint32(0)
+            for leaf in range(leaves):
+                total += counts[leaf, y, x]
+            if total > 0:
+                for channel in range(channels):
+                    numerator = np.float32(0.0)
+                    for leaf in range(leaves):
+                        numerator += values[leaf, channel, y, x] * counts[leaf, y, x]
+                    result[channel, y, x] = numerator / total
+    return result
+
+
+@njit(cache=True, nogil=True)
+def _weighted_merge_mono_serial(values: np.ndarray, counts: np.ndarray) -> np.ndarray:
+    """Serial counterpart with the same leaf traversal as the parallel path."""
+
+    leaves, height, width = values.shape
+    result = np.zeros((height, width), dtype=np.float32)
+    for y in range(height):
+        for x in range(width):
+            numerator = np.float32(0.0)
+            total = np.uint32(0)
+            for leaf in range(leaves):
+                count = counts[leaf, y, x]
+                numerator += values[leaf, y, x] * count
+                total += count
+            if total > 0:
+                result[y, x] = numerator / total
+    return result
+
+
+@njit(cache=True, nogil=True)
+def _weighted_merge_rgb_serial(values: np.ndarray, counts: np.ndarray) -> np.ndarray:
+    """Serial RGB merge used below the parallel launch threshold."""
+
+    leaves, channels, height, width = values.shape
+    result = np.zeros((channels, height, width), dtype=np.float32)
+    for y in range(height):
         for x in range(width):
             total = np.uint32(0)
             for leaf in range(leaves):
@@ -196,19 +280,31 @@ def weighted_merge(values: np.ndarray, counts: np.ndarray) -> np.ndarray:
     values = as_c_float32(values)
     counts = np.ascontiguousarray(counts, dtype=np.uint32)
     if values.ndim == 3:
-        return _weighted_merge_mono(values, counts)
+        if values.size >= _PARALLEL_MIN_ELEMENTS:
+            return _weighted_merge_mono(values, counts)
+        return _weighted_merge_mono_serial(values, counts)
     if values.ndim == 4:
-        return _weighted_merge_rgb(values, counts)
+        if values.size >= _PARALLEL_MIN_ELEMENTS:
+            return _weighted_merge_rgb(values, counts)
+        return _weighted_merge_rgb_serial(values, counts)
     raise ValueError("substack values must be mono or RGB")
 
 
 def warm_cpu_kernels() -> None:
     """Compile representative signatures in a background startup worker."""
+    configure_opencv_threads(1)
+    configure_numba_threads()
     sample = np.ones((4, 4), dtype=np.float32)
     calibrate_inplace(sample.copy(), sample, sample)
     values = np.ones((2, 4, 4), dtype=np.float32)
     masks = np.ones(values.shape, dtype=np.uint8)
     masked_extrema(values, masks, True)
+    # Cross the production threshold so the cached parallel dispatchers are
+    # compiled during startup rather than on the first user stack.
+    parallel_values = np.ones((16, 512, 512), dtype=np.float32)
+    parallel_masks = np.ones(parallel_values.shape, dtype=np.uint8)
+    _masked_extrema_parallel(parallel_values, parallel_masks, True)
     masked_sum_count(values, masks)
+    masked_sum_count(parallel_values, parallel_masks, parallel=True)
     apply_scale_and_mask_inplace(sample.copy(), np.ones(sample.shape, dtype=np.uint8), 1.0)
     weighted_merge(values, np.ones((2, 4, 4), dtype=np.uint32))

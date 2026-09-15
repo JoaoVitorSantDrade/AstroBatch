@@ -11,6 +11,7 @@ from app.application.pipelines import execute_pipeline
 from app.application.commands import AlignCommand, BatchCommand, CalibrationCommand, FlowCommand, HDRCommand, ReferenceChangeCommand, StackCommand
 from app.application.log_buffer import ActivityBuffer
 from app.infrastructure.json_store import SettingsRepository
+from views.flow_model import FlowViewModel
 
 
 class RunnerTests(unittest.TestCase):
@@ -60,6 +61,29 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result.outcome, "success")
         self.assertEqual(run.call_args.args[0], command.batch_dir)
         self.assertEqual(run.call_args.args[1], command.to_legacy_config())
+
+    def test_flow_command_validates_temporal_controls_and_preserves_defaults(self):
+        values = dict(
+            custom_anchors={}, global_master="Auto", fwhm=4, sigma=5,
+            matching_radius=15, ransac=3, debug_images=False,
+            min_stars=4, min_inliers=4, min_ratio=.15, max_stars=150,
+            engine="DAO", engine_profile="Stable", detector_engine="",
+            transform_fallback="Disabled", memory_budget_mb=512, flow_workers=2,
+        )
+        command = FlowCommand.from_values("batch", **values)
+        config = command.to_legacy_config()
+        self.assertTrue(config["temporal_analysis_enabled"])
+        self.assertEqual(config["temporal_gap_minutes"], 15.0)
+        self.assertEqual(config["temporal_seeing_sigma"], 3.0)
+        with self.assertRaises(ValueError):
+            FlowCommand.from_values("batch", **values, temporal_gap_minutes=0)
+
+    def test_flow_view_model_keeps_legacy_positional_constructor_order(self):
+        values = [object() for _ in range(16)]
+        model = FlowViewModel(*values)
+        self.assertIs(model.resource_workers_var, values[15])
+        self.assertEqual(model.custom_anchors, {})
+        self.assertIsNone(model.flow_temporal_enabled_var)
 
     def test_align_command_adapter_preserves_legacy_arguments(self):
         command = AlignCommand.from_values(

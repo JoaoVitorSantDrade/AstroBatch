@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 import numpy as np
 from astropy.io import fits
 import astroalign_logic as align
@@ -9,6 +10,34 @@ from hdr_logic import run_hdr_pipeline
 
 
 class ScienceMaskChainTests(unittest.TestCase):
+    def test_combined_alignment_loader_reads_masks_in_one_fits_open(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            rgb = np.zeros((3, 12, 16), np.uint16)
+            valid = np.ones((12, 16), np.uint8)
+            valid[2, 3] = 0
+            saturated = np.zeros((12, 16), np.uint8)
+            saturated[5, 7] = 1
+            path = root / "rgb.fits"
+            fits.HDUList(
+                [
+                    fits.PrimaryHDU(rgb),
+                    fits.ImageHDU(valid, name="VALID_MASK"),
+                    fits.ImageHDU(saturated, name="SAT_MASK"),
+                ]
+            ).writeto(path)
+
+            with patch.object(align.fits, "open", wraps=align.fits.open) as open_mock:
+                data, _header, combined_valid, combined_sat = (
+                    align.load_fits_data_and_masks(path)
+                )
+
+            self.assertEqual(open_mock.call_count, 1)
+            self.assertEqual(data.shape, (12, 16, 3))
+            legacy_valid, legacy_sat = align.load_fits_masks(path, data.shape)
+            np.testing.assert_array_equal(combined_valid, legacy_valid)
+            np.testing.assert_array_equal(combined_sat, legacy_sat)
+
     def test_calibration_align_hdr_preserve_sensor_clipping(self):
         with tempfile.TemporaryDirectory() as td:
             root=Path(td); calibrated=root/'cal'; calibrated.mkdir(); output=root/'aligned'

@@ -1,4 +1,5 @@
 *.json
+*.prof
 .venv
 __pycache__
 original_example/

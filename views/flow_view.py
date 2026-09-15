@@ -252,6 +252,37 @@ class FlowView(BaseAstroView):
         )
         self.btn_cancel_flow.grid(row=0, column=3, sticky="e", ipady=3)
 
+        # ============================================================
+        # CARD 3: análise temporal (metadata-only)
+        # ============================================================
+        temporal = ttk.LabelFrame(
+            self,
+            text="3. Sessão temporal e seeing (somente revisão)",
+            style="Section.TLabelframe",
+            padding=10,
+        )
+        temporal.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        temporal.columnconfigure(4, weight=1)
+        ttk.Checkbutton(
+            temporal,
+            text="Gerar agrupamento por DATE-OBS",
+            variable=self.model.flow_temporal_enabled_var,
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(temporal, text="Pausa (min):").grid(row=0, column=2, sticky="e", padx=(12, 4))
+        ttk.Entry(temporal, textvariable=self.model.flow_temporal_gap_var, width=8).grid(row=0, column=3, sticky="w")
+        ttk.Label(temporal, text="Sigma robusto:").grid(row=0, column=4, sticky="e", padx=(12, 4))
+        ttk.Entry(temporal, textvariable=self.model.flow_temporal_seeing_sigma_var, width=8).grid(row=0, column=5, sticky="w")
+        ttk.Label(
+            temporal,
+            text="Frames sem horário ficam marcados como desconhecidos; nenhuma exclusão é automática.",
+            style="Muted.TLabel",
+        ).grid(row=1, column=0, columnspan=5, sticky="w", pady=(6, 0))
+        ttk.Button(
+            temporal,
+            text="📊 Ver análise da sessão",
+            command=self.model.show_temporal_analysis,
+        ).grid(row=1, column=5, sticky="e", pady=(6, 0))
+
         # Container de Thumbnails
         self._build_reference_preview(self)
 
@@ -363,6 +394,9 @@ class FlowView(BaseAstroView):
                 engine_profile=self.model.flow_profile_var.get(),
                 detector_engine=self.model.flow_detector_engine_var.get(),
                 transform_fallback=self.model.flow_transform_fallback_var.get(),
+                temporal_analysis_enabled=self.model.flow_temporal_enabled_var.get(),
+                temporal_gap_minutes=self.model.flow_temporal_gap_var.get(),
+                temporal_seeing_sigma=self.model.flow_temporal_seeing_sigma_var.get(),
                 memory_budget_mb=self.model.resource_memory_var.get(),
                 flow_workers=self.model.resource_workers_var.get(),
                 skip_local_flow=True,

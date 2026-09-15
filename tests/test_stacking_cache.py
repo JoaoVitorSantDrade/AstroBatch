@@ -136,19 +136,52 @@ class FitsCacheTests(unittest.TestCase):
         self.assertEqual(stats.hits, 0)
         self.assertEqual(stacking.inspect_fits(second_frame.path).height, 4)
 
-    def test_scaled_uncompressed_frame_is_read_directly(self) -> None:
+    def test_scaled_uncompressed_frame_uses_raw_storage_cache(self) -> None:
         source = self.root / "scaled.fits"
         self._write_scaled_frame(source)
 
         frame, stats = self._cache_once(source)
 
-        self.assertEqual(stats.direct, 1)
-        self.assertEqual(stats.rebuilt, 0)
-        self.assertEqual(frame.path, source)
-        self.assertFalse(stacking.inspect_fits(source).science_compressed)
-        self.assertFalse(self.cache_dir.exists())
+        self.assertEqual(stats.scaled, 1)
+        self.assertEqual(stats.rebuilt, 1)
+        self.assertNotEqual(frame.path, source)
+        self.assertTrue(stacking.inspect_fits(source).requires_scaling)
+        cached_geometry = stacking.inspect_fits(frame.path)
+        self.assertTrue(cached_geometry.cache_raw_storage)
+        self.assertFalse(cached_geometry.requires_scaling)
 
-    def test_mixed_sources_only_cache_the_compressed_science_frame(self) -> None:
+        with fits.open(
+            source,
+            memmap=False,
+            do_not_scale_image_data=False,
+        ) as original_hdul:
+            original = np.array(original_hdul[0].data, dtype=np.float32, copy=True)
+        with fits.open(
+            frame.path,
+            memmap=True,
+            do_not_scale_image_data=True,
+        ) as cached_hdul:
+            raw = np.array(cached_hdul[0].data, copy=True)
+        restored = stacking._restore_cached_physical_values(raw, cached_geometry)
+        self.assertTrue(np.array_equal(original, restored))
+
+    def test_streaming_raw_scaling_matches_astropy_without_cache(self) -> None:
+        source = self.root / "scaled-stream.fits"
+        self._write_scaled_frame(source)
+        geometry = stacking.inspect_fits(source)
+
+        with stacking._open_streaming_fits(source, geometry) as hdul:
+            raw = stacking._read_hdu_section(
+                hdul[geometry.hdu_index],
+                (slice(1, 3), slice(1, 4)),
+            )
+            restored = stacking._restore_streaming_physical_values(raw, geometry)
+        with fits.open(source, memmap=False, do_not_scale_image_data=False) as hdul:
+            expected = np.asarray(hdul[geometry.hdu_index].data[1:3, 1:4], dtype=np.float32)
+
+        self.assertTrue(np.array_equal(restored, expected, equal_nan=True))
+
+    def test_mixed_sources_cache_scaled_and_compressed_science_frames(self) -> None:
         compressed = self.root / "compressed.fits"
         uncompressed = self.root / "scaled.fits"
         self._write_compressed_frame(compressed)
@@ -164,10 +197,10 @@ class FitsCacheTests(unittest.TestCase):
             None,
         )
 
-        self.assertEqual(stats.rebuilt, 1)
-        self.assertEqual(stats.direct, 1)
+        self.assertEqual(stats.rebuilt, 2)
+        self.assertEqual(stats.scaled, 1)
         self.assertNotEqual(compressed_frame.path, compressed)
-        self.assertEqual(uncompressed_frame.path, uncompressed)
+        self.assertNotEqual(uncompressed_frame.path, uncompressed)
 
     def test_discovery_ignores_input_sidecar_cache(self) -> None:
         source = self.root / "frame.fits"

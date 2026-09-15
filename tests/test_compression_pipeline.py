@@ -62,6 +62,9 @@ class CompressionPipelineTests(unittest.TestCase):
 
         np.testing.assert_allclose(compressed_result, uncompressed_result)
         self.assertTrue((compressed_input / stacking.FITS_CACHE_DIR_NAME).is_dir())
+        # Aligned camera-compatible uint16 FITS use BZERO=32768 even when
+        # tile compression is disabled.  The streaming path now mmaps their
+        # raw storage directly, so no second on-disk cache is needed.
         self.assertFalse((uncompressed_input / stacking.FITS_CACHE_DIR_NAME).exists())
 
     def test_rgb_median_stack_reduces_substacks_channel_by_channel(self) -> None:

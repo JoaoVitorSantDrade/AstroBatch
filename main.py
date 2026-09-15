@@ -87,8 +87,14 @@ class AstroProcessManager(tk.Tk):
         def warm() -> None:
             try:
                 from cpu_kernels import warm_cpu_kernels
+                from cpu_runtime import runtime_info
 
                 warm_cpu_kernels()
+                info = runtime_info()
+                self.log_queue.put(
+                    f"[CPU] SIMD={info.simd_level} | núcleos físicos={info.physical_cores} | "
+                    f"threads Numba={info.numba_threads}\n"
+                )
             except Exception as exc:
                 self.log_queue.put(f"[CPU] Kernel warm-up unavailable: {exc}\n")
 
@@ -151,6 +157,9 @@ class AstroProcessManager(tk.Tk):
         self.flow_profile_var = tk.StringVar(value="Stable")
         self.flow_detector_engine_var = tk.StringVar(value="")
         self.flow_transform_fallback_var = tk.StringVar(value="Disabled")
+        self.flow_temporal_enabled_var = tk.BooleanVar(value=True)
+        self.flow_temporal_gap_var = tk.DoubleVar(value=15.0)
+        self.flow_temporal_seeing_sigma_var = tk.DoubleVar(value=3.0)
 
         # ---------- AstroAlign ----------
         self.align_output_dir_var = tk.StringVar()
@@ -248,6 +257,9 @@ class AstroProcessManager(tk.Tk):
                 "engine_profile": self.flow_profile_var,
                 "detector_engine": self.flow_detector_engine_var,
                 "transform_fallback": self.flow_transform_fallback_var,
+                "temporal_analysis_enabled": self.flow_temporal_enabled_var,
+                "temporal_gap_minutes": self.flow_temporal_gap_var,
+                "temporal_seeing_sigma": self.flow_temporal_seeing_sigma_var,
             },
             "AstroAlign": {
                 "output_dir": self.align_output_dir_var,
@@ -515,6 +527,9 @@ class AstroProcessManager(tk.Tk):
             "flow_profile": self.flow_profile_var,
             "flow_detector_engine": self.flow_detector_engine_var,
             "flow_transform_fallback": self.flow_transform_fallback_var,
+            "flow_temporal_enabled": self.flow_temporal_enabled_var,
+            "flow_temporal_gap": self.flow_temporal_gap_var,
+            "flow_temporal_seeing_sigma": self.flow_temporal_seeing_sigma_var,
             "resource_memory": self.resource_memory_var,
             "resource_workers": self.resource_workers_var,
             "align_output_dir": self.align_output_dir_var,
@@ -574,6 +589,7 @@ class AstroProcessManager(tk.Tk):
             "open_anchor_selector": self.open_anchor_selector,
             "show_astroflow_preview": self.show_astroflow_preview,
             "show_flow_visualization": self.show_flow_visualization,
+            "show_temporal_analysis": self.show_temporal_analysis,
             "save_settings": self.save_settings,
             "print_to_console": self.print_to_console,
             "start_operation": self._start_operation,
@@ -1040,6 +1056,9 @@ class AstroProcessManager(tk.Tk):
                 engine_profile=self.flow_profile_var.get(),
                 detector_engine=self.flow_detector_engine_var.get(),
                 transform_fallback=self.flow_transform_fallback_var.get(),
+                temporal_analysis_enabled=self.flow_temporal_enabled_var.get(),
+                temporal_gap_minutes=self.flow_temporal_gap_var.get(),
+                temporal_seeing_sigma=self.flow_temporal_seeing_sigma_var.get(),
                 memory_budget_mb=self.resource_memory_var.get(),
                 flow_workers=self.resource_workers_var.get(),
             )
@@ -1495,6 +1514,122 @@ class AstroProcessManager(tk.Tk):
         toolbar.update()
 
         canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+    def show_temporal_analysis(self):
+        """Show the metadata-only DATE-OBS/seeing report for the session."""
+
+        import json
+        from datetime import datetime
+
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+        from matplotlib.figure import Figure
+
+        base_dir = Path(self.batch_dir_var.get()).expanduser().resolve()
+        if not base_dir.is_dir():
+            messagebox.showerror("Análise temporal", "Selecione uma Pasta Base válida.", parent=self)
+            return
+
+        report_path = base_dir / "temporal_analysis.json"
+        try:
+            if report_path.exists():
+                report = json.loads(report_path.read_text(encoding="utf-8"))
+            else:
+                from temporal_analysis import build_session_temporal_report
+
+                report = build_session_temporal_report(
+                    base_dir,
+                    self.flow_temporal_gap_var.get(),
+                    self.flow_temporal_seeing_sigma_var.get(),
+                )
+        except Exception as exc:
+            messagebox.showerror("Análise temporal", f"Falha ao ler o relatório:\n{exc}", parent=self)
+            return
+
+        batches = report.get("batches", []) if isinstance(report, dict) else []
+        points: list[tuple[datetime, float | None, float | None, str]] = []
+        suggested: list[str] = []
+        suggested_windows: list[tuple[datetime, datetime]] = []
+        unknown = 0
+        for batch in batches:
+            batch_name = str(batch.get("batch", "batch"))
+            unknown += len(batch.get("unknown_timestamp_frames", []) or [])
+            for frame in batch.get("frames", []) or []:
+                stamp = frame.get("timestamp_utc")
+                if not stamp or frame.get("timestamp_state") != "valid":
+                    continue
+                try:
+                    when = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+                except ValueError:
+                    continue
+                points.append((when, frame.get("quality"), frame.get("fwhm"), batch_name))
+
+        # Prefer the flattened session groups when available so a review span
+        # can cross a batch boundary; older sidecars still use per-batch groups.
+        groups_for_review = report.get("groups") if isinstance(report, dict) else None
+        if not isinstance(groups_for_review, list):
+            groups_for_review = [
+                {**group, "_batch_name": str(batch.get("batch", "batch"))}
+                for batch in batches
+                for group in batch.get("groups", []) or []
+            ]
+        for group in groups_for_review:
+            quality = group.get("quality") or {}
+            if not quality.get("review_suggested"):
+                continue
+            batch_name = str(group.get("_batch_name", "sessão"))
+            suggested.append(f"{batch_name}/{group.get('id', 'group')}")
+            try:
+                start = datetime.fromisoformat(str(group["start"]).replace("Z", "+00:00"))
+                end = datetime.fromisoformat(str(group["end"]).replace("Z", "+00:00"))
+                suggested_windows.append((start, end))
+            except (KeyError, TypeError, ValueError):
+                pass
+
+        if not points:
+            messagebox.showwarning(
+                "Análise temporal",
+                "Nenhum DATE-OBS válido foi encontrado nos frames.",
+                parent=self,
+            )
+            return
+
+        points.sort(key=lambda item: item[0])
+        win = tk.Toplevel(self)
+        win.title("AstroFlow — análise temporal e seeing")
+        win.geometry("980x700")
+        win.minsize(700, 500)
+        info = ttk.Frame(win, padding=10)
+        info.pack(fill=tk.X)
+        note = "revisão manual; nenhum frame foi excluído"
+        if suggested:
+            note += f" • {len(suggested)} grupo(s) sugerido(s)"
+        if unknown:
+            note += f" • {unknown} frame(s) sem horário"
+        ttk.Label(info, text=f"{len(points)} frames temporizados • {note}", style="Muted.TLabel").pack(anchor="w")
+
+        fig = Figure(figsize=(9, 6), dpi=90)
+        quality_ax = fig.add_subplot(211)
+        fwhm_ax = fig.add_subplot(212, sharex=quality_ax)
+        x = [item[0] for item in points]
+        quality = [float(item[1]) if item[1] is not None else np.nan for item in points]
+        fwhm = [float(item[2]) if item[2] is not None else np.nan for item in points]
+        quality_ax.plot(x, quality, marker=".", linestyle="-", color="#2563eb", linewidth=1)
+        for start, end in suggested_windows:
+            quality_ax.axvspan(start, end, color="#dc2626", alpha=0.14, zorder=0)
+        quality_ax.set_ylabel("Qualidade")
+        quality_ax.set_title("Tendência temporal (métricas aproximadas do Flow)")
+        quality_ax.grid(True, alpha=0.25)
+        fwhm_ax.plot(x, fwhm, marker=".", linestyle="-", color="#d97706", linewidth=1)
+        for start, end in suggested_windows:
+            fwhm_ax.axvspan(start, end, color="#dc2626", alpha=0.14, zorder=0)
+        fwhm_ax.set_ylabel("FWHM (px)")
+        fwhm_ax.set_xlabel("DATE-OBS (UTC)")
+        fwhm_ax.grid(True, alpha=0.25)
+        fig.autofmt_xdate()
+        fig.tight_layout()
+        canvas = FigureCanvasTkAgg(fig, master=win)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
 
     def open_anchor_selector(self, target_batch=None):
         """Delegate Flow reference selection to its presentation controller."""

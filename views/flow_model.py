@@ -40,3 +40,9 @@ class FlowViewModel:
     start_flow_processing: Callable | None = None
     cancel_processing: Callable | None = None
     _start_operation: Callable | None = None
+    # Append optional fields so every pre-temporal positional constructor
+    # keeps exactly the same argument order.
+    flow_temporal_enabled_var: Any = None
+    flow_temporal_gap_var: Any = None
+    flow_temporal_seeing_sigma_var: Any = None
+    show_temporal_analysis: Callable | None = None

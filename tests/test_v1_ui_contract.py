@@ -14,6 +14,7 @@ class V1UiContractTests(unittest.TestCase):
             "apply_dark_var", "apply_flat_var", "calib_overwrite_var",
             "opt_method_var", "crop_size_var", "downsample_method_var", "threshold_var",
             "flow_engine_var", "flow_fwhm_var", "flow_sigma_var", "flow_matching_radius_var",
+            "flow_temporal_enabled_var", "flow_temporal_gap_var", "flow_temporal_seeing_sigma_var",
             "align_debayer_pattern_var", "align_interpolation_var", "align_rgb_registration_var",
             "stack_selection_mode_var", "stack_method_var", "stack_rejection_method_var",
             "stack_normalize_var", "stack_output_name_var", "stack_compress_var",

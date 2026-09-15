@@ -14,6 +14,49 @@ _MAX_SHAPE_STARS = 64
 _MAX_RADIUS = 8
 
 
+def _shape_geometry(radius: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    size = 2 * radius + 1
+    yy, xx = np.indices((size, size), dtype=np.float64)
+    border = np.zeros((size, size), dtype=bool)
+    border[0, :] = border[-1, :] = True
+    border[:, 0] = border[:, -1] = True
+    return yy, xx, border
+
+
+# Every star cutout uses one of these bounded radii. Building the masks once
+# avoids allocating the same geometry hundreds of times per Flow batch.
+_SHAPE_GEOMETRY = {
+    radius: _shape_geometry(radius) for radius in range(1, _MAX_RADIUS + 1)
+}
+
+
+def _median_finite(values: np.ndarray) -> float:
+    """Median for a small finite vector without NaN-dispatch overhead.
+
+    Shape measurements call ``np.median`` on short vectors whose finiteness
+    was established immediately beforehand.  NumPy's public median still
+    performs dtype/NaN dispatch and a generic reduction for each call.  This
+    helper follows its same partition indices and preserves float32's native
+    averaging dtype, so the scientific scalar is unchanged.
+    """
+
+    flat = np.asarray(values).reshape(-1)
+    size = int(flat.size)
+    if size == 0:
+        return float("nan")
+    if size & 1:
+        part = np.partition(flat, size // 2)
+        return float(part[size // 2])
+
+    middle = size // 2
+    part = np.partition(flat, [middle - 1, middle])
+    if flat.dtype == np.dtype(np.float32):
+        value = (part[middle - 1] + part[middle]) * np.float32(0.5)
+    else:
+        value = (part[middle - 1] + part[middle]) * 0.5
+    return float(value)
+
+
 def _empty_measurement() -> dict[str, float | int | None]:
     return {
         "roundness": None,
@@ -40,13 +83,11 @@ def _usable_star_shape(cutout: np.ndarray, radius: int) -> tuple[float, float, f
 
     # The outer ring is generally outside the PSF and is more reliable than a
     # global background for short exposures with gradients or vignetting.
-    border = np.zeros(cutout.shape, dtype=bool)
-    border[0, :] = border[-1, :] = True
-    border[:, 0] = border[:, -1] = True
+    yy, xx, border = _SHAPE_GEOMETRY[radius]
     border_values = cutout[border & finite]
     if border_values.size < 4:
         return None
-    background = float(np.median(border_values))
+    background = _median_finite(border_values)
     if not np.isfinite(background):
         return None
 
@@ -54,7 +95,9 @@ def _usable_star_shape(cutout: np.ndarray, radius: int) -> tuple[float, float, f
     # Use a robust noise floor when one is available.  With an exactly flat
     # synthetic background MAD is zero, correctly retaining positive signal.
     border_residual = residual[border & finite]
-    mad = float(np.median(np.abs(border_residual - np.median(border_residual))))
+    mad = _median_finite(
+        np.abs(border_residual - _median_finite(border_residual))
+    )
     noise = 1.4826 * mad
     threshold = 3.0 * noise if np.isfinite(noise) and noise > 0 else 0.0
     weights = np.where(finite & (residual > threshold), residual, 0.0)
@@ -69,13 +112,15 @@ def _usable_star_shape(cutout: np.ndarray, radius: int) -> tuple[float, float, f
     # A hot pixel or a mostly blank cutout has a dominant isolated sample.
     # True stellar PSFs have several neighbouring positive samples, including
     # for the smallest practical detector FWHM.
-    ordered = np.sort(positive)
-    peak = float(ordered[-1])
-    second = float(ordered[-2]) if ordered.size > 1 else 0.0
+    # Only the two largest samples participate in the hot-pixel guard. A full
+    # sort allocates and orders every positive pixel in the cutout; partial
+    # selection preserves the exact sample values while avoiding that work.
+    top_two = np.partition(positive, positive.size - 2)[-2:]
+    peak = float(np.max(top_two))
+    second = float(np.min(top_two)) if top_two.size > 1 else 0.0
     if peak / total > 0.72 or (second > 0 and peak / second > 8.0):
         return None
 
-    yy, xx = np.indices(cutout.shape, dtype=np.float64)
     sum_x = float(np.sum(weights * xx, dtype=np.float64) / total)
     sum_y = float(np.sum(weights * yy, dtype=np.float64) / total)
     if not np.isfinite(sum_x) or not np.isfinite(sum_y):
@@ -174,9 +219,9 @@ def measure_star_shapes(
     if not usable:
         return result
     values = np.asarray(usable, dtype=np.float64)
-    result["roundness"] = float(np.clip(np.median(values[:, 0]), 0.0, 1.0))
+    result["roundness"] = float(np.clip(_median_finite(values[:, 0]), 0.0, 1.0))
     result["shape_star_count"] = int(len(usable))
-    result["shape_fwhm"] = float(np.median(values[:, 1]))
-    result["elongation"] = float(max(1.0, np.median(values[:, 2])))
+    result["shape_fwhm"] = _median_finite(values[:, 1])
+    result["elongation"] = float(max(1.0, _median_finite(values[:, 2])))
     return result
 

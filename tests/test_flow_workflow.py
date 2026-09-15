@@ -52,6 +52,69 @@ class FlowWorkflowTests(unittest.TestCase):
             global_matrix @ local_c,
         )
 
+    def test_global_anchor_reuses_only_equivalent_local_detection(self):
+        stars = np.arange(70, dtype=np.float32).reshape(35, 2)
+        info = {
+            "anchor_stars": stars.tolist(),
+            "anchor_shape": [512, 512],
+            "fwhm": 3.0,
+            "anchor_detection": {
+                "fwhm": 3.0,
+                "sigma": 4.0,
+                "sigma_used": 4.0,
+                "max_stars": 250,
+                "engine": "DAO",
+                "engine_profile": "Stable",
+            },
+        }
+        cached = flow._cached_anchor_for_global(info, 3.0, 4.0, "DAO", "Stable")
+        self.assertIsNotNone(cached)
+        np.testing.assert_array_equal(cached[0], stars)
+        self.assertEqual(cached[1], (512, 512))
+
+        # A lower local sigma means Global's adaptive loop would have produced
+        # a different catalogue, so it must reread the FITS anchor.
+        info["anchor_detection"]["sigma_used"] = 3.5
+        self.assertIsNone(flow._cached_anchor_for_global(info, 3.0, 4.0, "DAO", "Stable"))
+
+    def test_global_anchor_cache_avoids_fits_decode(self):
+        stars = np.arange(70, dtype=np.float32).reshape(35, 2)
+        info = {
+            "anchor_path": Path("anchor.fits"),
+            "anchor_stars": stars.tolist(),
+            "anchor_shape": [128, 256],
+            "fwhm": 3.0,
+            "anchor_detection": {
+                "fwhm": 3.0, "sigma": 4.0, "sigma_used": 4.0,
+                "max_stars": 250, "engine": "DAO", "engine_profile": "Stable",
+            },
+        }
+        with patch.object(flow, "load_fits_data", side_effect=AssertionError("FITS reread")):
+            result = flow._detect_anchor_stars_task(info, 3.0, 4.0, "DAO", "Stable")
+        np.testing.assert_array_equal(result[2], stars)
+        self.assertEqual(result[1], (128, 256))
+        self.assertIsNone(result[-1])
+
+    def test_local_flow_batch_plan_caps_outer_memory_and_honours_override(self):
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            batches = []
+            for index in range(3):
+                batch = root / f"batch_{index:02d}"
+                batch.mkdir()
+                fits.PrimaryHDU(np.zeros((8, 8), dtype=np.uint16)).writeto(batch / "01.fits")
+                batches.append(batch)
+            self.assertEqual(
+                flow._local_flow_batch_plan(batches, {"memory_budget_mb": 512}, 4),
+                (1, 4, 512),
+            )
+            self.assertEqual(
+                flow._local_flow_batch_plan(
+                    batches, {"memory_budget_mb": 512, "flow_batch_workers": 2}, 4
+                ),
+                (2, 2, 256),
+            )
+
     def test_persisted_flow_fingerprint_rejects_changed_input(self):
         with TemporaryDirectory() as td:
             root = Path(td)

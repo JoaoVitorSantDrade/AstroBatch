@@ -9,12 +9,15 @@ import warnings
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 
 import cv2
 import numpy as np
 from astropy.io import fits
 from astropy.utils.exceptions import AstropyWarning
+
+from cpu_runtime import configure_opencv_threads, configure_worker_runtime, physical_core_count
 
 # Suprime todos os avisos de verificação de cabeçalho do Astropy
 warnings.simplefilter("ignore", category=AstropyWarning)
@@ -158,7 +161,7 @@ def get_optimal_worker_count() -> int:
         cpu_count = getattr(os, "process_cpu_count", os.cpu_count)() or 1
     except Exception:
         cpu_count = os.cpu_count() or 1
-    return max(1, min(16, cpu_count))
+    return max(1, min(8, physical_core_count(), cpu_count))
 
 
 def prepare_fits_file(
@@ -307,8 +310,11 @@ def process_fits_logic(
     # P0: Producer/Consumer ordenado e Gerenciamento de Memória P0
     def generate_prepared_frames():
         """Generator que fornece as imagens perfeitamente ordenadas e descarta assim que o loop principal o consome."""
+        configure_opencv_threads(1 if worker_count > 1 else physical_core_count())
         with ThreadPoolExecutor(
-            max_workers=worker_count, thread_name_prefix="fits-prep"
+            max_workers=worker_count,
+            thread_name_prefix="fits-prep",
+            initializer=partial(configure_worker_runtime, 1),
         ) as executor:
             futures = {}
             next_submit = 0

@@ -184,6 +184,25 @@ class FlowCommand:
             raise ValueError("registration_strategy: escolha neighbor_bfs ou legacy.")
         config["custom_anchors"] = dict(config.get("custom_anchors", {}))
         config["debug_images"] = cls._as_bool("debug_images", config.get("debug_images", False))
+        config["temporal_analysis_enabled"] = cls._as_bool(
+            "temporal_analysis_enabled", config.get("temporal_analysis_enabled", True)
+        )
+        raw_gap = config.get("temporal_gap_minutes", 15.0)
+        try:
+            gap = float(raw_gap)
+        except (TypeError, ValueError, OverflowError):
+            gap = float("nan")
+        if isinstance(raw_gap, bool) or not math.isfinite(gap) or gap <= 0:
+            raise ValueError("temporal_gap_minutes: informe um número positivo e finito.")
+        raw_sigma = config.get("temporal_seeing_sigma", 3.0)
+        try:
+            sigma = float(raw_sigma)
+        except (TypeError, ValueError, OverflowError):
+            sigma = float("nan")
+        if isinstance(raw_sigma, bool) or not math.isfinite(sigma) or sigma <= 0:
+            raise ValueError("temporal_seeing_sigma: informe um número positivo e finito.")
+        config["temporal_gap_minutes"] = gap
+        config["temporal_seeing_sigma"] = sigma
         return cls(Path(batch_dir).expanduser().resolve(), config)
 
     @staticmethod

@@ -24,6 +24,7 @@ from concurrent.futures import (
     wait,
 )
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Any, Literal
 
@@ -35,6 +36,7 @@ from photutils.background import Background2D, MedianBackground
 
 from app.engines import EngineDescriptor, EngineProfile, ExecutionBudget, registry
 from cpu_kernels import apply_scale_and_mask_inplace, masked_extrema, masked_sum_count, weighted_merge
+from cpu_runtime import configure_opencv_threads, configure_worker_runtime, physical_core_count
 
 try:
     from pyinstrument import Profiler
@@ -52,6 +54,16 @@ DEFAULT_CHUNK_SIZE = 2048
 DEFAULT_MEMORY_BUDGET_MB = 4096
 DEFAULT_NORMALIZATION_MAX_SAMPLES = 1_000_000
 MAX_WORKERS = 16
+# Empirical upper bound for the float/mask/rejection working set per input
+# pixel in a band.  The previous 24-byte factor split 4 GiB across four
+# workers into ~60-row bands for the 3-channel Lagoon capture; that doubled
+# FITS passes without improving stability.  Twelve bytes keeps the measured
+# peak below the configured budget while materially reducing band overhead.
+STACK_BAND_BYTES_PER_PIXEL = 12
+# Keep the leaf partition and binary reduction topology independent of the
+# requested executor width.  Concurrency may change completion order, but it
+# must not change which frames are accumulated together in Stable mode.
+DETERMINISTIC_LEAF_COUNT = 4
 
 
 class StackingCancelled(RuntimeError):
@@ -106,11 +118,11 @@ class StackingConfig:
 
         if self.workers is not None:
             try:
-                return max(1, min(MAX_WORKERS, int(self.workers)))
+                return max(1, min(MAX_WORKERS, 8, physical_core_count(), cpu_count, int(self.workers)))
             except (TypeError, ValueError):
                 pass
 
-        return max(1, min(MAX_WORKERS, cpu_count))
+        return max(1, min(MAX_WORKERS, 8, physical_core_count(), cpu_count))
 
     @property
     def effective_chunk_size(self) -> int:
@@ -150,6 +162,15 @@ class FrameGeometry:
     hdu_index: int
     mask_hdu_index: int | None
     science_compressed: bool = False
+    # True when the source science HDU carries FITS scaling/BLANK cards and
+    # therefore cannot be safely memory-mapped by Astropy.  The flag is kept
+    # separate from ``science_compressed`` because dedicated-camera captures
+    # commonly store uint16 pixels as signed int16 + BZERO without tile
+    # compression.
+    requires_scaling: bool = False
+    source_bscale: float = 1.0
+    source_bzero: float = 0.0
+    source_blank: int | None = None
     cache_raw_storage: bool = False
     cache_bscale: float = 1.0
     cache_bzero: float = 0.0
@@ -166,6 +187,9 @@ class BlockRead:
 class SubstackInfo:
     path: Path
     frame_count: int
+    # Logical position in the deterministic reduction tree.  Completion order
+    # of worker futures must never decide scientific accumulation order.
+    order: int = 0
 
 
 @dataclass(slots=True)
@@ -174,6 +198,10 @@ class FitsCacheStats:
     rebuilt: int = 0
     direct: int = 0
     skipped: int = 0
+    # Number of uncompressed-but-scaled science HDUs that were eligible for
+    # the raw-storage cache.  This is diagnostic only and does not alter the
+    # legacy counters consumed by callers.
+    scaled: int = 0
 
 
 def get_optimal_worker_count() -> int:
@@ -181,7 +209,7 @@ def get_optimal_worker_count() -> int:
         cpu_count = getattr(os, "process_cpu_count", os.cpu_count)() or 1
     except Exception:
         cpu_count = os.cpu_count() or 1
-    return max(1, min(MAX_WORKERS, cpu_count))
+    return max(1, min(MAX_WORKERS, 8, physical_core_count(), cpu_count))
 
 
 def check_cancel(cancel_event: threading.Event | None) -> None:
@@ -344,6 +372,14 @@ def inspect_fits(filepath: Path) -> FrameGeometry:
             hdu_index=hdu_index,
             mask_hdu_index=mask_hdu_index,
             science_compressed=_is_compressed_hdu(image_hdu),
+            requires_scaling=_has_active_scaling(image_hdu),
+            source_bscale=float(image_hdu.header.get("BSCALE", 1.0)),
+            source_bzero=float(image_hdu.header.get("BZERO", 0.0)),
+            source_blank=(
+                int(image_hdu.header["BLANK"])
+                if "BLANK" in image_hdu.header
+                else None
+            ),
             cache_raw_storage=bool(image_hdu.header.get("ASTRAW", False)),
             cache_bscale=float(image_hdu.header.get("ASTBSCL", 1.0)),
             cache_bzero=float(image_hdu.header.get("ASTBZRO", 0.0)),
@@ -452,8 +488,11 @@ def build_frame_infos(
     result: list[FrameInfo] = []
 
     # Inspeção em paralelo para aniquilar o gargalo do header mapping do Astropy
+    inspection_workers = get_optimal_worker_count()
+    configure_opencv_threads(1 if inspection_workers > 1 else physical_core_count())
     with ThreadPoolExecutor(
-        max_workers=get_optimal_worker_count(), thread_name_prefix="AstroInspect"
+        max_workers=inspection_workers, thread_name_prefix="AstroInspect",
+        initializer=partial(configure_worker_runtime, 1),
     ) as executor:
         futures = {}
         for filepath in fits_files:
@@ -760,6 +799,32 @@ def _restore_cached_physical_values(
     return np.asarray(values, dtype=np.float32)
 
 
+def _restore_streaming_physical_values(
+    data: np.ndarray,
+    geometry: FrameGeometry,
+) -> np.ndarray:
+    """Restore physical values from a raw streaming FITS section.
+
+    The streaming opener deliberately requests ``do_not_scale_image_data`` so
+    uncompressed camera files with BZERO/BSCALE can stay memory-mapped.  Raw
+    cache entries carry the original cards as ``AST*`` metadata; source files
+    use their normal FITS cards.  Both paths use float32 operations in the
+    same order as Astropy's scaler and preserve BLANK as NaN.
+    """
+    if geometry.cache_raw_storage:
+        return _restore_cached_physical_values(data, geometry)
+    if not geometry.requires_scaling:
+        return np.asarray(data, dtype=np.float32)
+
+    raw = np.asarray(data, dtype=np.float32)
+    values = raw * np.float32(geometry.source_bscale) + np.float32(
+        geometry.source_bzero
+    )
+    if geometry.source_blank is not None:
+        values = np.where(raw == geometry.source_blank, np.nan, values)
+    return np.asarray(values, dtype=np.float32)
+
+
 def _valid_cached_geometry(
     cached_path: Path,
     source_key: str,
@@ -794,11 +859,15 @@ def cache_decompressed_frames(
     app_print: Callable[[str], None],
     cancel_event: threading.Event | None,
 ) -> tuple[dict[Path, FrameGeometry], FitsCacheStats]:
-    """Persist compressed FITS pixels as raw FITS without retaining a RAM cache.
+    """Persist scaled/compressed FITS pixels as raw FITS without RAM caching.
 
     The cache key includes source path, size and mtime.  A changed source gets a
     different entry automatically; existing entries are safe to reuse between
-    runs.  Only one frame is decoded at a time.
+    runs.  Only one frame is decoded at a time.  In addition to tile-compressed
+    HDUs, this covers the uncompressed ``BZERO/BSCALE`` representation emitted
+    by many dedicated cameras.  Astropy disables mmap for those files, so
+    caching their raw storage is what turns the hot band reads into contiguous
+    mmap slices while restoring the original physical float32 values exactly.
     """
     updated: dict[Path, FrameGeometry] = {}
     stats = FitsCacheStats()
@@ -835,12 +904,22 @@ def cache_decompressed_frames(
                     if geometry.mask_hdu_index is not None
                     else None
                 )
-                if not _is_compressed_hdu(image_hdu):
+                cache_candidate = _is_compressed_hdu(image_hdu) or _has_active_scaling(
+                    image_hdu
+                )
+                if not cache_candidate:
                     updated[source_path] = geometry
                     stats.direct += 1
                     if index % max(1, len(frames) // 20) == 0 or index == len(frames):
                         app_print(f"[Stack] FITS cache: {index}/{len(frames)}")
                     continue
+
+                if not _is_compressed_hdu(image_hdu):
+                    # Keep this distinction visible in diagnostics: the
+                    # source is a normal image HDU, but its BZERO/BSCALE/BLANK
+                    # cards prevented mmap and caused the real-capture I/O
+                    # hotspot.
+                    stats.scaled += 1
 
                 # Preserve FITS's raw signed storage. Original scaling is
                 # stored as AST* metadata and applied only to read bands.
@@ -1278,9 +1357,19 @@ def _combine_masked_impl(
             where=count > 0,
         )
     if combine_method == "Maximum":
-        return masked_extrema(values, valid, True)
+        return masked_extrema(
+            values,
+            valid,
+            True,
+            parallel=kernel_parallel and profile is EngineProfile.FAST,
+        )
     if combine_method == "Minimum":
-        return masked_extrema(values, valid, False)
+        return masked_extrema(
+            values,
+            valid,
+            False,
+            parallel=kernel_parallel and profile is EngineProfile.FAST,
+        )
     if combine_method == "Median":
         return _nanmedian_axis0_no_warning(np.where(valid, values, np.nan))
     raise ValueError(f"Unsupported combine method: {combine_method}")
@@ -1490,8 +1579,16 @@ def _leaf_band_rows(
     height: int,
 ) -> int:
     # Values, masks and rejection temporaries need several copies of a band.
-    # Keep a conservative per-leaf cap instead of oversubscribing RAM.
-    bytes_per_row = max(1, group_size * width * max(1, channels) * 24)
+    # The calibrated factor leaves headroom for the reducer while avoiding the
+    # excessive number of tiny FITS sections seen in the real 3856x2180 RGB
+    # capture.  The budget is still divided by the bounded leaf worker count.
+    bytes_per_row = max(
+        1,
+        group_size
+        * width
+        * max(1, channels)
+        * STACK_BAND_BYTES_PER_PIXEL,
+    )
     budget = max(
         64, config.memory_budget_mb // _hierarchical_worker_count(config, group_size)
     )
@@ -1520,22 +1617,41 @@ def _read_open_band(
     )
 
 
-def _open_streaming_fits(path: Path) -> fits.HDUList:
-    """Use mmap only when the science HDU can be read without FITS scaling."""
-    with fits.open(
-        path,
-        memmap=True,
-        lazy_load_hdus=True,
-        do_not_scale_image_data=True,
-    ) as probe:
-        _, image_hdu = _find_primary_image_hdu(probe)
-        requires_scaling = _has_active_scaling(image_hdu)
+def _open_streaming_fits(
+    path: Path,
+    geometry: FrameGeometry | None = None,
+) -> fits.HDUList:
+    """Open a science stream with mmap whenever the geometry permits it.
+
+    ``inspect_fits`` already reads the header once per frame.  Re-probing that
+    header for every leaf is pure I/O overhead, especially on the 1,253-frame
+    dedicated-camera capture.  Cached raw-storage geometry is guaranteed to
+    have no active FITS scaling, while an uncached source carries the explicit
+    ``requires_scaling`` flag.  The probe remains as a compatibility fallback
+    for callers that do not have geometry available.
+    """
+    if geometry is None:
+        with fits.open(
+            path,
+            memmap=True,
+            lazy_load_hdus=True,
+            do_not_scale_image_data=True,
+        ) as probe:
+            _, image_hdu = _find_primary_image_hdu(probe)
+            science_compressed = _is_compressed_hdu(image_hdu)
+    else:
+        science_compressed = bool(geometry.science_compressed)
 
     return fits.open(
         path,
-        memmap=not requires_scaling,
+        # Astropy cannot mmap a scaled image when it materializes ``.data``;
+        # asking for raw storage avoids that conversion and lets the caller
+        # restore BZERO/BSCALE on each contiguous band.  Tile-compressed HDUs
+        # still decode in memory, but they use the same raw path after the
+        # optional persistent cache.
+        memmap=not science_compressed,
         lazy_load_hdus=True,
-        do_not_scale_image_data=False,
+        do_not_scale_image_data=True,
     )
 
 
@@ -1575,13 +1691,16 @@ def _process_substack(
                 0,
                 f"Leaf {leaf_index + 1}: opening {index}/{group_size} ({frame.name})",
             )
-            handles.append(_open_streaming_fits(frame.path))
+            handles.append(
+                _open_streaming_fits(frame.path, geometries[frame.path])
+            )
     except Exception:
         for handle in handles:
             handle.close()
         raise
     try:
         last_frame_report = 0.0
+        has_dither = any(shift is not None for shift in shifts)
         for band_index, y1 in enumerate(range(0, height, band_rows), start=1):
             check_cancel(cancel_event)
             y2 = min(height, y1 + band_rows)
@@ -1589,8 +1708,47 @@ def _process_substack(
                 0,
                 f"Leaf {leaf_index + 1}: reading band {band_index}/{total_bands}",
             )
-            for channel in range(channels):
-                values = np.empty((group_size, y2 - y1, width), dtype=np.float32)
+            # Full VALID_MASK arrays are optional.  When the caller kept the
+            # masks streamed to respect the RAM budget, read one mask section
+            # per frame/band and reuse it for every RGB channel.
+            band_masks: list[np.ndarray | None] | None = None
+            if any(shift is None for shift in shifts):
+                band_masks = []
+                for frame, hdul in zip(frames, handles, strict=True):
+                    frame_index = len(band_masks)
+                    if shifts[frame_index] is not None:
+                        # ``read_frame_block`` applies the translated mask
+                        # itself; keep a placeholder for positional lookup.
+                        band_masks.append(None)
+                        continue
+                    geometry = geometries[frame.path]
+                    if frame.valid_mask is not None:
+                        band_masks.append(
+                            np.asarray(frame.valid_mask[y1:y2, :], dtype=bool)
+                        )
+                    elif geometry.mask_hdu_index is not None:
+                        band_masks.append(
+                            _read_mask_section(
+                                hdul[geometry.mask_hdu_index],
+                                y1,
+                                y2,
+                                0,
+                                width,
+                            )
+                        )
+                    else:
+                        band_masks.append(None)
+            # RGB FITS are commonly stored as [C,H,W].  Reading one full
+            # channel stack per frame/band cuts the number of section calls by
+            # 3x (or 4x for RGBA) while keeping the rejection/reduction order
+            # identical: each channel is still combined independently below.
+            # Dithered frames retain the established per-channel path because
+            # their translated source window is not one contiguous section.
+            batch_rgb = channels > 1 and not any(shift is not None for shift in shifts)
+            if batch_rgb:
+                values = np.empty(
+                    (group_size, channels, y2 - y1, width), dtype=np.float32
+                )
                 masks = np.empty(values.shape, dtype=bool)
                 for index, (frame, hdul) in enumerate(
                     zip(frames, handles, strict=True)
@@ -1604,81 +1762,151 @@ def _process_substack(
                         )
                         last_frame_report = now
                     geometry = geometries[frame.path]
-                    if shifts[index] is not None:
-                        # Dithered bands need pixels outside their nominal row
-                        # range.  Preserve the established translation path.
-                        block = read_frame_block(
-                            frame,
-                            geometry,
-                            y1,
-                            y2,
-                            0,
-                            width,
-                            channel,
-                            factors[index],
-                            shifts[index],
-                        )
-                        values[index] = block.data
-                        masks[index] = block.mask
-                        continue
-                    # Inline the image section using the already-open HDU.
                     hdu = hdul[geometry.hdu_index]
-                    if geometry.image_kind == "Mono":
-                        raw = _read_hdu_section(hdu, (slice(y1, y2), slice(0, width)))
-                    elif hdu.shape[0] in (3, 4):
+                    if hdu.shape[0] in (3, 4):
                         raw = _read_hdu_section(
                             hdu,
                             (
-                                slice(channel, channel + 1),
+                                slice(0, channels),
                                 slice(y1, y2),
                                 slice(0, width),
                             ),
-                        )[0]
+                        )
                     else:
                         raw = _read_hdu_section(
                             hdu,
                             (
                                 slice(y1, y2),
                                 slice(0, width),
-                                slice(channel, channel + 1),
+                                slice(0, channels),
                             ),
-                        )[:, :, 0]
-                    raw = _restore_cached_physical_values(raw, geometry)
+                        )
+                        raw = np.moveaxis(raw, -1, 0)
+                    raw = _restore_streaming_physical_values(raw, geometry)
                     mask = np.isfinite(raw)
-                    if frame.valid_mask is not None:
-                        mask &= frame.valid_mask[y1:y2, :]
-                    # Reuse the preallocated contiguous band slot instead of
-                    # allocating a second full np.where result per frame.
+                    if band_masks is not None and band_masks[index] is not None:
+                        mask &= band_masks[index]
                     values[index] = raw
-                    if EngineProfile.coerce(config.engine_profile) is EngineProfile.FAST:
-                        apply_scale_and_mask_inplace(values[index], mask, factors[index])
-                    else:
-                        if factors[index] != 1.0:
-                            values[index] *= np.float32(factors[index])
-                        values[index][~mask] = np.float32(0.0)
+                    for channel in range(channels):
+                        if EngineProfile.coerce(config.engine_profile) is EngineProfile.FAST:
+                            apply_scale_and_mask_inplace(
+                                values[index, channel], mask[channel], factors[index]
+                            )
+                        else:
+                            if factors[index] != 1.0:
+                                values[index, channel] *= np.float32(factors[index])
+                            values[index, channel][~mask[channel]] = np.float32(0.0)
                     masks[index] = mask
                 report(
                     0,
                     f"Leaf {leaf_index + 1}: combining band {band_index}/{total_bands}",
                 )
-                combined = reject_and_combine_block(
-                    values,
-                    masks,
-                    config.method,
-                    config.rejection_method,
-                    config.rejection_low,
-                    config.rejection_high,
-                    cancel_event,
-                    config.engine_profile,
-                    config.reducer_engine,
-                    ExecutionBudget.for_pipeline(config.worker_count).kernel_parallel,
-                )
-                if channels == 1:
-                    result[y1:y2] = combined
-                else:
+                for channel in range(channels):
+                    combined = reject_and_combine_block(
+                        values[:, channel],
+                        masks[:, channel],
+                        config.method,
+                        config.rejection_method,
+                        config.rejection_low,
+                        config.rejection_high,
+                        cancel_event,
+                        config.engine_profile,
+                        config.reducer_engine,
+                        ExecutionBudget.for_pipeline(config.worker_count).kernel_parallel,
+                    )
                     result[channel, y1:y2] = combined
-                if channel == 0:
-                    counts[y1:y2] = masks.sum(axis=0, dtype=np.uint32)
+                counts[y1:y2] = masks[:, 0].sum(axis=0, dtype=np.uint32)
+            else:
+                for channel in range(channels):
+                    values = np.empty((group_size, y2 - y1, width), dtype=np.float32)
+                    masks = np.empty(values.shape, dtype=bool)
+                    for index, (frame, hdul) in enumerate(
+                        zip(frames, handles, strict=True)
+                    ):
+                        now = time.monotonic()
+                        if index == 0 or now - last_frame_report >= 0.5:
+                            report(
+                                0,
+                                f"Leaf {leaf_index + 1}: band {band_index}/{total_bands}, "
+                                f"frame {index + 1}/{group_size} ({frame.name})",
+                            )
+                            last_frame_report = now
+                        geometry = geometries[frame.path]
+                        if shifts[index] is not None:
+                            # Dithered bands need pixels outside their nominal row
+                            # range.  Preserve the established translation path.
+                            block = read_frame_block(
+                                frame,
+                                geometry,
+                                y1,
+                                y2,
+                                0,
+                                width,
+                                channel,
+                                factors[index],
+                                shifts[index],
+                            )
+                            values[index] = block.data
+                            masks[index] = block.mask
+                            continue
+                        # Inline the image section using the already-open HDU.
+                        hdu = hdul[geometry.hdu_index]
+                        if geometry.image_kind == "Mono":
+                            raw = _read_hdu_section(hdu, (slice(y1, y2), slice(0, width)))
+                        elif hdu.shape[0] in (3, 4):
+                            raw = _read_hdu_section(
+                                hdu,
+                                (
+                                    slice(channel, channel + 1),
+                                    slice(y1, y2),
+                                    slice(0, width),
+                                ),
+                            )[0]
+                        else:
+                            raw = _read_hdu_section(
+                                hdu,
+                                (
+                                    slice(y1, y2),
+                                    slice(0, width),
+                                    slice(channel, channel + 1),
+                                ),
+                            )[:, :, 0]
+                        raw = _restore_streaming_physical_values(raw, geometry)
+                        mask = np.isfinite(raw)
+                        if band_masks is not None and band_masks[index] is not None:
+                            mask &= band_masks[index]
+                        # Reuse the preallocated contiguous band slot instead of
+                        # allocating a second full np.where result per frame.
+                        values[index] = raw
+                        if EngineProfile.coerce(config.engine_profile) is EngineProfile.FAST:
+                            apply_scale_and_mask_inplace(values[index], mask, factors[index])
+                        else:
+                            if factors[index] != 1.0:
+                                values[index] *= np.float32(factors[index])
+                            values[index][~mask] = np.float32(0.0)
+                        masks[index] = mask
+                    report(
+                        0,
+                        f"Leaf {leaf_index + 1}: combining band {band_index}/{total_bands}",
+                    )
+                    combined = reject_and_combine_block(
+                        values,
+                        masks,
+                        config.method,
+                        config.rejection_method,
+                        config.rejection_low,
+                        config.rejection_high,
+                        cancel_event,
+                        config.engine_profile,
+                        config.reducer_engine,
+                        ExecutionBudget.for_pipeline(config.worker_count).kernel_parallel,
+                    )
+                    if channels == 1:
+                        result[y1:y2] = combined
+                    else:
+                        result[channel, y1:y2] = combined
+                    if channel == 0:
+                        counts[y1:y2] = masks.sum(axis=0, dtype=np.uint32)
             report(
                 1,
                 f"Leaf {leaf_index + 1}: completed band {band_index}/{total_bands}",
@@ -1716,28 +1944,34 @@ def _combine_substacks(
             masks.append(np.array(hdul["VALID_MASK"].data, dtype=bool, copy=True))
             counts.append(np.array(hdul["SUB_COUNT"].data, dtype=np.uint32, copy=True))
 
+    # Materialize each child exactly once.  The previous reducer called
+    # ``np.stack(counts)`` repeatedly for coverage and weighted merge, keeping
+    # duplicate full-frame arrays alive during the expensive reduction.
     values = np.stack(data_list)
+    masks_stack = np.stack(masks)
+    counts_stack = np.stack(counts)
+    del data_list, masks, counts
 
     # Se a saída for RGB (4D: [N_substacks, Canais, Altura, Largura])
     # a máscara e a contagem que estão em 3D [N_substacks, Altura, Largura] precisam se expandir.
     if values.ndim == 4:
-        valid = np.stack(masks)
+        valid = masks_stack
         valid = np.broadcast_to(valid[:, None, :, :], values.shape)
-        coverage_base = np.sum(np.stack(counts), axis=0, dtype=np.uint32)
+        coverage_base = np.sum(counts_stack, axis=0, dtype=np.uint32)
         # O coverage de saída deve permanecer 2D (Altura, Largura) para uso posterior na referência
         coverage = coverage_base
     else:
-        valid = np.stack(masks)
-        coverage = np.sum(np.stack(counts), axis=0, dtype=np.uint32)
+        valid = masks_stack
+        coverage = np.sum(counts_stack, axis=0, dtype=np.uint32)
 
     threshold = max(1, math.ceil(total_frames * 0.70))
     final_mask = coverage >= threshold
 
     if config.method == "Mean" and config.rejection_method == "None":
         if EngineProfile.coerce(config.engine_profile) is EngineProfile.FAST:
-            result = weighted_merge(values, np.stack(counts))
+            result = weighted_merge(values, counts_stack)
         else:
-            weights = np.stack(counts).astype(np.float32)
+            weights = counts_stack.astype(np.float32)
             if values.ndim == 4:
                 weights = weights[:, None, :, :]
             result = np.sum(values * weights, axis=0) / np.maximum(
@@ -1821,32 +2055,45 @@ def _reduce_substacks_tree(
     """Reduce leaves in parallel binary layers without increasing workers."""
     current = leaves
     level = 0
-    while len(current) > worker_count:
+    # Always reduce to one root.  Stopping at ``worker_count`` made the final
+    # grouping depend on the number of threads and changed rejection results
+    # when a user only adjusted concurrency.
+    while len(current) > 1:
         groups = [current[index : index + 2] for index in range(0, len(current), 2)]
         next_level: list[SubstackInfo] = []
         with ThreadPoolExecutor(
             max_workers=worker_count,
             thread_name_prefix=f"AstroBranch{level}",
+            initializer=partial(
+                configure_worker_runtime,
+                ExecutionBudget.for_pipeline(worker_count).kernel_threads,
+            ),
         ) as executor:
-            futures = [
+            futures = {
                 executor.submit(
                     _process_branch,
                     group,
                     config,
                     temp_dir / f"branch_{level:02d}_{index:02d}.fits",
                     cancel_event,
-                )
+                ): index
                 for index, group in enumerate(groups)
-            ]
+            }
             for completed, future in enumerate(as_completed(futures), start=1):
                 check_cancel(cancel_event)
-                next_level.append(future.result())
+                result = future.result()
+                result.order = futures[future]
+                next_level.append(result)
                 if progress_callback:
                     progress_callback(
                         completed,
                         len(futures),
                         f"Branch level {level + 1}: {completed}/{len(futures)}",
                     )
+        # ``as_completed`` is intentionally used for progress latency, but
+        # reduction inputs must be restored to their logical left-to-right
+        # order before the next binary layer.
+        next_level.sort(key=lambda item: item.order)
         current = next_level
         level += 1
     return current
@@ -1868,7 +2115,7 @@ def _create_substacks(
 ) -> list[SubstackInfo]:
 
     workers = _hierarchical_worker_count(config, len(selected_frames))
-    leaf_count = min(len(selected_frames), workers * 4)
+    leaf_count = min(len(selected_frames), DETERMINISTIC_LEAF_COUNT)
     groups = _partition_frames(selected_frames, leaf_count)
     factor_groups = _partition_frames(normalization_factors, leaf_count)
     shift_groups = _partition_frames(dither_shifts, leaf_count)
@@ -1884,10 +2131,13 @@ def _create_substacks(
         status_callback(
             f"Starting substack work | Leafs {leaf_count} | bands {total_bands}"
         )
+    leaf_kernel_threads = ExecutionBudget.for_pipeline(workers).kernel_threads
     with ThreadPoolExecutor(
-        max_workers=workers, thread_name_prefix="AstroLeaf_substack"
+        max_workers=workers,
+        thread_name_prefix="AstroLeaf_substack",
+        initializer=partial(configure_worker_runtime, leaf_kernel_threads),
     ) as executor:
-        futures = [
+        futures = {
             executor.submit(
                 _process_substack,
                 group,
@@ -1902,11 +2152,11 @@ def _create_substacks(
                 cancel_event,
                 index,
                 progress_queue,
-            )
+            ): index
             for index, (group, factors, shifts) in enumerate(
                 zip(groups, factor_groups, shift_groups, strict=True)
             )
-        ]
+        }
         pending = set(futures)
         while pending:
             check_cancel(cancel_event)
@@ -1924,9 +2174,12 @@ def _create_substacks(
                         message,
                     )
             for future in done:
-                results.append(future.result())
+                result = future.result()
+                result.order = futures[future]
+                results.append(result)
         if progress_callback:
             progress_callback(total_bands, total_bands, "Leaf substacks complete")
+    results.sort(key=lambda item: item.order)
     return results
 
 
@@ -2411,6 +2664,17 @@ def process_stacking(
     if cancel_event is None:
         cancel_event = threading.Event()
 
+    # Keep Numba's global pool bounded when a direct library caller bypasses
+    # the GUI warm-up.  A multi-worker leaf scheduler uses serial kernels so
+    # frame workers remain the owners of the CPU.
+    from cpu_runtime import configure_numba_threads
+
+    pipeline_budget = ExecutionBudget.for_pipeline(config.worker_count)
+    configure_opencv_threads(
+        1 if pipeline_budget.worker_count > 1 else pipeline_budget.kernel_threads
+    )
+    configure_numba_threads(pipeline_budget.kernel_threads)
+
     def log(message: str) -> None:
         if status_callback:
             status_callback(message + "\n")
@@ -2560,16 +2824,16 @@ def process_stacking(
 
         if config.cache_decompressed_fits:
             cache_dir = config.input_dir / FITS_CACHE_DIR_NAME
-            compressed_frames = [
+            cache_candidates = [
                 frame
                 for frame in selected_frames
                 if geometries[frame.path].science_compressed
             ]
-            bypassed_uncompressed = len(selected_frames) - len(compressed_frames)
+            bypassed_uncompressed = len(selected_frames) - len(cache_candidates)
             cache_stats = FitsCacheStats()
-            if compressed_frames:
+            if cache_candidates:
                 cached_geometries, cache_stats = cache_decompressed_frames(
-                    compressed_frames,
+                    cache_candidates,
                     geometries,
                     cache_dir,
                     log,
@@ -2579,11 +2843,12 @@ def process_stacking(
             reference_geometry = geometries[reference_frame.path]
             log(
                 "[Stack] Raw FITS cache: "
-                f"{len(compressed_frames)} compressed candidates | "
+                f"{len(cache_candidates)} compressed candidates | "
                 f"{cache_stats.hits} hits | "
                 f"{cache_stats.rebuilt} rebuilt | "
                 f"{cache_stats.direct} direct | "
-                f"{bypassed_uncompressed} uncompressed bypassed | "
+                f"{cache_stats.scaled} uncompressed-scaled | "
+                f"{bypassed_uncompressed} uncompressed mmap/raw | "
                 f"{cache_stats.skipped} skipped"
             )
 
@@ -2598,22 +2863,41 @@ def process_stacking(
         )
 
         # VALID_MASK is independent of the image channel and output block.
-        # Cache it once: compressed FITS mask tiles otherwise get decoded for
-        # every block and once again for every RGB channel.
+        # Keep small masks resident because that avoids repeated section reads;
+        # for a real dedicated-camera session, however, one bool array per
+        # frame can consume several GiB (8.4 MiB × 1,242 Lagoon frames).  In
+        # that case the leaf reader streams one mask band and reuses it across
+        # RGB channels, preserving the memory budget.
         masks_loaded = 0
-        for frame in selected_frames:
-            if not frame.has_valid_mask:
-                continue
+        mask_bytes = sum(
+            geometries[frame.path].height * geometries[frame.path].width
+            for frame in selected_frames
+            if frame.has_valid_mask
+        )
+        mask_budget = max(
+            16 * 1024 * 1024,
+            int(config.memory_budget_mb * 1024 * 1024 * 0.25),
+        )
+        if mask_bytes <= mask_budget:
+            for frame in selected_frames:
+                if not frame.has_valid_mask:
+                    continue
 
-            frame.valid_mask = _load_full_valid_mask(
-                frame,
-                geometries[frame.path],
+                frame.valid_mask = _load_full_valid_mask(
+                    frame,
+                    geometries[frame.path],
+                )
+                if frame.valid_mask is not None:
+                    masks_loaded += 1
+
+            if masks_loaded:
+                log(f"VALID_MASK cached: {masks_loaded}")
+        elif mask_bytes:
+            log(
+                "VALID_MASK streaming: "
+                f"{mask_bytes / 1024**3:.2f} GiB exceeds "
+                f"{mask_budget / 1024**3:.2f} GiB resident budget"
             )
-            if frame.valid_mask is not None:
-                masks_loaded += 1
-
-        if masks_loaded:
-            log(f"VALID_MASK cached: {masks_loaded}")
 
         quality_values = [
             frame.quality for frame in selected_frames if math.isfinite(frame.quality)

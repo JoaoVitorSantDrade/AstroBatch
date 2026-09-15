@@ -8,6 +8,7 @@ import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from dataclasses import dataclass
 from collections import OrderedDict
+from functools import partial
 from pathlib import Path
 
 import colour_demosaicing
@@ -19,6 +20,7 @@ from skimage.transform import AffineTransform, warp
 
 from app.engines import EngineProfile, ExecutionBudget, registry
 from app.engines.align import register_align_engines
+from cpu_runtime import configure_opencv_threads, configure_worker_runtime, physical_core_count
 
 # Suprime todos os avisos de verificação de cabeçalho do Astropy
 warnings.simplefilter("ignore", category=AstropyWarning)
@@ -85,6 +87,10 @@ class AlignConfig:
     max_in_flight: int = 0
     workers: int = 0
     memory_budget_mb: int = 0
+    # Internal diagnostic override.  Zero keeps the conservative single
+    # writer; production callers can opt into a bounded pool after measuring
+    # compression throughput on their storage.
+    writer_workers: int = 0
 
 
 def _build_align_config(
@@ -114,6 +120,7 @@ def _build_align_config(
         max_in_flight=max(0, int(config_dict.get("max_in_flight", 0))),
         workers=max(0, int(config_dict.get("workers", 0))),
         memory_budget_mb=max(0, int(config_dict.get("memory_budget_mb", 0))),
+        writer_workers=max(0, int(config_dict.get("writer_workers", 0))),
     )
 
 
@@ -152,7 +159,8 @@ def get_optimal_worker_count() -> int:
     return max(
         1,
         min(
-            16,
+            8,
+            physical_core_count(),
             cpu_count,
             ram_workers,
         ),
@@ -273,9 +281,19 @@ def compute_final_matrix(
 # ============================================================
 
 
-def load_fits_data(
+def _load_fits_data_and_optional_masks(
     filepath: Path,
-) -> tuple[np.ndarray, fits.Header]:
+    include_masks: bool = False,
+) -> tuple[np.ndarray, fits.Header, np.ndarray | None, np.ndarray | None]:
+    """Load an alignment frame, optionally consuming masks in the same open.
+
+    Alignment used to call ``load_fits_data`` and ``load_fits_masks``
+    sequentially, reopening every source FITS.  Keeping the optional path here
+    preserves the lightweight pixel-only API used by Flow and previews while
+    giving the hot alignment worker one header/data/mask read.
+    """
+
+    from app.infrastructure.fits_masks import read_science_masks_from_hdul
 
     with fits.open(
         filepath,
@@ -293,16 +311,49 @@ def load_fits_data(
                 )
                 if data.ndim == 3:
                     if data.shape[0] in (3,4):
+                        spatial_shape = data.shape[1:]
                         data = np.moveaxis(data,0,-1)
-                    elif data.shape[-1] not in (3,4):
+                    elif data.shape[-1] in (3,4):
+                        spatial_shape = data.shape[:2]
+                    else:
                         raise ValueError(f"Unsupported RGB geometry: {data.shape}")
+                else:
+                    spatial_shape = data.shape
+
+                if include_masks:
+                    source_valid, source_sat = read_science_masks_from_hdul(
+                        hdul, spatial_shape
+                    )
+                else:
+                    source_valid = source_sat = None
 
                 return (
                     data,
                     header,
+                    source_valid,
+                    source_sat,
                 )
 
     raise ValueError(f"Imagem 2D não encontrada em {filepath.name}")
+
+
+def load_fits_data(
+    filepath: Path,
+) -> tuple[np.ndarray, fits.Header]:
+    data, header, _valid, _saturated = _load_fits_data_and_optional_masks(
+        filepath, include_masks=False
+    )
+    return data, header
+
+
+def load_fits_data_and_masks(
+    filepath: Path,
+) -> tuple[np.ndarray, fits.Header, np.ndarray, np.ndarray]:
+    data, header, valid, saturated = _load_fits_data_and_optional_masks(
+        filepath, include_masks=True
+    )
+    assert valid is not None and saturated is not None
+    return data, header, valid, saturated
 
 
 def load_fits_masks(filepath: Path, shape: tuple[int, int]) -> tuple[np.ndarray, np.ndarray]:
@@ -593,8 +644,7 @@ def prepare_reference_preview(filepath: Path, matrix: np.ndarray,
                               interpolation_mode: str = "bilinear",
                               max_size: int = 512) -> tuple[np.ndarray, np.ndarray]:
     """Load and warp an alignment anchor once for bounded quality checks."""
-    data, header = load_fits_data(filepath)
-    source_valid, source_sat = load_fits_masks(filepath, data.shape)
+    data, header, source_valid, source_sat = load_fits_data_and_masks(filepath)
     finite_source = np.isfinite(data)
     source_valid &= np.all(finite_source, axis=2) if data.ndim == 3 else finite_source
     saturation = header.get("SATURATE", header.get("SATLEVEL"))
@@ -920,8 +970,7 @@ def _process_single_alignment(
         # Leitura
         # ----------------------------------------------------
 
-        raw_data, raw_header = load_fits_data(filepath)
-        source_valid, source_sat = load_fits_masks(filepath, raw_data.shape)
+        raw_data, raw_header, source_valid, source_sat = load_fits_data_and_masks(filepath)
         finite_source = np.isfinite(raw_data)
         source_valid &= np.all(finite_source, axis=2) if raw_data.ndim == 3 else finite_source
         saturation = raw_header.get("SATURATE", raw_header.get("SATLEVEL"))
@@ -1261,9 +1310,14 @@ def process_batch_alignment(
     processed = 0
     failed = 0
 
+    # Alignment uses OpenCV/scikit-image in each frame worker.  Multiple frame
+    # workers own parallelism; the single-worker path may use the physical
+    # native pool for the large warp.
+    configure_opencv_threads(1 if worker_count > 1 else physical_core_count())
     with ThreadPoolExecutor(
         max_workers=worker_count,
         thread_name_prefix="astroalign",
+        initializer=partial(configure_worker_runtime, 1),
     ) as executor:
         futures = {
             executor.submit(
@@ -1615,13 +1669,17 @@ def process_all_alignments(
         frame_bytes=frame_bytes)
     worker_count = budget.worker_count
     limit = min(align_config.max_in_flight or budget.max_in_flight, budget.max_in_flight)
-    # Writes target independent files. A single writer made every alignment
-    # worker wait behind the slowest FITS compression/write and serialized the
-    # whole pipeline. Keep the writer pool bounded by the same execution
-    # budget so disk work can overlap without unbounded memory growth.
-    writer_workers = max(1, min(worker_count, 4))
-    with ThreadPoolExecutor(max_workers=writer_workers, thread_name_prefix="astroalign-writer") as writer_executor, \
-         ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="astroalign-v2") as executor:
+    # Keep writes bounded.  The default remains one writer (conservative for
+    # spinning disks and compressed FITS); diagnostics may request up to four
+    # writers to measure whether storage/compression can overlap productively.
+    writer_workers = max(1, min(worker_count, 4, align_config.writer_workers or 1))
+    configure_opencv_threads(1 if worker_count > 1 else physical_core_count())
+    with ThreadPoolExecutor(max_workers=writer_workers,
+                            thread_name_prefix="astroalign-writer",
+                            initializer=partial(configure_worker_runtime, 1)) as writer_executor, \
+         ThreadPoolExecutor(max_workers=worker_count,
+                            thread_name_prefix="astroalign-v2",
+                            initializer=partial(configure_worker_runtime, budget.kernel_threads)) as executor:
         iterator = iter(tasks)
         futures = {}
         canceled = False

@@ -2,12 +2,14 @@ import copy
 import hashlib
 import itertools
 import json
+import math
 import os
 import re
 import tempfile
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import OrderedDict, deque
+from functools import partial
 from pathlib import Path
 
 import cv2
@@ -18,10 +20,173 @@ from astropy.utils.exceptions import AstropyWarning
 from photutils.detection import DAOStarFinder
 from scipy.spatial import KDTree
 
+try:
+    # DAO's public class is stable, while the cached-convolution path below
+    # uses private helpers that vary between Photutils releases. Import the
+    # optional module once on the main thread so frame workers do not contend
+    # on Python's import lock for every detection attempt.
+    from photutils.detection import daofinder as _DAOFINDER_MODULE
+except Exception:  # pragma: no cover - exercised only by unsupported versions
+    _DAOFINDER_MODULE = None
+
+try:
+    from photutils.detection.peakfinder import (
+        _fast_circular_peaks as _DAO_FAST_CIRCULAR_PEAKS,
+    )
+except Exception:  # pragma: no cover - exercised only by unsupported versions
+    _DAO_FAST_CIRCULAR_PEAKS = None
+
+
+class _DAOFlowSources:
+    """Minimal source-table contract consumed by :func:`detect_stars_dao`.
+
+    Photutils' QTable materialization performs metadata/version work and
+    computes many columns that Flow does not use. This private row container
+    keeps the same ``sort``/``reverse``/column access contract for the four
+    required arrays while preserving NumPy's default argsort ordering.
+    """
+
+    def __init__(self, columns: dict[str, np.ndarray]) -> None:
+        self._columns = columns
+        self.colnames = tuple(columns)
+
+    def __len__(self) -> int:
+        if not self._columns:
+            return 0
+        return len(next(iter(self._columns.values())))
+
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            return self._columns[key]
+        return _DAOFlowSources({name: values[key] for name, values in self._columns.items()})
+
+    def sort(self, key: str) -> None:
+        if isinstance(key, (list, tuple)):
+            if len(key) != 1:
+                raise ValueError("Flow source sorting expects one column")
+            key = key[0]
+        order = np.argsort(self._columns[key])
+        self._columns = {
+            name: np.asarray(values)[order]
+            for name, values in self._columns.items()
+        }
+
+    def reverse(self) -> None:
+        self._columns = {
+            name: np.asarray(values)[::-1].copy()
+            for name, values in self._columns.items()
+        }
+
+    def sort_descending(self, key: str) -> None:
+        """Sort once in the same order as ``sort`` followed by ``reverse``."""
+
+        order = np.argsort(self._columns[key])[::-1]
+        self._columns = {
+            name: np.asarray(values)[order]
+            for name, values in self._columns.items()
+        }
+
+
+def _dao_catalog_to_flow_table(catalog):
+    """Materialize only the DAO columns consumed by Flow.
+
+    ``DAOStarFinderCatalog.to_table()`` computes every public catalog column,
+    including threshold-derived diagnostics that Flow never reads. Keeping
+    this helper isolated makes the optimization safe across Photutils
+    versions: unsupported private column selection falls back to the complete
+    table, and the surrounding detector still has its public fallback.
+    """
+
+    attributes = {
+        "xcentroid": ("x_centroid", "xcentroid"),
+        "ycentroid": ("y_centroid", "ycentroid"),
+        "flux": ("flux",),
+        "sharpness": ("sharpness",),
+    }
+    try:
+        columns = {}
+        for public_name, candidates in attributes.items():
+            for candidate in candidates:
+                try:
+                    columns[public_name] = np.asarray(getattr(catalog, candidate))
+                    break
+                except AttributeError:
+                    continue
+            else:
+                raise AttributeError(public_name)
+        return _DAOFlowSources(columns)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return catalog.to_table()
+
+
+def _dao_find_stars_without_table(convolved, finder, threshold):
+    """Return DAO peak coordinates without constructing Photutils' QTable.
+
+    DAO's current configuration always uses a positive minimum separation and
+    no mask/border exclusion. The direct path mirrors ``find_peaks``'s
+    NaN/constant handling and row-major ``nonzero`` ordering; unsupported
+    Photutils versions fall back to the public private helper unchanged.
+    """
+
+    fast_peaks = _DAO_FAST_CIRCULAR_PEAKS
+    if fast_peaks is None or finder.min_separation <= 0:
+        return finder._find_stars(
+            convolved,
+            finder.kernel,
+            threshold,
+            min_separation=finder.min_separation,
+            mask=None,
+            exclude_border=finder.exclude_border,
+        )
+
+    try:
+        data = np.asanyarray(convolved)
+        if data.size == 0 or np.all(data == data.flat[0]):
+            return None
+        if np.any(np.isnan(data)):
+            data = np.array(data, copy=True)
+            data[np.isnan(data)] = np.nanmin(data)
+        peak_goodmask = fast_peaks(data, finder.min_separation)
+        if finder.exclude_border:
+            yborder = finder.kernel.y_radius
+            xborder = finder.kernel.x_radius
+            if yborder > 0:
+                peak_goodmask[:yborder, :] = False
+                peak_goodmask[-yborder:, :] = False
+            if xborder > 0:
+                peak_goodmask[:, :xborder] = False
+                peak_goodmask[:, -xborder:] = False
+        peak_goodmask &= data > threshold
+        y_peaks, x_peaks = peak_goodmask.nonzero()
+        if len(x_peaks) == 0:
+            return None
+        return np.transpose((x_peaks, y_peaks))
+    except Exception:
+        # Keep the established Photutils implementation as the compatibility
+        # route if a future release changes the private peak helper contract.
+        return finder._find_stars(
+            convolved,
+            finder.kernel,
+            threshold,
+            min_separation=finder.min_separation,
+            mask=None,
+            exclude_border=finder.exclude_border,
+        )
+
 from app.engines import EngineDescriptor, EngineProfile, EngineUnavailable, registry
 from app.engines.execution import ExecutionBudget
 from app.engines.astroalign_fallback import estimate_asterism_transform
 from frame_quality import measure_star_shapes
+from cpu_runtime import configure_opencv_threads, configure_worker_runtime, physical_core_count
+from temporal_analysis import (
+    DEFAULT_GAP_MINUTES,
+    DEFAULT_SEEING_SIGMA,
+    build_session_temporal_report,
+    build_temporal_report,
+    enrich_flow_frames,
+    parse_date_obs,
+    write_temporal_report,
+)
 
 warnings.simplefilter("ignore", category=AstropyWarning)
 
@@ -95,6 +260,53 @@ def extract_luminance(data: np.ndarray, header: fits.Header) -> np.ndarray:
 
 
 def load_fits_data(filepath: Path) -> tuple[np.ndarray, fits.Header]:
+    # Dedicated-camera uint16 FITS commonly use signed int16+BZERO.  Astropy
+    # cannot memory-map the scaled ``.data`` property, so request raw storage
+    # and restore the cards in-place in float32.  This keeps the large read
+    # sequential and avoids an intermediate Astropy scaling allocation while
+    # preserving the established physical values (including BLANK -> NaN).
+    try:
+        with fits.open(
+            filepath,
+            memmap=True,
+            lazy_load_hdus=True,
+            do_not_scale_image_data=True,
+        ) as hdul:
+            for hdu in hdul:
+                if not hdu.is_image or getattr(hdu, "shape", None) is None:
+                    continue
+                if len(hdu.shape) not in (2, 3):
+                    continue
+                raw = np.asarray(hdu.data)
+                header = hdu.header.copy()
+                bscale = float(header.get("BSCALE", 1.0))
+                bzero = float(header.get("BZERO", 0.0))
+                blank = header.get("BLANK")
+                blank_value = int(blank) if blank is not None else None
+                if (
+                    raw.dtype == np.float32
+                    and bscale == 1.0
+                    and bzero == 0.0
+                    and blank_value is None
+                ):
+                    # Do not return a view into a file mapping after the HDU
+                    # list closes; callers may retain this array through the
+                    # detection/phase stages and Windows must be able to
+                    # replace the source file later.
+                    return np.array(raw, dtype=np.float32, copy=True), header
+                values = np.asarray(raw, dtype=np.float32).copy()
+                if bscale != 1.0:
+                    np.multiply(values, np.float32(bscale), out=values)
+                if bzero != 0.0:
+                    np.add(values, np.float32(bzero), out=values)
+                if blank_value is not None:
+                    values[raw == blank_value] = np.nan
+                return values, header
+    except (OSError, ValueError, TypeError, OverflowError):
+        # Keep the legacy path as a compatibility fallback for unusual FITS
+        # files whose raw header cannot be interpreted by the explicit scaler.
+        pass
+
     with fits.open(filepath, memmap=False) as hdul:
         for hdu in hdul:
             if hdu.is_image and hdu.data is not None and hdu.data.ndim in (2, 3):
@@ -110,6 +322,14 @@ def load_fits_data(filepath: Path) -> tuple[np.ndarray, fits.Header]:
 def prepare_for_phase_correlation(data: np.ndarray) -> np.ndarray:
     finite_mask = np.isfinite(data)
     if not np.any(finite_mask):
+        return np.zeros_like(data, dtype=np.float32)
+    if finite_mask.all():
+        d_min = float(np.min(data))
+        d_max = float(np.max(data))
+        if d_max > d_min:
+            return ((data - d_min) / (d_max - d_min)).astype(
+                np.float32, copy=False
+            )
         return np.zeros_like(data, dtype=np.float32)
     finite_data = data[finite_mask]
     d_min, d_max = float(np.min(finite_data)), float(np.max(finite_data))
@@ -174,16 +394,217 @@ def _greedy_spatial_filter(coords: np.ndarray, min_dist: float, max_count: int) 
     return accepted
 
 
+def _dao_sources_with_cached_convolution(
+    data: np.ndarray,
+    background: float,
+    background_std: float,
+    threshold: float,
+    fwhm: float,
+    stats_cache: dict,
+) -> tuple[bool, object | None]:
+    """Run DAOStarFinder while reusing its invariant convolution.
+
+    Photutils applies the same convolution every time an adaptive threshold is
+    tried.  The public ``DAOStarFinder`` call intentionally remains the
+    fallback, while this path mirrors its current private implementation and
+    only runs for the per-frame cache used by Flow.  ``False`` means the
+    installed Photutils version does not expose the compatible internals.
+    """
+
+    if stats_cache.get("dao_cache_disabled"):
+        return False, None
+    try:
+        _daofinder = _DAOFINDER_MODULE
+        if _daofinder is None:
+            return False, None
+
+        finder = stats_cache.get("dao_finder")
+        if finder is None or float(getattr(finder, "fwhm", -1.0)) != float(fwhm):
+            # The threshold is supplied again below for each retry; this
+            # object owns only the fwhm-dependent kernel and filter settings.
+            finder = DAOStarFinder(fwhm=fwhm, threshold=threshold)
+            stats_cache["dao_finder"] = finder
+            stats_cache.pop("dao_source_data", None)
+            stats_cache.pop("dao_convolved", None)
+            stats_cache.pop("dao_low_xypos", None)
+            stats_cache.pop("dao_low_xypos_computed", None)
+            stats_cache.pop("dao_catalog", None)
+            stats_cache.pop("dao_catalog_table", None)
+            stats_cache.pop("dao_catalog_ready", None)
+            stats_cache.pop("dao_attempts", None)
+
+        source_data = stats_cache.get("dao_source_data")
+        if source_data is None:
+            source_data = data - background
+            stats_cache["dao_source_data"] = source_data
+        convolved = stats_cache.get("dao_convolved")
+        if convolved is None:
+            convolved = _daofinder._filter_data(
+                source_data,
+                finder.kernel.data,
+                mode="constant",
+                fill_value=0.0,
+                check_normalization=False,
+            )
+            stats_cache["dao_convolved"] = convolved
+
+        threshold_eff = threshold * finder.kernel.rel_err
+        # The first adaptive attempt keeps the established Photutils catalog
+        # path.  When Flow asks for another threshold on the same image, build
+        # the catalog once at the lowest search threshold and slice it for the
+        # later attempts.  DAO's catalog filters (sharpness, roundness,
+        # finiteness and peak limit) do not depend on the scalar threshold;
+        # only ``daofind_mag`` does, and it is not consumed by Flow.  We still
+        # refresh that field below for callers that inspect the private table.
+        attempt_number = int(stats_cache.get("dao_attempts", 0))
+        # Local Flow retries at 3.0 sigma and Global Flow at 2.8 sigma.  A
+        # lower-threshold peak search is a superset of every higher-threshold
+        # result for the same convolved image, so filter its coordinates by
+        # the current threshold instead of rescanning the full image.  Calls
+        # below 2.8 sigma retain the exact direct path as a compatibility
+        # fallback.
+        search_floor = 2.8 * float(background_std)
+        if threshold >= search_floor:
+            stats_cache["dao_attempts"] = attempt_number + 1
+            if not stats_cache.get("dao_low_xypos_computed"):
+                stats_cache["dao_low_xypos"] = _dao_find_stars_without_table(
+                    convolved,
+                    finder,
+                    search_floor * finder.kernel.rel_err,
+                )
+                stats_cache["dao_low_xypos_computed"] = True
+            low_xypos = stats_cache.get("dao_low_xypos")
+            if low_xypos is None:
+                xypos = None
+            else:
+                low_xypos = np.asarray(low_xypos)
+                indices = low_xypos.astype(np.intp, copy=False)
+                keep = convolved[indices[:, 1], indices[:, 0]] >= threshold_eff
+                xypos = low_xypos[keep]
+                if len(xypos) == 0:
+                    xypos = None
+        else:
+            xypos = _dao_find_stars_without_table(
+                convolved,
+                finder,
+                threshold_eff,
+            )
+        if xypos is None:
+            return True, None
+
+        if (
+            threshold >= search_floor
+            and attempt_number >= 1
+            and not stats_cache.get("dao_catalog_ready")
+        ):
+            low_xypos = stats_cache.get("dao_low_xypos")
+            if low_xypos is None:
+                stats_cache["dao_catalog"] = None
+            else:
+                floor_catalog = _daofinder._DAOStarFinderCatalog(
+                    source_data,
+                    convolved,
+                    np.asarray(low_xypos),
+                    search_floor,
+                    finder.kernel,
+                    sharpness_range=finder.sharpness_range,
+                    roundness_range=finder.roundness_range,
+                    n_brightest=finder.n_brightest,
+                    peak_max=finder.peak_max,
+                    scale_threshold=finder.scale_threshold,
+                )
+                stats_cache["dao_catalog"] = floor_catalog.apply_all_filters()
+            stats_cache["dao_catalog_ready"] = True
+
+        cached_catalog = stats_cache.get("dao_catalog")
+        if (
+            threshold >= search_floor
+            and stats_cache.get("dao_catalog_ready")
+        ):
+            if cached_catalog is None:
+                return True, None
+            catalog_xypos = np.asarray(cached_catalog.xypos)
+            catalog_indices = catalog_xypos.astype(np.intp, copy=False)
+            catalog_keep = (
+                convolved[catalog_indices[:, 1], catalog_indices[:, 0]]
+                >= threshold_eff
+            )
+            if not np.any(catalog_keep):
+                return True, None
+            # Flow consumes only these four columns. Cache the floor table so
+            # later adaptive thresholds slice plain columns instead of
+            # rebuilding every catalog property (including daofind_mag).
+            flow_table = stats_cache.get("dao_catalog_table")
+            if flow_table is None:
+                flow_table = _dao_catalog_to_flow_table(cached_catalog)
+                stats_cache["dao_catalog_table"] = flow_table
+            return True, flow_table[catalog_keep]
+
+        catalog = _daofinder._DAOStarFinderCatalog(
+            source_data,
+            convolved,
+            xypos,
+            threshold,
+            finder.kernel,
+            sharpness_range=finder.sharpness_range,
+            roundness_range=finder.roundness_range,
+            n_brightest=finder.n_brightest,
+            peak_max=finder.peak_max,
+            scale_threshold=finder.scale_threshold,
+        )
+        catalog = catalog.apply_all_filters()
+        return True, None if catalog is None else _dao_catalog_to_flow_table(catalog)
+    except Exception:
+        # Private Photutils symbols may change independently of AstroBatch.
+        # Keep a functional, scientifically conservative public fallback.
+        stats_cache["dao_cache_disabled"] = True
+        stats_cache.pop("dao_source_data", None)
+        stats_cache.pop("dao_convolved", None)
+        stats_cache.pop("dao_low_xypos", None)
+        stats_cache.pop("dao_low_xypos_computed", None)
+        stats_cache.pop("dao_catalog", None)
+        stats_cache.pop("dao_catalog_table", None)
+        stats_cache.pop("dao_catalog_ready", None)
+        return False, None
+
+
 def detect_stars_dao(
-    data: np.ndarray, fwhm: float, sigma: float, max_stars: int
+    data: np.ndarray,
+    fwhm: float,
+    sigma: float,
+    max_stars: int,
+    stats_cache: dict | None = None,
 ) -> tuple[np.ndarray, float, dict]:
-    mean_val, median_val, std_val = (
-        float(np.mean(data)),
-        float(np.median(data)),
-        float(np.std(data)),
-    )
-    _, bkg_median, bkg_std = sigma_clipped_stats(data, sigma=3.0)
-    bkg_median, bkg_std = float(bkg_median), float(bkg_std)
+    if stats_cache is not None:
+        identity = (id(data), tuple(data.shape), str(data.dtype))
+        if stats_cache.get("dao_data_identity") != identity:
+            for key in tuple(stats_cache):
+                if str(key).startswith("dao_"):
+                    stats_cache.pop(key, None)
+            stats_cache["dao_data_identity"] = identity
+    # Adaptive detection tries several thresholds on the same luminance
+    # image.  These image-only statistics are invariant to ``sigma`` and are
+    # therefore safe to reuse for that bounded retry loop.  The cache is
+    # created per prepared frame by ``_process_single_frame`` and never
+    # escapes the call, so it cannot retain image buffers between frames.
+    cached_stats = stats_cache.get("dao_stats") if stats_cache is not None else None
+    if cached_stats is None:
+        mean_val, median_val, std_val = (
+            float(np.mean(data)),
+            float(np.median(data)),
+            float(np.std(data)),
+        )
+        _, bkg_median, bkg_std = sigma_clipped_stats(data, sigma=3.0)
+        cached_stats = (
+            mean_val,
+            median_val,
+            std_val,
+            float(bkg_median),
+            float(bkg_std),
+        )
+        if stats_cache is not None:
+            stats_cache["dao_stats"] = cached_stats
+    mean_val, median_val, std_val, bkg_median, bkg_std = cached_stats
 
     if not np.isfinite(bkg_std) or bkg_std <= 0:
         metrics = {
@@ -200,12 +621,23 @@ def detect_stars_dao(
         }
         return (np.empty((0, 2), dtype=np.float32), 0.0, metrics)
 
-    daofind = DAOStarFinder(fwhm=fwhm, threshold=sigma * bkg_std)
-    sources = daofind(data - bkg_median)
+    threshold = sigma * bkg_std
+    used_cached_convolution = False
+    sources = None
+    if stats_cache is not None:
+        used_cached_convolution, sources = _dao_sources_with_cached_convolution(
+            data, bkg_median, bkg_std, threshold, fwhm, stats_cache
+        )
+    if not used_cached_convolution:
+        daofind = DAOStarFinder(fwhm=fwhm, threshold=threshold)
+        sources = daofind(data - bkg_median)
 
     if sources is not None and len(sources) > 0:
-        sources.sort("flux")
-        sources.reverse()
+        if hasattr(sources, "sort_descending"):
+            sources.sort_descending("flux")
+        else:
+            sources.sort("flux")
+            sources.reverse()
 
         raw_coords = np.transpose((sources["xcentroid"], sources["ycentroid"])).astype(
             np.float32
@@ -439,6 +871,7 @@ def detect_stars(
     max_stars: int,
     engine: str = "DAO",
     profile: str = "Stable",
+    stats_cache: dict | None = None,
 ) -> tuple[np.ndarray, float, dict]:
     """V1-compatible detector adapter resolved through the V2 registry."""
     _register_flow_engines()
@@ -450,6 +883,8 @@ def detect_stars(
     engine_id = aliases.get(normalized, "dao")
     selected_profile = EngineProfile.coerce(profile)
     detector = registry.resolve("flow.detector", engine_id, selected_profile)
+    if engine_id == "dao" and stats_cache is not None:
+        return detect_stars_dao(data, fwhm, sigma, max_stars, stats_cache=stats_cache)
     return detector(data, fwhm, sigma, max_stars)
 
 
@@ -624,15 +1059,20 @@ def _process_single_frame(
 ) -> tuple[str, dict | None]:
     try:
         data, header = load_fits_data(filepath)
+        timestamp_fields = _timestamp_fields_from_header(header)
         working_data = extract_luminance(data, header)
 
         current_sigma = sigma_val
+        sigma_used = current_sigma
+        detector_stats_cache: dict = {}
         best_stars, best_fwhm, best_metrics = [], 0.0, {}
         target_stars = max(20, min_stars * 2)
 
         while current_sigma >= 3.0:
+            sigma_used = current_sigma
             stars, measured_fwhm, metrics = detect_stars(
-                working_data, fwhm_val, current_sigma, max_stars_val, engine_val, engine_profile
+                working_data, fwhm_val, current_sigma, max_stars_val, engine_val,
+                engine_profile, stats_cache=detector_stats_cache,
             )
             best_stars, best_fwhm, best_metrics = stars, measured_fwhm, metrics
             if len(stars) >= target_stars:
@@ -656,7 +1096,9 @@ def _process_single_frame(
                     "phase_data": None,
                     "stars": best_stars,
                     "fwhm": best_fwhm,
+                    "sigma_used": sigma_used,
                     "metrics": best_metrics,
+                    **timestamp_fields,
                     "status": "rejected",
                     "reason": "insufficient_stars_in_detection",
                 },
@@ -671,7 +1113,9 @@ def _process_single_frame(
                 "phase_data": phase_data,
                 "stars": best_stars,
                 "fwhm": best_fwhm,
+                "sigma_used": sigma_used,
                 "metrics": best_metrics,
+                **timestamp_fields,
                 "status": "prepared",
             },
         )
@@ -702,6 +1146,72 @@ def _shape_metrics_for_frame(frame: dict | None) -> dict:
         key: metrics[key]
         for key in ("roundness", "shape_star_count", "shape_fwhm", "elongation")
         if key in metrics
+    }
+
+
+_TIMESTAMP_KEYS = (
+    "timestamp",
+    "timestamp_utc",
+    "timestamp_normalized",
+    "timestamp_state",
+    "timezone",
+    "timezone_present",
+    "epoch_s",
+)
+
+
+def _timestamp_fields_from_header(header) -> dict:
+    """Normalize DATE-OBS from a header already read for pixel processing."""
+
+    value = None
+    try:
+        if header is not None:
+            value = header.get("DATE-OBS", header.get("DATEOBS"))
+    except Exception:
+        value = None
+    parsed = parse_date_obs(value)
+    return {key: parsed.get(key) for key in _TIMESTAMP_KEYS}
+
+
+def _timestamp_fields_from_frame(frame: dict | None) -> dict:
+    """Copy normalized timestamp fields from a prepared frame when present."""
+
+    if not isinstance(frame, dict) or "timestamp_state" not in frame:
+        return {}
+    return {key: frame.get(key) for key in _TIMESTAMP_KEYS}
+
+
+def _persisted_frame_metadata(frame: dict | None) -> dict:
+    """Return scientific shape metrics plus cached temporal metadata."""
+
+    return {
+        **_shape_metrics_for_frame(frame),
+        **_timestamp_fields_from_frame(frame),
+    }
+
+
+def _anchor_detection_metadata(
+    anchor: dict,
+    fwhm: float,
+    sigma: float,
+    max_stars: int,
+    engine: str,
+    engine_profile: str,
+) -> dict:
+    """Describe the exact local detector invocation used for the anchor.
+
+    The Global Flow can reuse the in-memory result only when this metadata
+    proves that its adaptive detector would stop on the same first pass.  It is
+    deliberately persisted as a small compatibility hint; old flow JSONs do
+    not have it and therefore keep the conservative reread path.
+    """
+    return {
+        "fwhm": float(fwhm),
+        "sigma": float(sigma),
+        "sigma_used": float(anchor.get("sigma_used", sigma)),
+        "max_stars": int(max_stars),
+        "engine": str(engine),
+        "engine_profile": str(engine_profile),
     }
 
 
@@ -736,6 +1246,41 @@ def _spatial_inlier_coverage(ref_stars, current_stars, matrix, shape, residual_t
     hull = cv2.contourArea(cv2.convexHull(np.asarray(inliers, np.float32)))
     height, width = shape[:2]
     return float(np.clip(hull / max(float(height * width), 1.0), 0.0, 1.0))
+
+
+def _persist_local_temporal_outputs(
+    batch_dir: Path,
+    flow_data: dict,
+    config: dict,
+    app_print,
+) -> dict:
+    """Attach timestamps and optionally publish the metadata-only report."""
+
+    timestamp_cache: dict[str, dict] = {}
+    flow_data = enrich_flow_frames(batch_dir, flow_data, timestamp_cache)
+    enabled = config.get("temporal_analysis_enabled", True)
+    if isinstance(enabled, str):
+        enabled = enabled.strip().lower() not in {"0", "false", "no", "off"}
+    if not enabled:
+        return flow_data
+    gap = config.get("temporal_gap_minutes", DEFAULT_GAP_MINUTES)
+    seeing_sigma = config.get("temporal_seeing_sigma", DEFAULT_SEEING_SIGMA)
+    try:
+        report = build_temporal_report(
+            batch_dir,
+            flow_data,
+            gap,
+            seeing_sigma,
+            timestamp_cache=timestamp_cache,
+        )
+        write_temporal_report(batch_dir / "temporal_analysis.json", report)
+        flow_data["temporal_report"] = "temporal_analysis.json"
+        flow_data["temporal_gap_minutes"] = report["gap_minutes"]
+    except Exception as exc:
+        # A report is a convenience sidecar.  A malformed header or a full
+        # disk must not discard an otherwise valid Flow result.
+        app_print(f"[{batch_dir.name}] Aviso: análise temporal indisponível: {exc}\n")
+    return flow_data
 
 
 def process_local_flow(batch_dir: Path, config: dict, app_print, cancellation_event=None) -> dict:
@@ -796,7 +1341,7 @@ def process_local_flow(batch_dir: Path, config: dict, app_print, cancellation_ev
         cpu_count = getattr(os, "process_cpu_count", os.cpu_count)() or 1
     except Exception:
         cpu_count = os.cpu_count() or 1
-    requested_workers = max(1, min(8, int(config.get("flow_workers", min(2, max(1, cpu_count // 4))))))
+    requested_workers = max(1, min(8, physical_core_count(), int(config.get("flow_workers", min(2, max(1, cpu_count // 4))))))
     # Header-only estimate: reserve roughly 40 bytes per pixel for detector,
     # luminance, phase and transient matching buffers.
     memory_budget_mb = max(64, int(config.get("memory_budget_mb", 512)))
@@ -806,6 +1351,14 @@ def process_local_flow(batch_dir: Path, config: dict, app_print, cancellation_ev
         worker_count = budget.worker_count
     except OSError:
         raise ValueError("Could not inspect FITS dimensions for the Flow memory budget")
+
+    # Star detection and phase correlation call OpenCV from Python workers.
+    # Bound its independent native pool before creating the executor so the
+    # configured frame budget is not multiplied by OpenCV's default pool.
+    native_threads = int(
+        config.get("opencv_threads", 1 if worker_count > 1 else physical_core_count())
+    )
+    configure_opencv_threads(native_threads)
 
     registration_strategy = str(config.get("registration_strategy", "neighbor_bfs")).strip().lower()
     if registration_strategy not in {"neighbor_bfs", "legacy", "incremental_chain"}:
@@ -834,6 +1387,7 @@ def process_local_flow(batch_dir: Path, config: dict, app_print, cancellation_ev
             return {}
         flow_data, anchor, anchor_quality, valid_count = graph_result
         flow_data["registration_strategy"] = "neighbor_bfs"
+        flow_data = _persist_local_temporal_outputs(batch_dir, flow_data, config, app_print)
         output_path = batch_dir / "flow_local.json"
         from app.infrastructure.json_store import atomic_json_write
         atomic_json_write(output_path, flow_data)
@@ -851,10 +1405,15 @@ def process_local_flow(batch_dir: Path, config: dict, app_print, cancellation_ev
             "fwhm": anchor["fwhm"],
             "anchor_quality": anchor_quality,
             "anchor_metrics": anchor.get("metrics", {}),
+            "anchor_detection": flow_data.get("anchor_detection"),
+            "anchor_shape": flow_data.get("anchor_shape"),
             "valid_frames": valid_count,
             "total_frames": total_count,
             "coverage": coverage,
             "local_transform_revision": flow_data.get("transform_revision"),
+            "temporal_report": str(batch_dir / "temporal_analysis.json")
+            if (batch_dir / "temporal_analysis.json").exists()
+            else None,
         }
 
     # Prepare the anchor synchronously, then stream all other frames through a
@@ -864,7 +1423,9 @@ def process_local_flow(batch_dir: Path, config: dict, app_print, cancellation_ev
 
     def bounded_prepare():
         others = (p for p in files if p.name != anchor_file.name)
-        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="astroflow") as executor:
+        with ThreadPoolExecutor(max_workers=worker_count,
+                                thread_name_prefix="astroflow",
+                                initializer=partial(configure_worker_runtime, 1)) as executor:
             pending = deque()
             for _ in range(budget.max_in_flight):
                 try: p = next(others)
@@ -912,6 +1473,11 @@ def process_local_flow(batch_dir: Path, config: dict, app_print, cancellation_ev
             "ransac": ransac_thresh,
             **limits,
         },
+        "anchor_shape": list(anchor["phase_data"].shape) if anchor.get("phase_data") is not None else None,
+        "anchor_stars": _flow_json_value(anchor["stars"]),
+        "anchor_detection": _anchor_detection_metadata(
+            anchor, fwhm_val, sigma_val, max_stars_val, engine_val, engine_profile,
+        ),
         "anchor_metrics": {
             "star_count": len(anchor["stars"]),
             "fwhm": anchor["fwhm"],
@@ -939,7 +1505,7 @@ def process_local_flow(batch_dir: Path, config: dict, app_print, cancellation_ev
         "cumulative_rms": 0.0,
         "star_count": len(anchor["stars"]),
         "fwhm": anchor["fwhm"],
-        **_shape_metrics_for_frame(anchor),
+        **_persisted_frame_metadata(anchor),
     }
 
     previous_name = anchor_file.name
@@ -962,7 +1528,7 @@ def process_local_flow(batch_dir: Path, config: dict, app_print, cancellation_ev
                 "confidence": "rejected",
                 "confidence_reason": "insufficient_stars_or_error",
                 "reason": "insufficient_stars_or_error",
-                **_shape_metrics_for_frame(current_frame),
+                **_persisted_frame_metadata(current_frame),
             }
             continue
 
@@ -1054,7 +1620,7 @@ def process_local_flow(batch_dir: Path, config: dict, app_print, cancellation_ev
                     "cumulative_rms": cumulative_rms,
                     "fwhm": current_frame["fwhm"],
                     "star_count": len(current_frame["stars"]),
-                    **_shape_metrics_for_frame(current_frame),
+                    **_persisted_frame_metadata(current_frame),
                     **metrics,
                 }
 
@@ -1098,7 +1664,7 @@ def process_local_flow(batch_dir: Path, config: dict, app_print, cancellation_ev
                         "recovery_method": "astroalign_asterism",
                         "relative_matrix": relative_homogeneous.tolist(), "relative_to": previous_name,
                         "fwhm": current_frame["fwhm"], "star_count": len(current_frame["stars"]), **metrics,
-                        **_shape_metrics_for_frame(current_frame),
+                        **_persisted_frame_metadata(current_frame),
                     }
                     app_print(f"[{current_name}] OK (astroalign_asterism) <- {previous_name} | "
                               f"{metrics['inliers']}/{metrics['matches']} asterism matches | RMS={metrics['rms']:.3f}px\n")
@@ -1129,7 +1695,7 @@ def process_local_flow(batch_dir: Path, config: dict, app_print, cancellation_ev
                 "phase_response": best_metrics.get("phase_response", 0.0),
                 "fwhm": current_frame["fwhm"],
                 "star_count": len(current_frame["stars"]),
-                **_shape_metrics_for_frame(current_frame),
+                **_persisted_frame_metadata(current_frame),
             }
             app_print(
                 f"[{current_name}] REJEITADO: {best_metrics.get('reason', 'unknown')} | "
@@ -1181,6 +1747,8 @@ def process_local_flow(batch_dir: Path, config: dict, app_print, cancellation_ev
     }
     flow_data["geometry_revision"] = _geometry_revision(flow_data)
 
+    flow_data = _persist_local_temporal_outputs(batch_dir, flow_data, config, app_print)
+
     output_path = batch_dir / "flow_local.json"
     from app.infrastructure.json_store import atomic_json_write
     atomic_json_write(output_path, flow_data)
@@ -1198,9 +1766,14 @@ def process_local_flow(batch_dir: Path, config: dict, app_print, cancellation_ev
         "fwhm": anchor["fwhm"],
         "anchor_quality": anchor_quality,
         "anchor_metrics": anchor["metrics"],
+        "anchor_detection": flow_data.get("anchor_detection"),
+        "anchor_shape": flow_data.get("anchor_shape"),
         "valid_frames": valid_count,
         "total_frames": total_count,
         "coverage": coverage,
+        "temporal_report": str(batch_dir / "temporal_analysis.json")
+        if (batch_dir / "temporal_analysis.json").exists()
+        else None,
     }
 
 
@@ -1232,7 +1805,7 @@ def _build_quad_hash(
     best_pair = (0, 1)
     for i in range(4):
         for j in range(i + 1, 4):
-            d = np.hypot(
+            d = math.hypot(
                 points_4[i, 0] - points_4[j, 0], points_4[i, 1] - points_4[j, 1]
             )
             if d > best_dist:
@@ -1431,15 +2004,23 @@ def _detect_anchor_stars_task(
 ):
     """Worker independente por batch: usado para paralelizar a fase de detecção de
     estrelas-âncora do Global Flow (anteriormente sequencial)."""
+    cached = _cached_anchor_for_global(info, fwhm_val, base_sigma, engine_val, engine_profile)
+    if cached is not None:
+        stars, shape, measured_fwhm = cached
+        info["_anchor_detection_reused"] = True
+        return info, shape, stars, measured_fwhm, base_sigma, None
+
     data, header = load_fits_data(info["anchor_path"])
     working_data = extract_luminance(data, header)
 
     current_sigma = base_sigma
+    detector_stats_cache: dict = {}
     best_stars, best_fwhm = [], fwhm_val
 
     while current_sigma >= 2.8:
         g_stars, g_fwhm, _ = detect_stars(
-            working_data, fwhm_val, current_sigma, 250, engine_val, engine_profile
+            working_data, fwhm_val, current_sigma, 250, engine_val, engine_profile,
+            stats_cache=detector_stats_cache,
         )
         best_stars, best_fwhm = g_stars, g_fwhm
         if len(g_stars) >= 35:
@@ -1448,6 +2029,100 @@ def _detect_anchor_stars_task(
 
     phase_data = prepare_for_phase_correlation(working_data)
     return info, working_data.shape, best_stars, best_fwhm, current_sigma, phase_data
+
+
+def _cached_anchor_for_global(
+    info: dict,
+    fwhm_val: float,
+    base_sigma: float,
+    engine_val: str,
+    engine_profile: str,
+) -> tuple[np.ndarray, tuple[int, ...], float] | None:
+    """Return a local anchor catalogue only when Global would be identical.
+
+    Global detection has an adaptive sigma loop and a fixed 250-star cap.  A
+    local catalogue is therefore safe to reuse only when it stopped on the
+    first pass with the same detector inputs and at least the Global stop
+    threshold (35 stars).  Missing metadata intentionally falls back to the
+    legacy FITS read, keeping old JSONs scientifically conservative.
+    """
+    detection = info.get("anchor_detection")
+    if not isinstance(detection, dict):
+        return None
+    try:
+        if float(detection.get("fwhm")) != float(fwhm_val):
+            return None
+        if float(detection.get("sigma")) != float(base_sigma):
+            return None
+        if float(detection.get("sigma_used")) != float(base_sigma):
+            return None
+        if int(detection.get("max_stars")) != 250:
+            return None
+        if str(detection.get("engine")) != str(engine_val):
+            return None
+        if str(detection.get("engine_profile")) != str(engine_profile):
+            return None
+        stars = np.asarray(info.get("anchor_stars"), dtype=np.float32)
+        if stars.ndim != 2 or stars.shape[1] != 2 or len(stars) < 35:
+            return None
+        if not np.isfinite(stars).all():
+            return None
+        shape_value = info.get("anchor_shape", info.get("shape"))
+        if shape_value is None:
+            shape = (0, 0)
+        else:
+            shape = tuple(int(value) for value in shape_value)
+        measured_fwhm = float(info.get("fwhm", detection.get("fwhm", fwhm_val)))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return np.ascontiguousarray(stars, dtype=np.float32), shape, measured_fwhm
+
+
+def _local_flow_batch_plan(
+    batch_folders: list[Path], config: dict, requested_workers: int
+) -> tuple[int, int, int]:
+    """Split the Flow CPU/memory budget between independent batches.
+
+    A session with several batches can opt into the Siril-style policy of
+    distributing a global budget across independent images first.  It is
+    intentionally opt-in because the best split depends on camera size and
+    storage latency; the default keeps the established per-batch executor.
+    The returned tuple is ``(batch_workers, frame_workers,
+    memory_mb_per_batch)``.
+    """
+    requested = max(1, min(8, physical_core_count(), int(requested_workers)))
+    batch_count = len(batch_folders)
+    if batch_count <= 1 or requested <= 1:
+        return 1, requested, max(64, int(config.get("memory_budget_mb", 512)))
+
+    try:
+        requested_outer = int(config.get("flow_batch_workers", 1) or 1)
+    except (TypeError, ValueError):
+        requested_outer = 1
+    if requested_outer <= 1:
+        return 1, requested, max(64, int(config.get("memory_budget_mb", 512)))
+
+    memory_mb = max(64, int(config.get("memory_budget_mb", 512)))
+    # Match the per-frame reservation used by process_local_flow.  If one
+    # frame already consumes the whole budget, do not add an outer pool.
+    estimated_per_batch = 64 * 1024 * 1024
+    for batch in batch_folders:
+        try:
+            frame_estimates = [
+                max_science_frame_bytes(path) * 10
+                for path in batch.iterdir()
+                if path.is_file() and path.suffix.lower() in {".fit", ".fits", ".fts"}
+            ]
+            if frame_estimates:
+                estimated_per_batch = max(estimated_per_batch, max(frame_estimates))
+        except (OSError, ValueError):
+            continue
+    memory_limited_batches = max(1, (memory_mb * 1024 * 1024) // estimated_per_batch)
+    batch_workers = min(batch_count, requested, memory_limited_batches, requested_outer)
+    batch_workers = max(1, batch_workers)
+    frame_workers = max(1, requested // batch_workers)
+    per_batch_memory = max(64, memory_mb // batch_workers)
+    return batch_workers, frame_workers, per_batch_memory
 
 
 def process_all_flows(
@@ -1497,8 +2172,10 @@ def process_all_flows(
                     "batch_name": batch_folder.name,
                     "anchor_path": batch_folder / anchor_name,
                     "anchor_data": None,
-                    "anchor_stars": [],
-                    "shape": None,
+                    "anchor_stars": local_data.get("anchor_stars", []),
+                    "shape": local_data.get("anchor_shape"),
+                    "anchor_shape": local_data.get("anchor_shape"),
+                    "anchor_detection": local_data.get("anchor_detection"),
                     "star_count": anchor_metrics.get("star_count", 0),
                     "fwhm": anchor_metrics.get("fwhm", 0.0),
                     "anchor_quality": anchor_metrics.get("quality", 0.0),
@@ -1522,21 +2199,68 @@ def process_all_flows(
         except Exception:
             cpu_count = os.cpu_count() or 1
 
-        local_workers = max(1, min(8, int(config.get("flow_workers", min(2, cpu_count)))))
-        local_config = {**config, "flow_workers": local_workers}
-        for batch_folder in batch_folders:
-            if cancel_event.is_set():
-                return
+        requested_local_workers = max(
+            1,
+            min(
+                8,
+                physical_core_count(),
+                int(config.get("flow_workers", min(2, cpu_count))),
+            ),
+        )
+        batch_workers, local_workers, batch_memory_mb = _local_flow_batch_plan(
+            batch_folders, config, requested_local_workers
+        )
+        if batch_workers > 1:
+            app_print(
+                f"[FLOW] {batch_workers} batches em paralelo, "
+                f"{local_workers} worker(s) por batch, "
+                f"{batch_memory_mb} MiB/batch.\n"
+            )
+
+        def run_local_batch(batch_folder: Path):
+            messages: list[str] = []
+            batch_config = {
+                **config,
+                "flow_workers": local_workers,
+                "memory_budget_mb": batch_memory_mb,
+            }
+            if batch_workers > 1:
+                # A concurrent batch is itself the outer worker.  Do not let
+                # the single-frame path restore OpenCV's full native pool.
+                batch_config["opencv_threads"] = 1
             try:
                 info = process_local_flow(
-                    batch_folder, local_config, lambda message: app_print(message),
+                    batch_folder,
+                    batch_config,
+                    messages.append,
                     cancellation_event=cancel_event,
                 )
-                if info:
-                    anchors_info.append(info)
-                app_print(f"Flow Local Finalizado: {batch_folder.name}\n")
+                return batch_folder, info, messages, None
             except Exception as exc:
-                app_print(f"Erro em {batch_folder.name}: {exc}\n")
+                return batch_folder, None, messages, exc
+
+        if batch_workers == 1:
+            batch_results = [run_local_batch(batch_folder) for batch_folder in batch_folders]
+        else:
+            with ThreadPoolExecutor(
+                max_workers=batch_workers,
+                thread_name_prefix="astroflow-batch",
+                initializer=partial(configure_worker_runtime, 1),
+            ) as executor:
+                futures = [executor.submit(run_local_batch, batch_folder) for batch_folder in batch_folders]
+                # Consume in natural batch order so logs and publication stay
+                # deterministic even though the work overlaps.
+                batch_results = [future.result() for future in futures]
+
+        for batch_folder, info, messages, error in batch_results:
+            for message in messages:
+                app_print(message)
+            if error is not None:
+                app_print(f"Erro em {batch_folder.name}: {error}\n")
+                continue
+            if info:
+                anchors_info.append(info)
+            app_print(f"Flow Local Finalizado: {batch_folder.name}\n")
 
     if not anchors_info:
         app_print("Nenhum Flow Local válido foi produzido ou encontrado.\n")
@@ -1548,6 +2272,7 @@ def process_all_flows(
     engine_val = _flow_detector_choice(config)
     engine_profile = str(config.get("engine_profile", "Stable"))
     fwhm_val = float(config.get("fwhm", 4.0))
+    anchor_cache_hits = 0
 
     app_print("\n[GLOBAL] Gerando imagens sintéticas para Pareamento Global...\n")
 
@@ -1555,19 +2280,70 @@ def process_all_flows(
         cpu_count = getattr(os, "process_cpu_count", os.cpu_count)() or 1
     except Exception:
         cpu_count = os.cpu_count() or 1
-    global_workers = max(1, min(8, cpu_count))
+    global_workers = max(1, min(8, physical_core_count(), cpu_count))
 
-    # Global matching consumes star catalogues only. Decode one anchor at a
-    # time rather than retaining an entire session of unused phase images.
-    for info in anchors_info:
-        if cancel_event.is_set():
-            return
-        info, shape, best_stars, best_fwhm, stopped_sigma, phase_data = _detect_anchor_stars_task(
-            info, fwhm_val, base_sigma, engine_val, engine_profile)
-        info.update(shape=shape, anchor_stars=best_stars,
-                    star_count=len(best_stars), fwhm=best_fwhm, anchor_data=None)
-        del phase_data
-        app_print(f"  -> {info['batch_name']}: {len(best_stars):02d} estrelas base\n")
+    # Global matching is independent across batches.  It uses OpenCV from
+    # each worker, so only the single-worker case may use a native pool.
+    configure_opencv_threads(1 if global_workers > 1 else physical_core_count())
+
+    # Anchor detection is independent across batches. Keep the executor
+    # bounded and consume futures in natural batch order so the resulting
+    # metadata/log publication remains deterministic. The submission window
+    # is bounded so at most ``anchor_workers`` small phase images are retained.
+    anchor_workers = max(1, min(global_workers, len(anchors_info)))
+    with ThreadPoolExecutor(
+        max_workers=anchor_workers,
+        thread_name_prefix="astroflow-anchor",
+        initializer=partial(configure_worker_runtime, 1),
+    ) as anchor_executor:
+        pending_anchors = []
+        next_anchor = 0
+        for _ in range(anchor_workers):
+            if next_anchor >= len(anchors_info):
+                break
+            pending_anchors.append(
+                anchor_executor.submit(
+                    _detect_anchor_stars_task,
+                    anchors_info[next_anchor],
+                    fwhm_val,
+                    base_sigma,
+                    engine_val,
+                    engine_profile,
+                )
+            )
+            next_anchor += 1
+
+        while pending_anchors:
+            if cancel_event.is_set():
+                for pending in pending_anchors:
+                    pending.cancel()
+                return
+            future = pending_anchors.pop(0)
+            info, shape, best_stars, best_fwhm, stopped_sigma, phase_data = future.result()
+            del stopped_sigma
+            if info.pop("_anchor_detection_reused", False):
+                anchor_cache_hits += 1
+            info.update(shape=shape, anchor_stars=best_stars,
+                        star_count=len(best_stars), fwhm=best_fwhm, anchor_data=None)
+            del phase_data
+            app_print(f"  -> {info['batch_name']}: {len(best_stars):02d} estrelas base\n")
+            if next_anchor < len(anchors_info):
+                pending_anchors.append(
+                    anchor_executor.submit(
+                        _detect_anchor_stars_task,
+                        anchors_info[next_anchor],
+                        fwhm_val,
+                        base_sigma,
+                        engine_val,
+                        engine_profile,
+                    )
+                )
+                next_anchor += 1
+
+    if anchor_cache_hits:
+        app_print(
+            f"[GLOBAL] Detecção de âncora reutilizada em {anchor_cache_hits}/{len(anchors_info)} batches.\n"
+        )
 
     global_master_cfg = config.get("global_master", "Auto")
     if str(global_master_cfg).lower() == "auto":
@@ -1621,6 +2397,7 @@ def process_all_flows(
         "batches": {},
         "quality": {},
         "cross_checks": [],
+        "anchor_detection_cache_hits": anchor_cache_hits,
     }
 
     global_flow["batches"][master_info["batch_name"]] = {
@@ -1653,7 +2430,8 @@ def process_all_flows(
     ]
 
     with ThreadPoolExecutor(
-        max_workers=global_workers, thread_name_prefix="astroflow-direct"
+        max_workers=global_workers, thread_name_prefix="astroflow-direct",
+        initializer=partial(configure_worker_runtime, 1),
     ) as executor:
         futures = {
             executor.submit(
@@ -1939,6 +2717,21 @@ def process_all_flows(
         app_print(f"[GLOBAL] Falha ao publicar revisão imutável: {exc}\n")
         return {"status": "failed", "reason": f"flow revision publish failed: {exc}"}
 
+    temporal_enabled = config.get("temporal_analysis_enabled", True)
+    if isinstance(temporal_enabled, str):
+        temporal_enabled = temporal_enabled.strip().lower() not in {"0", "false", "no", "off"}
+    if temporal_enabled:
+        try:
+            temporal_report = build_session_temporal_report(
+                base_dir,
+                config.get("temporal_gap_minutes", DEFAULT_GAP_MINUTES),
+                config.get("temporal_seeing_sigma", DEFAULT_SEEING_SIGMA),
+            )
+            write_temporal_report(base_dir / "temporal_analysis.json", temporal_report)
+            app_print("[GLOBAL] Relatório temporal salvo (revisão manual).\n")
+        except Exception as exc:
+            app_print(f"[GLOBAL] Aviso: análise temporal indisponível: {exc}\n")
+
     app_progress(total_batches, total_batches, "AstroFlow Finalizado.")
     app_print(
         f"\n>>> AstroFlow Finalizado. {len(accepted_batches)}/{len(anchors_info)} Batches aceitas no Global Flow. <<<\n"
@@ -1947,6 +2740,10 @@ def process_all_flows(
         "status": "partial" if rejected_batches else "success",
         "message": f"Flow: {len(accepted_batches)}/{len(anchors_info)} batches aceitas.",
         "output_path": str(global_path),
+        "anchor_detection_cache_hits": anchor_cache_hits,
+        "temporal_report": str(base_dir / "temporal_analysis.json")
+        if (base_dir / "temporal_analysis.json").exists()
+        else None,
     }
 
 
@@ -2202,6 +2999,21 @@ def _build_local_registration_graph(
                 break
         return frame
 
+    prefetch_executor = ThreadPoolExecutor(
+        max_workers=max(1, worker_count),
+        thread_name_prefix="astroflow-prepare",
+        initializer=partial(configure_worker_runtime, 1),
+    )
+    # Prefetch is fully drained before a target's edge attempts begin. Reuse
+    # its already-bounded pool instead of constructing and destroying a new
+    # executor for every target with multiple candidate parents. Futures are
+    # still consumed in candidate order below, so graph publication remains
+    # deterministic.
+    edge_executor_enabled = bool(
+        config.get("flow_workers") is not None
+        and worker_count > 1
+    )
+
     def prefetch(names):
         """Prepare an independent bounded batch without changing graph order."""
         wanted = []
@@ -2213,40 +3025,39 @@ def _build_local_registration_graph(
             wanted.append(name)
         if not wanted:
             return
-        with ThreadPoolExecutor(max_workers=max(1, worker_count),
-                                thread_name_prefix="astroflow-prepare") as executor:
-            futures = {
-                name: executor.submit(
-                    _process_single_frame,
-                    files[name_to_index[name]],
-                    float(config.get("fwhm", 4.0)),
-                    float(config.get("sigma", 5.0)),
-                    int(config.get("max_stars", 250)),
-                    limits["min_stars"],
-                    engine_val,
-                    engine_profile,
-                )
-                for name in wanted
-            }
-            for name in wanted:
-                try:
-                    _, frame = futures[name].result()
-                except Exception as exc:
-                    app_print(f"[{files[name_to_index[name]].name}] Erro no worker: {exc}\n")
-                    frame = None
-                frame_cache[name] = frame
-                frame_cache.move_to_end(name)
-                while len(frame_cache) > cache_limit:
-                    old_name, old_frame = frame_cache.popitem(last=False)
-                    if old_name == anchor_name:
-                        frame_cache[old_name] = old_frame
-                        break
+        futures = {
+            name: prefetch_executor.submit(
+                _process_single_frame,
+                files[name_to_index[name]],
+                float(config.get("fwhm", 4.0)),
+                float(config.get("sigma", 5.0)),
+                int(config.get("max_stars", 250)),
+                limits["min_stars"],
+                engine_val,
+                engine_profile,
+            )
+            for name in wanted
+        }
+        for name in wanted:
+            try:
+                _, frame = futures[name].result()
+            except Exception as exc:
+                app_print(f"[{files[name_to_index[name]].name}] Erro no worker: {exc}\n")
+                frame = None
+            frame_cache[name] = frame
+            frame_cache.move_to_end(name)
+            while len(frame_cache) > cache_limit:
+                old_name, old_frame = frame_cache.popitem(last=False)
+                if old_name == anchor_name:
+                    frame_cache[old_name] = old_frame
+                    break
     anchor = prepare(anchor_name)
     if (
         anchor is None
         or anchor.get("status") == "error"
         or len(anchor.get("stars", [])) < limits["min_stars"]
     ):
+        prefetch_executor.shutdown(wait=True, cancel_futures=True)
         app_print(f"[{batch_name}] ERRO: Falha na âncora.\n")
         return None
 
@@ -2281,6 +3092,13 @@ def _build_local_registration_graph(
         "input_fingerprint": input_fingerprint,
         "transform_revision": input_fingerprint[:16],
         "parameters": registration_parameters,
+        "anchor_shape": list(anchor["phase_data"].shape) if anchor.get("phase_data") is not None else None,
+        "anchor_stars": _flow_json_value(anchor["stars"]),
+        "anchor_detection": _anchor_detection_metadata(
+            anchor, float(config.get("fwhm", 4.0)), float(config.get("sigma", 5.0)),
+            int(config.get("max_stars", 250)),
+            engine_val, engine_profile,
+        ),
         "anchor_metrics": {
             "star_count": len(anchor["stars"]),
             "fwhm": anchor["fwhm"],
@@ -2310,7 +3128,7 @@ def _build_local_registration_graph(
         "sequence_index": anchor_index,
         "star_count": len(anchor["stars"]),
         "fwhm": anchor["fwhm"],
-        **_shape_metrics_for_frame(anchor),
+        **_persisted_frame_metadata(anchor),
     }
 
     accepted_names = {anchor_name}
@@ -2355,6 +3173,7 @@ def _build_local_registration_graph(
         prefetch(frontier)
         for target_name in ordered_remaining:
             if cancelled():
+                prefetch_executor.shutdown(wait=True, cancel_futures=True)
                 return None
             target_frame = prepare(target_name)
             if (
@@ -2368,7 +3187,7 @@ def _build_local_registration_graph(
                     "confidence_reason": "insufficient_stars_or_error",
                     "reason": "insufficient_stars_or_error",
                     "sequence_index": name_to_index[target_name],
-                    **_shape_metrics_for_frame(target_frame),
+                    **_persisted_frame_metadata(target_frame),
                 }
                 remaining_names.remove(target_name)
                 made_progress = True
@@ -2388,10 +3207,11 @@ def _build_local_registration_graph(
             target_index = name_to_index[target_name]
             successful_edges = []
             edge_jobs = []
-            edge_executor = ThreadPoolExecutor(
-                max_workers=max(1, min(worker_count, len(candidates))),
-                thread_name_prefix="astroflow-edge",
-            ) if config.get("flow_workers") is not None and worker_count > 1 and len(candidates) > 1 else None
+            edge_executor = (
+                prefetch_executor
+                if edge_executor_enabled and len(candidates) > 1
+                else None
+            )
             for candidate_position, parent_name in enumerate(candidates):
                 parent_frame = prepare(parent_name)
                 parent_index = name_to_index[parent_name]
@@ -2448,7 +3268,6 @@ def _build_local_registration_graph(
                     last_failures[target_name] = metrics
 
             if edge_executor is not None:
-                edge_executor.shutdown(wait=True)
                 for candidate_position, parent_name, parent_index, cache_key, future in edge_jobs:
                     try:
                         relative, metrics, method = future.result()
@@ -2534,7 +3353,7 @@ def _build_local_registration_graph(
                 "fwhm": target_frame["fwhm"],
                 "star_count": len(target_frame["stars"]),
                 **_flow_json_value(metrics),
-                **_shape_metrics_for_frame(target_frame),
+                **_persisted_frame_metadata(target_frame),
             }
             edge = {
                 "source": parent_name,
@@ -2574,7 +3393,7 @@ def _build_local_registration_graph(
             "rms": metrics.get("rms", 999.0),
             "phase_shift": metrics.get("phase_shift", [0.0, 0.0]),
             "phase_response": metrics.get("phase_response", 0.0),
-            **_shape_metrics_for_frame(prepare(target_name)),
+            **_persisted_frame_metadata(prepare(target_name)),
         }
         app_print(
             f"[{target_name}] REJEITADO: {flow_data['frames'][target_name]['reason']} | "
@@ -2619,6 +3438,7 @@ def _build_local_registration_graph(
     flow_data = _flow_json_value(flow_data)
     accepted_count = int(flow_data["statistics"]["accepted_frames"])
     anchor_metrics = flow_data["anchor_metrics"]
+    prefetch_executor.shutdown(wait=True, cancel_futures=True)
     return flow_data, anchor, anchor_quality, accepted_count
 
 

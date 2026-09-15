@@ -5,6 +5,7 @@ import threading
 import tempfile
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -13,6 +14,7 @@ from astropy.io import fits
 from astropy.utils.exceptions import AstropyWarning
 
 from cpu_kernels import calibrate_inplace
+from cpu_runtime import configure_worker_runtime, physical_core_count
 
 # Suprime avisos de verificação de cabeçalho do Astropy.
 warnings.simplefilter("ignore", category=AstropyWarning)
@@ -523,7 +525,9 @@ def run_calibration_pipeline(
         1,
         min(
             MAX_WORKERS,
-            (os.cpu_count() or 1) + 2,
+            8,
+            physical_core_count(),
+            (os.cpu_count() or 1),
         ),
     )
 
@@ -537,6 +541,7 @@ def run_calibration_pipeline(
     with ThreadPoolExecutor(
         max_workers=workers,
         thread_name_prefix="calibration",
+        initializer=partial(configure_worker_runtime, 1),
     ) as executor:
         future_to_light: dict = {}
         next_index = 0

@@ -77,6 +77,71 @@ class SubstackProgressTests(unittest.TestCase):
             self.assertTrue(any("completed band" in message for message in messages))
             self.assertEqual(completed, 1)
 
+    def test_mixed_dither_keeps_streamed_mask_for_unchanged_frame(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            paths: list[Path] = []
+            for index in range(2):
+                path = root / f"mixed_{index}.fits"
+                fits.HDUList(
+                    [
+                        fits.PrimaryHDU(
+                            np.full((4, 4), index + 1, dtype=np.float32)
+                        ),
+                        fits.ImageHDU(
+                            np.zeros((4, 4), dtype=np.uint8)
+                            if index == 0
+                            else np.ones((4, 4), dtype=np.uint8),
+                            name="VALID_MASK",
+                        ),
+                    ]
+                ).writeto(path)
+                paths.append(path)
+
+            geometries = {path: stacking.inspect_fits(path) for path in paths}
+            frames = [
+                stacking.FrameInfo(
+                    path=path,
+                    name=path.name,
+                    batch="root",
+                    metrics={},
+                    quality=1.0,
+                    star_count=1.0,
+                    fwhm=1.0,
+                    snr=1.0,
+                    rms=1.0,
+                    has_valid_mask=True,
+                    shape=(4, 4),
+                    image_kind="Mono",
+                    channels=1,
+                )
+                for path in paths
+            ]
+
+            output = root / "mixed-output.fits"
+            stacking._process_substack(
+                frames,
+                geometries,
+                [1.0, 1.0],
+                [None, (0.0, 0.0)],
+                stacking.StackingConfig(
+                    method="Mean",
+                    rejection_method="None",
+                    workers=1,
+                ),
+                output,
+                4,
+                4,
+                1,
+                None,
+            )
+
+            with fits.open(output, memmap=False) as hdul:
+                result = np.asarray(hdul[0].data, dtype=np.float32)
+                counts = np.asarray(hdul["SUB_COUNT"].data, dtype=np.uint32)
+            self.assertTrue(np.all(result == 2.0))
+            self.assertTrue(np.all(counts == 1))
+
 
 if __name__ == "__main__":
     unittest.main()
