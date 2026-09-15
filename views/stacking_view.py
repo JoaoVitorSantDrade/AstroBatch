@@ -3,13 +3,14 @@ import tkinter as tk
 from tkinter import ttk
 
 from .base_view import BaseAstroView
+from .stack_model import StackViewModel
 
 
 class StackingView(BaseAstroView):
     """Aba para configuração do AstroStack com scroll e layout completo"""
 
-    def __init__(self, parent, app):
-        super().__init__(parent, app)
+    def __init__(self, parent, model: StackViewModel):
+        super().__init__(parent, model)
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)  # Permite scroll expandir
         self._build_ui()
@@ -26,7 +27,7 @@ class StackingView(BaseAstroView):
         # Canvas + Scrollbar
         canvas = tk.Canvas(
             canvas_container,
-            background=self.app.BG,
+            background=self.model.BG,
             highlightthickness=0,
             borderwidth=0,
         )
@@ -68,7 +69,9 @@ class StackingView(BaseAstroView):
                     break
                 widget = widget.master
 
-        canvas.bind_all("<MouseWheel>", on_mousewheel, add="+")
+        # Scope the wheel handler to this view.  A global bind_all handler
+        # steals scrolling from the other tabs and from the activity panel.
+        canvas.bind("<MouseWheel>", on_mousewheel, add="+")
 
         # ============================================================
         # 1. Diretórios (NOVO!)
@@ -83,18 +86,18 @@ class StackingView(BaseAstroView):
         ttk.Label(dirs_frame, text="Frames alinhados (entrada):").grid(
             row=0, column=0, sticky="w", pady=5
         )
-        ttk.Entry(dirs_frame, textvariable=self.app.stack_input_dir_var).grid(
+        ttk.Entry(dirs_frame, textvariable=self.model.stack_input_dir_var).grid(
             row=0, column=1, sticky="ew", padx=8, pady=5
         )
         ttk.Button(
             dirs_frame,
             text="Selecionar",
-            command=lambda: self.app.browse_dir(self.app.stack_input_dir_var),
+            command=lambda: self.model.browse_dir(self.model.stack_input_dir_var),
         ).grid(row=0, column=2, pady=5)
         ttk.Button(
             dirs_frame,
             text="Usar saída do Align",
-            command=self.app.use_align_output_for_stack,
+            command=self.model.use_align_output_for_stack,
         ).grid(row=0, column=3, padx=(8, 0), pady=5)
 
         ttk.Label(
@@ -107,13 +110,13 @@ class StackingView(BaseAstroView):
         ttk.Label(dirs_frame, text="Pasta de saída:").grid(
             row=2, column=0, sticky="w", pady=5
         )
-        ttk.Entry(dirs_frame, textvariable=self.app.stack_output_dir_var).grid(
+        ttk.Entry(dirs_frame, textvariable=self.model.stack_output_dir_var).grid(
             row=2, column=1, sticky="ew", padx=8, pady=5
         )
         ttk.Button(
             dirs_frame,
             text="Selecionar",
-            command=lambda: self.app.browse_dir(self.app.stack_output_dir_var),
+            command=lambda: self.model.browse_dir(self.model.stack_output_dir_var),
         ).grid(row=2, column=2, pady=5)
 
         ttk.Label(
@@ -134,7 +137,7 @@ class StackingView(BaseAstroView):
 
         self.selection_mode_combo = ttk.Combobox(
             selection_frame,
-            textvariable=self.app.stack_selection_mode_var,
+            textvariable=self.model.stack_selection_mode_var,
             values=["All", "BestPercentage"],
             state="readonly",
             width=16,
@@ -154,7 +157,7 @@ class StackingView(BaseAstroView):
 
         self.selection_metric_combo = ttk.Combobox(
             selection_frame,
-            textvariable=self.app.stack_selection_metric_var,
+            textvariable=self.model.stack_selection_metric_var,
             values=["quality", "fwhm", "star_count", "snr", "roundness"],
             state="readonly",
             width=16,
@@ -173,7 +176,7 @@ class StackingView(BaseAstroView):
         ttk.Checkbutton(
             selection_frame,
             text="Rejeitar subs com rastros",
-            variable=self.app.stack_trail_filter_var,
+            variable=self.model.stack_trail_filter_var,
         ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(12, 0))
 
         ttk.Label(
@@ -192,7 +195,7 @@ class StackingView(BaseAstroView):
             from_=0.0,
             to=1.0,
             increment=0.01,
-            textvariable=self.app.stack_min_roundness_var,
+            textvariable=self.model.stack_min_roundness_var,
             width=8,
         ).grid(row=3, column=1, sticky="w", padx=8, pady=(8, 0))
         ttk.Label(
@@ -209,7 +212,7 @@ class StackingView(BaseAstroView):
             from_=1,
             to=64,
             increment=1,
-            textvariable=self.app.stack_min_shape_stars_var,
+            textvariable=self.model.stack_min_shape_stars_var,
             width=8,
         ).grid(row=4, column=1, sticky="w", padx=8, pady=(8, 0))
         ttk.Label(
@@ -223,7 +226,7 @@ class StackingView(BaseAstroView):
         ttk.Button(
             selection_frame,
             text="Preset: Subs sem guiagem",
-            command=self.app.apply_unguided_preset,
+            command=self.model.apply_unguided_preset,
         ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(12, 0))
         ttk.Label(
             selection_frame,
@@ -245,7 +248,7 @@ class StackingView(BaseAstroView):
             percent_frame,
             from_=10,
             to=100,
-            variable=self.app.stack_selection_percentage_var,
+            variable=self.model.stack_selection_percentage_var,
             orient="horizontal",
             length=150,
             command=self._update_percentage_label,
@@ -253,7 +256,7 @@ class StackingView(BaseAstroView):
 
         ttk.Label(
             percent_frame,
-            textvariable=self.app.stack_selection_percentage_text_var,
+            textvariable=self.model.stack_selection_percentage_text_var,
             style="Muted.TLabel",
             width=5,
         ).pack(side="left", padx=(8, 0))
@@ -270,7 +273,7 @@ class StackingView(BaseAstroView):
         ttk.Label(combine_frame, text="Método:").grid(row=0, column=0, sticky="w")
         ttk.Combobox(
             combine_frame,
-            textvariable=self.app.stack_method_var,
+            textvariable=self.model.stack_method_var,
             values=["Median", "Mean", "Sum", "Maximum", "Minimum"],
             state="readonly",
             width=14,
@@ -297,7 +300,7 @@ class StackingView(BaseAstroView):
         ttk.Label(rejection_frame, text="Método:").grid(row=0, column=0, sticky="w")
         ttk.Combobox(
             rejection_frame,
-            textvariable=self.app.stack_rejection_method_var,
+            textvariable=self.model.stack_rejection_method_var,
             values=["None", "SigmaClip", "Winsorized", "MAD"],
             state="readonly",
             width=14,
@@ -313,7 +316,7 @@ class StackingView(BaseAstroView):
             row=1, column=0, sticky="w", pady=(8, 0)
         )
         ttk.Entry(
-            rejection_frame, textvariable=self.app.stack_rejection_low_var, width=10
+            rejection_frame, textvariable=self.model.stack_rejection_low_var, width=10
         ).grid(row=1, column=1, sticky="w", padx=8, pady=(8, 0))
 
         ttk.Label(
@@ -326,7 +329,7 @@ class StackingView(BaseAstroView):
             row=2, column=0, sticky="w", pady=(8, 0)
         )
         ttk.Entry(
-            rejection_frame, textvariable=self.app.stack_rejection_high_var, width=10
+            rejection_frame, textvariable=self.model.stack_rejection_high_var, width=10
         ).grid(row=2, column=1, sticky="w", padx=8, pady=(8, 0))
 
         ttk.Label(
@@ -345,7 +348,7 @@ class StackingView(BaseAstroView):
         norm_frame.columnconfigure(1, weight=1)
 
         ttk.Checkbutton(
-            norm_frame, text="Normalizar frames", variable=self.app.stack_normalize_var
+            norm_frame, text="Normalizar frames", variable=self.model.stack_normalize_var
         ).grid(row=0, column=0, columnspan=2, sticky="w")
 
         ttk.Label(
@@ -359,7 +362,7 @@ class StackingView(BaseAstroView):
         )
         ttk.Combobox(
             norm_frame,
-            textvariable=self.app.stack_normalize_method_var,
+            textvariable=self.model.stack_normalize_method_var,
             values=["Median", "Mode"],
             state="readonly",
             width=14,
@@ -381,7 +384,7 @@ class StackingView(BaseAstroView):
         ttk.Checkbutton(
             post_frame,
             text="Corrigir dithering (filtro de mediana)",
-            variable=self.app.stack_dither_correction_var,
+            variable=self.model.stack_dither_correction_var,
         ).grid(row=0, column=0, columnspan=2, sticky="w")
 
         ttk.Label(
@@ -403,7 +406,7 @@ class StackingView(BaseAstroView):
             row=0, column=0, sticky="w"
         )
         ttk.Entry(
-            output_frame, textvariable=self.app.stack_output_name_var, width=30
+            output_frame, textvariable=self.model.stack_output_name_var, width=30
         ).grid(row=0, column=1, sticky="w", padx=8)
 
         ttk.Label(output_frame, text="Profundidade de bits:").grid(
@@ -422,7 +425,7 @@ class StackingView(BaseAstroView):
         ttk.Checkbutton(
             output_frame,
             text="Comprimir saída (RICE_1)",
-            variable=self.app.stack_compress_var,
+            variable=self.model.stack_compress_var,
         ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         ttk.Label(
@@ -438,11 +441,11 @@ class StackingView(BaseAstroView):
             row=3, column=0, sticky="w", pady=(8, 0)
         )
         ttk.Combobox(
-            output_frame, textvariable=self.app.stack_profile_var,
+            output_frame, textvariable=self.model.stack_profile_var,
             values=["Stable", "Fast"], state="readonly", width=14,
         ).grid(row=3, column=1, sticky="w", padx=8, pady=(8, 0))
         ttk.Combobox(
-            output_frame, textvariable=self.app.stack_reducer_engine_var,
+            output_frame, textvariable=self.model.stack_reducer_engine_var,
             values=["", "stable-numpy", "fast-numba"], state="readonly", width=16,
         ).grid(row=3, column=2, sticky="w", padx=(8, 0), pady=(8, 0))
 
@@ -451,22 +454,22 @@ class StackingView(BaseAstroView):
         actions.columnconfigure(0, weight=1)
         actions.columnconfigure(1, weight=1)
 
-        self.app.btn_run_stack = ttk.Button(
+        self.btn_run_stack = ttk.Button(
             actions,
             text="▶  INICIAR ASTROSTACK",
             style="Accent.TButton",
-            command=self.app.start_stacking,
+            command=self.model.start_stacking,
         )
-        self.app.btn_run_stack.grid(row=0, column=0, sticky="ew", ipady=5)
+        self.btn_run_stack.grid(row=0, column=0, sticky="ew", ipady=5)
 
-        self.app.btn_cancel_stack = ttk.Button(
+        self.btn_cancel_stack = ttk.Button(
             actions,
             text="Cancelar",
             style="Danger.TButton",
-            command=self.app.cancel_processing,
+            command=self.model.cancel_processing,
             state="disabled",
         )
-        self.app.btn_cancel_stack.grid(
+        self.btn_cancel_stack.grid(
             row=0, column=1, sticky="ew", padx=(8, 0), ipady=5
         )
 
@@ -475,7 +478,7 @@ class StackingView(BaseAstroView):
 
     def _update_percentage_label(self, value):
         """Atualiza o label do percentual quando o slider é movido"""
-        self.app.stack_selection_percentage_text_var.set(f"{int(float(value))}%")
+        self.model.stack_selection_percentage_text_var.set(f"{int(float(value))}%")
 
     def _path_row(
         self, parent, row, label, variable, browse_command, browse_text="Selecionar"

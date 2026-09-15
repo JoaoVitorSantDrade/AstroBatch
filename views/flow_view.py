@@ -8,11 +8,34 @@ import numpy as np
 from PIL import Image, ImageTk
 
 from views.base_view import BaseAstroView
+from views.flow_model import FlowViewModel
+from views.preview_service import PreviewService
+
+
+def format_reference_provenance(flow_data, frame_name):
+    """Return compact status and graph provenance text for a reference card."""
+
+    if not flow_data:
+        return "Flow pendente"
+    frame = (flow_data.get("frames") or {}).get(frame_name) or {}
+    status = str(frame.get("status", "desconhecido"))
+    stale_prefix = "stale • " if flow_data.get("stale") else ""
+    if status != "accepted":
+        reason = frame.get("reason") or frame.get("rejected_reason") or frame.get("error")
+        return f"{stale_prefix}{status} • {reason or 'sem motivo registrado'}"
+    method = frame.get("recovery_method") or "direct"
+    hops = int(frame.get("hop_count", 0) or 0)
+    parent = frame.get("relative_to") or "reference"
+    confidence = frame.get("confidence")
+    details = [method, f"hops={hops}", f"parent={parent}"]
+    if confidence:
+        details.append(f"confidence={confidence}")
+    return stale_prefix + "accepted • " + " • ".join(details)
 
 
 class FlowView(BaseAstroView):
-    def __init__(self, parent, app):
-        super().__init__(parent, app)
+    def __init__(self, parent, model: FlowViewModel):
+        super().__init__(parent, model)
         self.columnconfigure(0, weight=1)
         self.rowconfigure(3, weight=1)
 
@@ -21,9 +44,23 @@ class FlowView(BaseAstroView):
         self.reference_preview_inner = None
         self.reference_preview_images = []
         self.reference_preview_generation = 0
+        self._preview_cards = {}
+        self._preview_service = PreviewService(self._load_reference_thumbnail, max_workers=2, max_pending=32)
+        self._preview_after_id = self.after(150, self.refresh_reference_preview)
+        self.bind("<Destroy>", self._on_destroy, add="+")
 
         self._build_ui()
-        self.after(150, self.refresh_reference_preview)
+
+    def _on_destroy(self, _event=None):
+        self.reference_preview_generation += 1
+        self._preview_service.close()
+        after_id = self._preview_after_id
+        if after_id:
+            try:
+                self.after_cancel(after_id)
+            except tk.TclError:
+                pass
+            self._preview_after_id = None
 
     def _build_ui(self):
         # ============================================================
@@ -45,7 +82,7 @@ class FlowView(BaseAstroView):
         )
         ttk.Combobox(
             card_local,
-            textvariable=self.app.flow_engine_var,
+            textvariable=self.model.flow_engine_var,
             values=["DAO", "OpenCV"],
             state="readonly",
             width=14,
@@ -54,28 +91,28 @@ class FlowView(BaseAstroView):
         ttk.Label(card_local, text="Mínimo de estrelas:").grid(
             row=0, column=2, sticky="w", pady=(0, 5)
         )
-        ttk.Entry(card_local, textvariable=self.app.flow_min_stars_var, width=14).grid(
+        ttk.Entry(card_local, textvariable=self.model.flow_min_stars_var, width=14).grid(
             row=0, column=3, sticky="w", padx=8, pady=(0, 5)
         )
 
         ttk.Label(card_local, text="FWHM médio (px):").grid(
             row=1, column=0, sticky="w", pady=(5, 5)
         )
-        ttk.Entry(card_local, textvariable=self.app.flow_fwhm_var, width=14).grid(
+        ttk.Entry(card_local, textvariable=self.model.flow_fwhm_var, width=14).grid(
             row=1, column=1, sticky="w", padx=8, pady=(5, 5)
         )
 
         ttk.Label(card_local, text="Sigma (Início da Busca):").grid(
             row=1, column=2, sticky="w", pady=(5, 5)
         )
-        ttk.Entry(card_local, textvariable=self.app.flow_sigma_var, width=14).grid(
+        ttk.Entry(card_local, textvariable=self.model.flow_sigma_var, width=14).grid(
             row=1, column=3, sticky="w", padx=8, pady=(5, 5)
         )
 
         ttk.Checkbutton(
             card_local,
             text="Gerar imagens de diagnóstico nas âncoras (debug)",
-            variable=self.app.flow_debug_var,
+            variable=self.model.flow_debug_var,
         ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(10, 8))
 
         # Botões de Ação - Local Flow
@@ -85,18 +122,18 @@ class FlowView(BaseAstroView):
         advanced.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(0, 8))
         ttk.Label(advanced, text="Perfil:").grid(row=0, column=0, sticky="w")
         ttk.Combobox(
-            advanced, textvariable=self.app.flow_profile_var, values=["Stable", "Fast"],
+            advanced, textvariable=self.model.flow_profile_var, values=["Stable", "Fast"],
             state="readonly", width=12,
         ).grid(row=0, column=1, sticky="w", padx=8)
         ttk.Label(advanced, text="Detector:").grid(row=0, column=2, sticky="w")
         ttk.Combobox(
-            advanced, textvariable=self.app.flow_detector_engine_var,
+            advanced, textvariable=self.model.flow_detector_engine_var,
             values=["", "dao", "opencv-contours", "opencv-components", "sep"],
             state="readonly", width=20,
         ).grid(row=0, column=3, sticky="w", padx=8)
         ttk.Label(advanced, text="Fallback:").grid(row=1, column=0, sticky="w", pady=(6, 0))
         ttk.Combobox(
-            advanced, textvariable=self.app.flow_transform_fallback_var,
+            advanced, textvariable=self.model.flow_transform_fallback_var,
             values=["Disabled", "astroalign-asterism"], state="readonly", width=20,
         ).grid(row=1, column=1, sticky="w", padx=8, pady=(6, 0))
         ttk.Label(
@@ -111,24 +148,24 @@ class FlowView(BaseAstroView):
         self.btn_select_anchor = ttk.Button(
             actions_local,
             text="🖼 Definir referência",
-            command=self.app.open_anchor_selector,
+            command=self.model.open_anchor_selector,
         )
         self.btn_select_anchor.grid(row=0, column=0, sticky="w", padx=(0, 6), ipady=3)
 
         self.btn_preview_flow = ttk.Button(
             actions_local,
             text="🔍 Preview detecção",
-            command=self.app.show_astroflow_preview,
+            command=self.model.show_astroflow_preview,
         )
         self.btn_preview_flow.grid(row=0, column=1, sticky="w", padx=6, ipady=3)
 
-        self.app.btn_run_flow = ttk.Button(
+        self.btn_run_flow = ttk.Button(
             actions_local,
             text="▶ Executar AstroFlow (Local + Global)",
             style="Accent.TButton",
-            command=self.app.start_flow_processing,
+            command=self.model.start_flow_processing,
         )
-        self.app.btn_run_flow.grid(row=0, column=2, sticky="e", ipady=3)
+        self.btn_run_flow.grid(row=0, column=2, sticky="e", ipady=3)
 
         # ============================================================
         # CARD 2: Pareamento Global
@@ -149,7 +186,7 @@ class FlowView(BaseAstroView):
         )
         self.combo_global_master = ttk.Combobox(
             card_global,
-            textvariable=self.app.flow_global_master_var,
+            textvariable=self.model.flow_global_master_var,
             values=["Auto"],
             state="readonly",
             width=14,
@@ -160,13 +197,13 @@ class FlowView(BaseAstroView):
             row=0, column=2, sticky="w", pady=(0, 5)
         )
         ttk.Entry(
-            card_global, textvariable=self.app.flow_matching_radius_var, width=14
+            card_global, textvariable=self.model.flow_matching_radius_var, width=14
         ).grid(row=0, column=3, sticky="w", padx=8, pady=(0, 5))
 
         ttk.Label(card_global, text="RANSAC threshold:").grid(
             row=1, column=0, sticky="w", pady=(5, 5)
         )
-        ttk.Entry(card_global, textvariable=self.app.flow_ransac_var, width=14).grid(
+        ttk.Entry(card_global, textvariable=self.model.flow_ransac_var, width=14).grid(
             row=1, column=1, sticky="w", padx=8, pady=(5, 5)
         )
 
@@ -176,10 +213,10 @@ class FlowView(BaseAstroView):
         ratio_frame = ttk.Frame(card_global)
         ratio_frame.grid(row=1, column=3, sticky="w", padx=8, pady=(5, 5))
         ttk.Entry(
-            ratio_frame, textvariable=self.app.flow_min_inliers_var, width=6
+            ratio_frame, textvariable=self.model.flow_min_inliers_var, width=6
         ).pack(side="left")
         ttk.Label(ratio_frame, text=" / ").pack(side="left")
-        ttk.Entry(ratio_frame, textvariable=self.app.flow_min_ratio_var, width=6).pack(
+        ttk.Entry(ratio_frame, textvariable=self.model.flow_min_ratio_var, width=6).pack(
             side="left"
         )
 
@@ -202,18 +239,18 @@ class FlowView(BaseAstroView):
         self.btn_viz_flow = ttk.Button(
             actions_global,
             text="📈 Visualizar 3D",
-            command=self.app.show_flow_visualization,
+            command=self.model.show_flow_visualization,
         )
         self.btn_viz_flow.grid(row=0, column=2, sticky="e", padx=6, ipady=3)
 
-        self.app.btn_cancel_flow = ttk.Button(
+        self.btn_cancel_flow = ttk.Button(
             actions_global,
             text="Cancelar",
             style="Danger.TButton",
-            command=self.app.cancel_processing,
+            command=self.model.cancel_processing,
             state="disabled",
         )
-        self.app.btn_cancel_flow.grid(row=0, column=3, sticky="e", ipady=3)
+        self.btn_cancel_flow.grid(row=0, column=3, sticky="e", ipady=3)
 
         # Container de Thumbnails
         self._build_reference_preview(self)
@@ -249,7 +286,7 @@ class FlowView(BaseAstroView):
 
         canvas = tk.Canvas(
             canvas_container,
-            background=self.app.BG,
+            background=self.model.BG,
             highlightthickness=0,
             borderwidth=0,
         )
@@ -296,38 +333,46 @@ class FlowView(BaseAstroView):
         sem recalcular os Flows Locais.
         Injeta uma flag na configuração para que a lógica principal saiba.
         """
-        if self.app.worker and self.app.worker.is_alive():
+        if self.model.is_busy and self.model.is_busy():
             return
 
-        base_dir_str = self.app.batch_dir_var.get()
+        base_dir_str = self.model.batch_dir_var.get()
         if not base_dir_str:
-            self.app.print_to_console("ERRO: Selecione a Pasta Base primeiro.\n")
+            self.model.print_to_console("ERRO: Selecione a Pasta Base primeiro.\n")
             return
 
         batch_dir = Path(base_dir_str).expanduser().resolve()
 
-        config = {
-            "custom_anchors": dict(self.app.custom_anchors),
-            "global_master": self.app.flow_global_master_var.get(),
-            "fwhm": self.app.flow_fwhm_var.get(),
-            "sigma": self.app.flow_sigma_var.get(),
-            "matching_radius": self.app.flow_matching_radius_var.get(),
-            "ransac": self.app.flow_ransac_var.get(),
-            "debug_images": self.app.flow_debug_var.get(),
-            "min_stars": self.app.flow_min_stars_var.get(),
-            "min_inliers": self.app.flow_min_inliers_var.get(),
-            "min_ratio": self.app.flow_min_ratio_var.get(),
-            "max_stars": 150,
-            "engine": self.app.flow_engine_var.get(),
-            "skip_local_flow": True,  # <--- Flag cruciaL adicionada
-        }
+        from app.application.commands import FlowCommand
 
-        self.app.save_settings()
-        self.app._lock_ui("Flow")
-        self.app.worker = threading.Thread(
-            target=self.app.run_flow_logic, args=(batch_dir, config), daemon=True
-        )
-        self.app.worker.start()
+        try:
+            config = FlowCommand.from_values(
+                batch_dir,
+                custom_anchors=dict(self.model.custom_anchors),
+                global_master=self.model.flow_global_master_var.get(),
+                fwhm=self.model.flow_fwhm_var.get(),
+                sigma=self.model.flow_sigma_var.get(),
+                matching_radius=self.model.flow_matching_radius_var.get(),
+                ransac=self.model.flow_ransac_var.get(),
+                debug_images=self.model.flow_debug_var.get(),
+                min_stars=self.model.flow_min_stars_var.get(),
+                min_inliers=self.model.flow_min_inliers_var.get(),
+                min_ratio=self.model.flow_min_ratio_var.get(),
+                max_stars=150,
+                engine=self.model.flow_engine_var.get(),
+                engine_profile=self.model.flow_profile_var.get(),
+                detector_engine=self.model.flow_detector_engine_var.get(),
+                transform_fallback=self.model.flow_transform_fallback_var.get(),
+                memory_budget_mb=self.model.resource_memory_var.get(),
+                flow_workers=self.model.resource_workers_var.get(),
+                skip_local_flow=True,
+            )
+        except (TypeError, ValueError) as exc:
+            self.model.print_to_console(f"[Flow] Parâmetros inválidos: {exc}\n")
+            return
+
+        self.model.save_settings()
+        self.model._start_operation("Flow", config)
 
     def _load_reference_thumbnail(self, filepath):
         """
@@ -395,7 +440,7 @@ class FlowView(BaseAstroView):
         ):
             return
 
-        base_dir_str = self.app.batch_dir_var.get()
+        base_dir_str = self.model.batch_dir_var.get()
         if not base_dir_str:
             self._show_empty_reference_preview(
                 "Selecione uma Pasta Base para visualizar as referências."
@@ -447,18 +492,28 @@ class FlowView(BaseAstroView):
         references = []
 
         for batch_dir in batch_folders:
-            frame_name = self.app.custom_anchors.get(batch_dir.name)
+            frame_name = self.model.custom_anchors.get(batch_dir.name)
 
             if not frame_name:
                 continue
 
             frame_path = batch_dir / frame_name
+            try:
+                from astroalign_logic import load_local_flow
+
+                local_flow = load_local_flow(batch_dir)
+            except Exception as exc:
+                local_flow = None
+                self.model.print_to_console(
+                    f"[Flow] Não foi possível carregar a proveniência de {batch_dir.name}: {exc}\n"
+                )
+            provenance = format_reference_provenance(local_flow, frame_name)
 
             if not frame_path.is_file():
-                references.append((batch_dir.name, frame_name, None))
+                references.append((batch_dir.name, frame_name, None, provenance))
                 continue
 
-            references.append((batch_dir.name, frame_name, frame_path))
+            references.append((batch_dir.name, frame_name, frame_path, provenance))
 
         if not references:
             self._show_empty_reference_preview(
@@ -478,7 +533,7 @@ class FlowView(BaseAstroView):
         # ----------------------------------------------------
         cards = []
 
-        for index, (batch_name, frame_name, frame_path) in enumerate(references):
+        for index, (batch_name, frame_name, frame_path, provenance) in enumerate(references):
             row = index // 4
             column = index % 4
 
@@ -489,53 +544,54 @@ class FlowView(BaseAstroView):
             )
 
             card.grid(row=row, column=column, sticky="nsew", padx=5, pady=5)
-            cards.append((card, batch_name, frame_name, frame_path))
+            cards.append((card, batch_name, frame_name, frame_path, provenance))
 
-        # ----------------------------------------------------
-        # Threads individuais para thumbnails
-        # ----------------------------------------------------
-        for card, batch_name, frame_name, frame_path in cards:
-            threading.Thread(
-                target=self._load_card,
-                args=(card, batch_name, frame_name, frame_path, generation),
-                daemon=True,
-            ).start()
+        self._preview_cards.clear()
+        requests = []
+        for index, (card, batch_name, frame_name, frame_path, provenance) in enumerate(cards):
+            key = (generation, index)
+            self._preview_cards[key] = (card, batch_name, frame_name, provenance)
+            if frame_path is None:
+                self._populate_reference_card_error(
+                    card, batch_name, frame_name,
+                    f"{provenance}\nArquivo não encontrado",
+                )
+            else:
+                requests.append((key, frame_path))
+        self._preview_service.replace(generation, requests)
+        self._schedule_preview_poll(generation)
 
-    # ----------------------------------------------------
-    # Carregamento paralelo dos thumbnails e UI
-    # ----------------------------------------------------
-    def _load_card(self, card, batch_name, frame_name, frame_path, generation):
+    def _schedule_preview_poll(self, generation):
         if generation != self.reference_preview_generation:
             return
+        if self._preview_after_id:
+            try:
+                self.after_cancel(self._preview_after_id)
+            except tk.TclError:
+                pass
+        self._preview_after_id = self.after(40, lambda: self._poll_preview_results(generation))
 
-        if frame_path is None:
-            self.after(
-                0,
-                lambda: self._populate_reference_card_error(
-                    card, batch_name, frame_name, "Arquivo não encontrado"
-                ),
-            )
+    def _poll_preview_results(self, generation):
+        self._preview_after_id = None
+        if generation != self.reference_preview_generation:
             return
-
-        try:
-            image = self._load_reference_thumbnail(frame_path)
-            self.after(
-                0,
-                lambda img=image: self._populate_reference_card(
-                    card, batch_name, frame_name, img, generation
-                ),
-            )
-        except Exception:  # Fixed undefined 'exc' variable
-            self.after(
-                0,
-                lambda: self._populate_reference_card_error(
-                    card, batch_name, frame_name, str(exc)
-                ),
-            )
-            self.reference_preview_canvas.yview_moveto(0)
+        for result in self._preview_service.drain():
+            if result.generation != generation:
+                continue
+            card_info = self._preview_cards.get(result.key)
+            if not card_info:
+                continue
+            card, batch_name, frame_name, provenance = card_info
+            if result.error:
+                self._populate_reference_card_error(card, batch_name, frame_name, result.error)
+            else:
+                self._populate_reference_card(
+                    card, batch_name, frame_name, result.image, generation, provenance
+                )
+        self._schedule_preview_poll(generation)
 
     def _populate_reference_card(
-        self, card, batch_name, frame_name, img_array, generation
+        self, card, batch_name, frame_name, img_array, generation, provenance
     ):
         if not card.winfo_exists() or generation != self.reference_preview_generation:
             return
@@ -555,6 +611,10 @@ class FlowView(BaseAstroView):
         ttk.Label(card, text=frame_name, style="Muted.TLabel", anchor="center").pack(
             fill=tk.X
         )
+        ttk.Label(
+            card, text=provenance, style="Muted.TLabel", anchor="center",
+            wraplength=210, justify="center",
+        ).pack(fill=tk.X, pady=(2, 2))
 
     def _populate_reference_card_error(self, card, batch_name, frame_name, error):
         if not card.winfo_exists():
@@ -606,4 +666,4 @@ class FlowView(BaseAstroView):
     def on_theme_changed(self, is_dark: bool):
         """Atualiza widgets nativos do Tkinter que não herdam o ttk.Style automaticamente."""
         if hasattr(self, "reference_preview_canvas") and self.reference_preview_canvas:
-            self.reference_preview_canvas.configure(background=self.app.BG)
+            self.reference_preview_canvas.configure(background=self.model.BG)

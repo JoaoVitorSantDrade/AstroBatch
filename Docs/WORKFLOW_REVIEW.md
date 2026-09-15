@@ -1,6 +1,6 @@
 # Workflow, usability and performance review
 
-> Current status: see **Resumed implementation and UI architecture foundation (2026-09-05)** at the end of this document. Final verification of this delivery: **126 tests passed**, compilation and whitespace checks passed. Earlier stop/audit sections are historical. Real-capture validation and the complete migration of legacy views remain pending.
+> Current status: see **Current presentation and revision follow-up** at the end of this document. Final verification of the current checkout: **158 passed, 1 skipped**, compilation and whitespace checks passed. Earlier stop/audit sections are historical. Real-capture validation and manual visual review remain pending.
 
 ## Stage 1: inspect and reproduce
 
@@ -263,7 +263,7 @@ The user resumed bug fixing and implementation, with maintainability and easier 
 - **Reusable form scrolling:** Calibration, Batch, Flow, Align and HDR use `ScrollableHost`; Stack keeps its existing canvas. Mouse-wheel bindings are scoped to each form. Pending host callbacks are cancelled on destruction. The application's minimum window height was reduced from 1020 to 700, with scrolling for longer forms.
 - **Less duplicated UI wiring:** one operation-button mapping controls lock/unlock for all stages. Shared Flow/Align resource controls now live in the project panel. HDR has a working save-file dialog, a native Align-output handoff, clearer field labels and six editable native fields.
 
-This is an implemented migration foundation, not a claim that `main.py` has become a composition-only root. The five legacy views and several preview/selection dialogs still depend on it.
+This is an implemented migration foundation, not a claim that `main.py` has become a composition-only root. The Flow, Align and Stack views and several preview/selection dialogs still depend on it.
 
 ### Bugs fixed since the stop audit
 
@@ -304,7 +304,7 @@ Reproduce with `.venv/Scripts/python.exe benchmarks/flow_workflow_benchmark.py`.
 
 ### Remaining limitations and next UI phase
 
-1. **Finish the presentation migration.** Move the five remaining tabs to passive view models/commands, extract preview/anchor dialogs and their asynchronous lifecycle from `main.py`, and centralize stage registration so adding a stage does not require repeated UI wiring. Preserve all native settings and existing behavior.
+1. **Finish the presentation migration.** Move the three remaining Flow, Align and Stack views to passive view models/commands, extract preview/anchor dialogs and their asynchronous lifecycle from `main.py`, and centralize stage registration so adding a stage does not require repeated UI wiring. Preserve all native settings and existing behavior.
 2. **Complete typed commands.** Resources and HDR have shared validation; the older stages still build legacy dictionaries/configs. Move remaining validation into testable application commands, then reduce `main.py` to composition and rendering. Versioned settings storage exists, but the Tk-variable registry is still the form binding layer.
 3. **Expand scientific validation.** No real unguided captures are available. Validate retained integration time, star shapes, registration residuals and background noise on equal-exposure data first. Optional asterism confidence is deliberately conservative, not probabilistic. HDR uses a constant-noise model and advisory scatter flags, not PSF-aware proper coaddition or ghost reconstruction.
 4. **Measure realistic resource use.** Full sensor/RGB peak-RSS, compression-heavy throughput and cancellation latency under large workloads are not yet measured. The conservative frame estimate can reject a low configured RAM target; increasing the target is explicit. HDR still retains complete output/mask planes plus row-band accumulators.
@@ -312,3 +312,84 @@ Reproduce with `.venv/Scripts/python.exe benchmarks/flow_workflow_benchmark.py`.
 6. **Compatibility and visual review.** Stable's historical Lanczos label still routes through its legacy cubic interpolation path; correcting that naming/behavior needs an explicit compatibility migration. Full visual review across themes/DPI remains pending. Existing preview code has not all migrated to the new runner, and the bounded activity buffer intentionally discards older entries under sustained floods.
 
 The current bug-fix and architecture-foundation delivery is verified and ready for review. The next phase is the remaining UI architecture migration above; neither that full migration nor real-data scientific validation is marked complete.
+
+## Typed command and preview follow-up (2026-09-09)
+
+The next migration slice is now implemented and verified:
+
+- `CalibrationCommand` and `BatchCommand` validate widget values and adapt to
+  the existing processing APIs without changing the saved settings shape.
+- `FlowCommand` and `AlignCommand` carry the normal start paths through the
+  shared `PipelineRunner`; the Global Flow-only action no longer starts a
+  separate worker.
+- Calibration and Batch now use passive view models. Their native controls,
+  defaults, presets and shared run/cancel button lifecycle remain intact.
+- Flow detection preview runs in a worker and renders through Tk. Stale
+  generations and closed preview/anchor windows ignore late results; worker
+  errors retain their actual messages.
+
+Validation for this follow-up: **134 tests passed**, compilation passed and
+`git diff --check` passed. The remaining architecture work is Stack's typed
+command/passive view migration, central stage registration, and complete
+preview/anchor extraction from `main.py`. Resource stress measurements and
+representative real-capture validation remain open gates.
+
+## Reference propagation and neighbor registration (2026-09-09)
+
+The registration delivery is now implemented in the processing layer:
+
+- Local Flow uses a deterministic natural-frame order and expands from the
+  selected reference through accepted neighbors. It retries candidates within
+  a four-frame window, keeps direction-specific temporal history, bypasses
+  rejected frames when a valid route exists, and persists a versioned graph of
+  nodes, validated edges, metrics, parent frames and hop counts. Existing
+  per-frame `matrix`, `relative_matrix` and `relative_to` fields remain.
+  `registration_strategy=legacy` remains available for comparison.
+- Global Flow seeds the connected set with every successful direct master
+  match before neighbor propagation. Its persisted graph records direct seeds,
+  propagated edges and disconnected batches explicitly.
+- Flow revisions include input/settings fingerprints. `rebase_flow_reference`
+  re-roots a connected local graph without FITS decoding or star detection,
+  and `apply_reference_change` publishes the metadata-only change through the
+  shared runner. Local matrices use `inverse(Lr) @ Li`; global batch matrices
+  use `G @ Lr`, preserving the final `G × L` geometry.
+- Align still computes final transforms as `global × local` and warps each
+  source frame once. Its quality gate now tries a bounded cache of local graph
+  parents and batch references in the output grid. Results distinguish
+  `verified`, `insufficient_overlap`, `failed_quality` and `unverified`, while
+  the disabled gate keeps advisory reporting.
+
+Focused Flow/Align regressions cover middle-reference expansion, bad-frame
+bypass, reference rebasing without FITS access and insufficient-overlap
+reporting. That delivery's verification: **142 tests passed**, compilation and
+`git diff --check` passed. Full-sensor RSS/throughput measurements and
+representative real captures remain open; expanded union canvases are deferred
+and current output dimensions are unchanged.
+
+## Current presentation and revision follow-up
+
+The presentation migration now includes passive Flow, Align and Stack models,
+centralized `StackCommand` validation, a stage-definition registry that builds
+all six model/view pairs, and a bounded queue-based preview service. Flow
+thumbnail, detection-preview and anchor-preview workers do not call Tk;
+generation checks and dialog shutdown discard late results. The anchor dialog
+controller owns pending/apply/commit state and hands reference changes to the
+shared runner. Stack scrolling is scoped to its own canvas.
+
+Align quality references are now demand-driven and mask-aware. A frame cannot
+validate itself, references beyond the first cache window can be loaded on
+demand, and `VALID_MASK`/`SAT_MASK` are used for common-pixel checks.
+
+Reference changes validate the persisted input fingerprint before rebasing.
+Local and global snapshots are written below `.flow_revisions/<revision>` and
+one `flow_revision.json` manifest selects the active pair. Existing mutable
+`flow_local.json` and `global_flow.json` files remain compatibility fallbacks;
+application readers honor the manifest first. Global graph edges in both
+directions are rebased, while geometry revisions remain separate from metadata
+reference revisions.
+
+The full-sensor resource gate, representative real-capture gate and visual
+review across DPI/themes remain open. Synthetic benchmark numbers continue to
+describe only their recorded workloads. Current checkout verification is
+**158 passed, 1 skipped**; compilation and `git diff --check` also pass. The
+skip is the existing display-dependent Tk case in this environment.

@@ -18,10 +18,44 @@ class V1UiContractTests(unittest.TestCase):
             "stack_selection_mode_var", "stack_method_var", "stack_rejection_method_var",
             "stack_normalize_var", "stack_output_name_var", "stack_compress_var",
         }
-        missing = sorted(name for name in required if f"self.app.{name}" not in views)
+        calibration_model_names = {
+            "apply_dark_var": "apply_dark",
+            "apply_flat_var": "apply_flat",
+            "calib_overwrite_var": "overwrite",
+            "batch_input_dir_var": "input_dir",
+            "batch_dir_var": "output_dir",
+            "opt_method_var": "opt_method",
+            "crop_size_var": "crop_size",
+            "downsample_method_var": "downsample_method",
+            "downsample_scale_var": "downsample_scale",
+            "threshold_var": "threshold",
+            "copy_files_var": "copy_files",
+            "batch_overwrite_var": "overwrite",
+            "dry_run_var": "dry_run",
+        }
+        missing = sorted(
+            name for name in required
+            if f"self.app.{name}" not in views
+            and f"self.model.{calibration_model_names.get(name, name)}" not in views
+        )
         self.assertEqual(missing, [])
+
+    def test_calibration_view_uses_passive_model_bindings(self) -> None:
+        source = (ROOT / "views" / "calibration_view.py").read_text(encoding="utf-8")
+        self.assertIn("CalibrationViewModel", source)
+        self.assertNotIn("self.app.", source)
+
+    def test_batch_view_uses_passive_model_bindings(self) -> None:
+        source = (ROOT / "views" / "batch_view.py").read_text(encoding="utf-8")
+        self.assertIn("BatchViewModel", source)
+        self.assertNotIn("self.app.", source)
 
     def test_theme_declares_high_contrast_editable_field_states(self) -> None:
         source = (ROOT / "main.py").read_text(encoding="utf-8")
         for token in ("fieldbackground=\"#ffffff\"", "insertcolor=self.TEXT", "selectforeground", "TCombobox*Listbox.foreground"):
             self.assertIn(token, source)
+
+    def test_stack_mousewheel_binding_is_scoped_to_its_canvas(self) -> None:
+        source = (ROOT / "views" / "stacking_view.py").read_text(encoding="utf-8")
+        self.assertIn('canvas.bind("<MouseWheel>"', source)
+        self.assertNotIn("bind_all(\"<MouseWheel>\"", source)

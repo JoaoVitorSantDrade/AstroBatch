@@ -4,9 +4,9 @@ from tkinter import ttk
 class BaseAstroView(ttk.Frame):
     """Classe base para todas as abas, contendo os métodos utilitários de UI."""
 
-    def __init__(self, parent, app, padding=18):
+    def __init__(self, parent, model, padding=18):
         super().__init__(parent, padding=padding)
-        self.app = app  # Referência ao AstroProcessManager (Controller)
+        self.model = model
 
     def _path_row(
         self, parent, row, label, variable, browse_command, browse_text="Selecionar"
@@ -51,4 +51,6 @@ class BaseAstroView(ttk.Frame):
         # Como o Console fica no Main (fora da Tab), ele será ignorado aqui.
         if widget_under_mouse and str(widget_under_mouse).startswith(str(self)):
             # Substitua 'self.canvas' pelo nome exato da sua variável de Canvas, se for diferente
-            self.app.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            canvas = getattr(self.model, "canvas", None)
+            if canvas is not None:
+                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")

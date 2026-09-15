@@ -1,72 +1,76 @@
-# V2 Engines and Performance Architecture
+# AstroBatch roadmap
 
-## Summary
+## Current baseline
 
-Refactor Flow, Align and Stack around an internal CPU-first engine registry with two profiles:
+AstroBatch is CPU-first and Stable remains the default. Existing processing APIs,
+uint16 FITS output, FITS masks, compression/cache behavior and settings format
+remain compatibility boundaries.
 
-- **Stable** preserves V1 behavior and numerical compatibility.
-- **Fast** selects validated accelerated engines with defined scientific tolerances.
-- The UI shows the profile by default; technical engine choices live under **Advanced**.
+Delivered in the current checkout:
 
-Astroalign will be added as an optional **asterism-transform fallback**, not as the default Fast engine: its triangle matching is appropriate for stellar images without WCS and is robust to seeing/PSF differences, but is a reliability path rather than a throughput optimization. [Astroalign documentation](https://astroalign.quatrope.org/en/latest/)
+- One PipelineRunner and typed adapters for Calibration, Batch, Flow, Align,
+  Stack, HDR and reference changes, with explicit success, partial, failure and
+  cancellation outcomes.
+- Local/global registration graphs with natural ordering, neighbor recovery,
+  direct global seeds, fingerprints, parent/hop provenance and legacy strategy
+  compatibility.
+- Align quality checks that exclude self previews, use valid/unsaturated masks,
+  and load graph references through a bounded lazy cache.
+- Reference rebasing that validates current inputs, preserves final geometry,
+  updates both directions of global graph edges, and switches immutable local /
+  global snapshots through one active manifest. Legacy JSON files remain a
+  fallback for older projects.
+- Passive view models for all six stages, StackCommand validation, scoped
+  scrolling, and a shared two-worker preview service. Workers return data or
+  errors through queues; Tk polling owns widget updates.
+- A stage-definition registry that builds all six passive model/view pairs from
+  an explicit `StageContext`, including operation controls and scroll-host
+  policy. main.py now supplies bindings and shared feedback only.
+- A dedicated anchor-selection controller owning pending/applied reference
+  state, preview generations, dialog shutdown and reference-change handoff.
+- Flow reference cards show accepted/rejected status, recovery method, parent,
+  hop count and confidence when persisted graph data is available.
 
-## Architecture and interfaces
+Synthetic benchmarks remain tied to their original workloads. Historical GPU
+material is complete documentation, not a new feature backlog.
 
-- Add `app/engines/` with:
-  - `EngineDescriptor`: id, stage, profile support, capabilities, availability reason.
-  - Protocols: `StarDetector`, `TransformEstimator`, `WarpEngine`, `ChannelRefiner`, `StackReducer`.
-  - `EngineRegistry`: explicit built-in registration, validation and fallback. External package discovery is deferred.
-  - `EngineSelection`: typed persisted settings; legacy `flow_engine` maps to its detector choice.
-- Engines receive typed inputs, cancellation, worker budget and event sink; they return typed results/metrics. Pipelines depend on protocols rather than OpenCV, Numba, Photutils, SEP or Astroalign imports.
-- Add an execution-budget policy so frame/batch thread pools and parallel Numba kernels never oversubscribe CPU.
-- Keep existing public processing functions as V1 adapters until each pipeline has migrated.
+## Next implementation slices
 
-## Engines, methods and kernels
+1. **Finish manual presentation review.** Exercise the six registry-built tabs
+   and anchor dialog at small window sizes, with keyboard focus, scrolling,
+   themes and DPI changes. Keep settings persistence and shared feedback in
+   the composition root.
 
-- **Flow**
-  - Stable retains DAO, current OpenCV contour detection, KD-tree matching and affine RANSAC.
-  - Fast adds `opencv-components`: native connected-components statistics plus NumPy filtering, removing Python contour/moment work.
-  - Add optional `sep` detection with lazy import and explicit unavailable status. SEP provides source extraction plus spatial background estimation. [SEP API](https://sep.readthedocs.io/en/stable/reference.html)
-  - Add optional `astroalign-asterism` transform fallback. It receives already-detected `(x, y)` stars, calls Astroalign’s coordinate-capable `find_transform`, converts its `SimilarityTransform` to the pipeline’s 3×3 matrix, and reuses AstroBatch’s own OpenCV warp/mask path. This prevents duplicate image detection and preserves FITS/mask behavior. Astroalign exposes both coordinate input and a `max_control_points` control. [Astroalign API](https://astroalign.quatrope.org/en/latest/api.html)
-  - Expose the fallback as `Disabled | Astroalign asterisms` in Advanced; it is attempted only after the primary matcher rejects a frame.
-  - Fix Flow worker count so `ThreadPoolExecutor` always receives an integer.
+2. **Complete revision consumers and provenance.** Route every Flow reader,
+   visualization and Stack handoff through the active manifest. Add explicit
+   stale/disconnected status to the UI and expose revision, parent, hop count,
+   recovery method and rejection reason. Keep final-geometry revisions separate
+   from reference metadata revisions so an equivalent rebase does not force
+   unnecessary Align regeneration.
 
-- **Align**
-  - Extract current OpenCV and scikit-image paths into `WarpEngine`s.
-  - Stable keeps OpenCV nearest/bilinear and compatibility implementations for bicubic/Lanczos.
-  - Fast adds native OpenCV cubic/Lanczos4 and native RGB micro-registration, enabled only after tolerance validation.
-  - Keep Astroalign out of image warping: its transform-estimation engine augments Flow; AstroBatch retains one output/mask implementation.
-  - Flatten eligible frame work across batches under one bounded executor.
+3. **Maintain asynchronous preview lifecycle.** The service now bounds
+   submitted work and result retention, reports worker errors, discards stale
+   generations and closes idempotently. Keep these tests alongside future
+   preview changes and ensure workers never call Tk.
 
-- **Stack**
-  - Introduce `StackReducer`; Stable retains NumPy/Astropy behavior.
-  - Add cacheable Numba Fast kernels for masked sum+count, mean, min/max, normalization/mask application and weighted leaf merge.
-  - Use `njit(parallel=True)`/`prange` only for independent per-pixel work and only when the execution budget reserves kernel threads. [Numba parallel-loop documentation](https://numba.readthedocs.io/en/stable/user/parallel.html)
-  - Fast initially covers Mean, Sum, Minimum and Maximum without rejection. Median, SigmaClip, MAD and Winsorized remain Stable until benchmarked candidates meet tolerance and memory gates.
-  - Preserve Astropy’s optimized string-configured statistics and Bottleneck support for sigma clipping. [Astropy performance guidance](https://docs.astropy.org/en/stable/stats/index.html)
+4. **Measure resources and real captures.** Add repeatable full-sensor mono/RGB
+   workloads for peak RSS, compressed/uncompressed throughput, cancellation
+   latency and recovered-frame error. Validate equal-exposure unguided captures
+   for retained integration, residuals, stellar roundness, background noise,
+   clipping masks and uint16 quantization. Leave this gate open until captures
+   exist.
 
-## Migration and UI
+5. **Usability and compatibility review.** Test small windows, themes, DPI,
+   keyboard focus, scrolling, preview failures, cancellation and settings
+   round trips. Keep current output dimensions; expanded union canvases, new
+   engines, noise models and the Stable Lanczos compatibility decision require
+   separate proposals.
 
-1. Add engine contracts, registry, profile/selection persistence and legacy adapters without algorithm changes.
-2. Migrate Flow detectors, primary transform, and Astroalign fallback.
-3. Migrate Align warp/refinement engines and global scheduling.
-4. Migrate Stack reducers and kernels behind capability/profile gates.
-5. Replace direct Tk-variable algorithm selection with typed commands and registry-backed Advanced controls.
+## Acceptance rules
 
-Missing optional dependencies never silently alter a result: the UI explains the unavailable engine, while profile fallback occurs only under explicit policy.
-
-## Test plan
-
-- Registry and adapter tests: legacy migration, engine resolution, unavailable SEP/Astroalign, cancellation, fallback and event propagation.
-- Stable golden tests preserve current output, flow metadata and FITS behavior.
-- Astroalign fallback fixtures cover large shift/rotation/scale, variable PSF and failure (`MaxIterError`); verify matrix validity, mask preservation and no duplicate detector invocation.
-- Fast tests use operation-specific tolerances, valid-mask identity, transform acceptance metrics and FITS integrity.
-- Concurrency tests verify integer worker counts and no nested oversubscription.
-- Repeated-median benchmarks cover Flow detection/matching, Align warps, and Stack reducers across mono/RGB and compressed/uncompressed FITS. Engines not faster than Stable on the reference workload remain experimental and are excluded from automatic Fast selection.
-
-## Assumptions
-
-- Engines remain internal built-ins in this delivery; third-party plugin discovery is deferred.
-- CPU is the immediate target; interfaces leave room for GPU later.
-- Stable remains default. Fast may have small documented floating-point differences within tested scientific tolerances.
-- Astroalign is optional and fallback-only; it improves registration resilience, not the default throughput path.
+- Every stage preserves native controls, defaults, presets, saved settings and
+  success/partial/failure/cancellation behavior.
+- A failed write or cancellation cannot activate a mixed Flow revision.
+- Existing numerical, FITS, mask, uint16 and rejection regressions remain green.
+- Architecture changes stay separate from numerical changes, and benchmark
+  claims remain workload-specific.

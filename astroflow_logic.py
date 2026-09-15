@@ -1,9 +1,13 @@
+import copy
+import hashlib
 import itertools
 import json
 import os
+import re
+import tempfile
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from collections import deque
+from collections import OrderedDict, deque
 from pathlib import Path
 
 import cv2
@@ -747,7 +751,8 @@ def process_local_flow(batch_dir: Path, config: dict, app_print, cancellation_ev
             p
             for p in batch_dir.iterdir()
             if p.is_file() and p.suffix.lower() in {".fit", ".fits", ".fts"}
-        ]
+        ],
+        key=_natural_frame_key,
     )
     if not files:
         return {}
@@ -802,6 +807,56 @@ def process_local_flow(batch_dir: Path, config: dict, app_print, cancellation_ev
     except OSError:
         raise ValueError("Could not inspect FITS dimensions for the Flow memory budget")
 
+    registration_strategy = str(config.get("registration_strategy", "neighbor_bfs")).strip().lower()
+    if registration_strategy not in {"neighbor_bfs", "legacy", "incremental_chain"}:
+        raise ValueError("registration_strategy must be neighbor_bfs or legacy")
+    if registration_strategy not in {"legacy", "incremental_chain"}:
+        # The graph builder keeps image preparation on demand and bounded. The
+        # legacy sequential implementation remains below as an explicit
+        # comparison strategy for existing projects.
+        graph_result = _build_local_registration_graph(
+            files,
+            anchor_file,
+            config,
+            limits,
+            matching_radius,
+            ransac_thresh,
+            engine_val,
+            engine_profile,
+            fallback_engine,
+            worker_count,
+            budget,
+            cancelled,
+            app_print,
+            batch_dir.name,
+        )
+        if graph_result is None or cancelled():
+            return {}
+        flow_data, anchor, anchor_quality, valid_count = graph_result
+        flow_data["registration_strategy"] = "neighbor_bfs"
+        output_path = batch_dir / "flow_local.json"
+        from app.infrastructure.json_store import atomic_json_write
+        atomic_json_write(output_path, flow_data)
+        total_count = len(files)
+        coverage = valid_count / max(total_count, 1)
+        app_print(
+            f"[{batch_dir.name}] Flow salvo: {valid_count}/{total_count} ({coverage:.1%})\n"
+        )
+        return {
+            "batch_name": batch_dir.name,
+            "anchor_path": anchor_file,
+            "anchor_data": None,
+            "anchor_stars": anchor["stars"],
+            "star_count": len(anchor["stars"]),
+            "fwhm": anchor["fwhm"],
+            "anchor_quality": anchor_quality,
+            "anchor_metrics": anchor.get("metrics", {}),
+            "valid_frames": valid_count,
+            "total_frames": total_count,
+            "coverage": coverage,
+            "local_transform_revision": flow_data.get("transform_revision"),
+        }
+
     # Prepare the anchor synchronously, then stream all other frames through a
     # bounded FIFO. No collection of phase images is built.
     _, anchor = _process_single_frame(anchor_file, fwhm_val, sigma_val, max_stars_val,
@@ -844,6 +899,7 @@ def process_local_flow(batch_dir: Path, config: dict, app_print, cancellation_ev
         "batch_anchor": anchor_file.name,
         "selected_reference": chosen_anchor_name,
         "mode": "incremental_chain",
+        "registration_strategy": "legacy",
         "workers": worker_count,
         "engine": engine_val,
         "engine_profile": str(config.get("engine_profile", "Stable")),
@@ -1123,10 +1179,11 @@ def process_local_flow(batch_dir: Path, config: dict, app_print, cancellation_ev
         ),
         "chain_segments": _count_chain_segments(flow_data),
     }
+    flow_data["geometry_revision"] = _geometry_revision(flow_data)
 
     output_path = batch_dir / "flow_local.json"
-    with output_path.open("w", encoding="utf-8") as f:
-        json.dump(flow_data, f, indent=4, ensure_ascii=False)
+    from app.infrastructure.json_store import atomic_json_write
+    atomic_json_write(output_path, flow_data)
 
     app_print(
         f"[{batch_dir.name}] Flow salvo: {valid_count}/{total_count} ({coverage:.1%})\n"
@@ -1401,7 +1458,7 @@ def process_all_flows(
 
     batch_folders = sorted(
         [d for d in base_dir.iterdir() if d.is_dir() and "batch" in d.name.lower()],
-        key=lambda p: p.name.lower(),
+        key=_natural_frame_key,
     )
     total_batches = len(batch_folders)
 
@@ -1415,20 +1472,24 @@ def process_all_flows(
 
     if skip_local:
         app_print("\n[GLOBAL] Recarregando Flows Locais existentes...\n")
+        from astroalign_logic import load_local_flow
         for batch_folder in batch_folders:
-            flow_path = batch_folder / "flow_local.json"
-            if not flow_path.exists():
+            local_data = load_local_flow(batch_folder)
+            if not isinstance(local_data, dict):
                 app_print(
                     f"[{batch_folder.name}] AVISO: flow_local.json ausente. Ignorando.\n"
                 )
                 continue
 
             try:
-                with flow_path.open("r", encoding="utf-8") as f:
-                    local_data = json.load(f)
-
                 anchor_name = local_data.get("batch_anchor")
                 if not anchor_name:
+                    continue
+                if not _persisted_local_flow_is_current(batch_folder, local_data):
+                    app_print(
+                        f"[{batch_folder.name}] AVISO: Flow Local antigo ou desatualizado; "
+                        "reexecute o Flow Local antes do Global.\n"
+                    )
                     continue
 
                 anchor_metrics = local_data.get("anchor_metrics", {})
@@ -1449,6 +1510,7 @@ def process_all_flows(
                         "total_frames", 0
                     ),
                     "coverage": local_data.get("statistics", {}).get("coverage", 0.0),
+                    "local_transform_revision": local_data.get("transform_revision"),
                 }
                 anchors_info.append(info)
             except Exception as exc:
@@ -1478,9 +1540,9 @@ def process_all_flows(
 
     if not anchors_info:
         app_print("Nenhum Flow Local válido foi produzido ou encontrado.\n")
-        return
+        return {"status": "failed", "reason": "no_current_local_flow"}
 
-    anchors_info.sort(key=lambda x: x["batch_name"].lower())
+    anchors_info.sort(key=lambda x: _natural_frame_key(x["batch_name"]))
 
     base_sigma = float(config.get("sigma", 5.0))
     engine_val = _flow_detector_choice(config)
@@ -1543,9 +1605,14 @@ def process_all_flows(
     limits = _global_limits(config)
 
     global_flow = {
-        "schema_version": 2,
-        "mode": "global_hybrid",
+        "schema_version": 3,
+        "mode": "global_neighbor_bfs",
         "global_master_batch": master_info["batch_name"],
+        "transform_revision": _registration_input_fingerprint(
+            [Path(item["anchor_path"]) for item in anchors_info],
+            {"master": master_info["batch_name"], "matching_radius": matching_radius,
+             "ransac": ransac_thresh, **limits},
+        )[:16],
         "parameters": {
             "matching_radius": matching_radius,
             "ransac": ransac_thresh,
@@ -1570,6 +1637,12 @@ def process_all_flows(
         "rotation_deg": 0.0,
         "scale": 1.0,
         "phase_response": 1.0,
+        "local_transform_revision": master_info.get("local_transform_revision"),
+    }
+    global_flow["source_revisions"] = {
+        info["batch_name"]: info.get("local_transform_revision")
+        for info in anchors_info
+        if info.get("local_transform_revision")
     }
 
     # O pareamento direto de cada batch contra o Master é independente entre
@@ -1607,6 +1680,35 @@ def process_all_flows(
             )
 
     ordered_global_matrices = {master_info["batch_name"]: np.eye(3, dtype=np.float64)}
+    global_graph_edges = []
+
+    # Every successful direct match is a seed before neighbor expansion.  The
+    # old loop re-ran these matches one at a time and could prevent an already
+    # validated distant batch from serving as a propagation source.
+    for target_info in sorted(targets_for_direct, key=lambda item: _natural_frame_key(item["batch_name"])):
+        target_name = target_info["batch_name"]
+        direct_matrix, direct_metrics = direct_results.get(target_name, (None, {}))
+        if direct_matrix is None or direct_metrics.get("status") != "accepted":
+            continue
+        ordered_global_matrices[target_name] = np.asarray(direct_matrix, dtype=np.float64)
+        global_flow["batches"][target_name] = {
+            "status": "accepted",
+            "matrix": np.asarray(direct_matrix, dtype=np.float64).tolist(),
+            "relative_matrix": np.asarray(direct_matrix, dtype=np.float64).tolist(),
+            "relative_to": master_info["batch_name"],
+            "strategy": "master_direct",
+            "hop_count": 1,
+            "local_transform_revision": target_info.get("local_transform_revision"),
+            **direct_metrics,
+        }
+        global_graph_edges.append({
+            "source": master_info["batch_name"],
+            "target": target_name,
+            "relative_matrix": np.asarray(direct_matrix, dtype=np.float64).tolist(),
+            "method": "master_direct",
+            "hop_count": 1,
+            "metrics": _flow_json_value(direct_metrics),
+        })
 
     for distance in range(1, len(anchors_info)):
         progress_made = False
@@ -1645,8 +1747,18 @@ def process_all_flows(
                             if ref_name == master_info["batch_name"]
                             else "neighbor_chain"
                         ),
+                        "hop_count": int(global_flow["batches"].get(ref_name, {}).get("hop_count", 0)) + 1,
+                        "local_transform_revision": target_info.get("local_transform_revision"),
                         **metrics,
                     }
+                    global_graph_edges.append({
+                        "source": ref_name,
+                        "target": target_name,
+                        "relative_matrix": matrix.tolist(),
+                        "method": "neighbor_chain",
+                        "hop_count": int(global_flow["batches"][target_name]["hop_count"]),
+                        "metrics": _flow_json_value(metrics),
+                    })
                     progress_made = True
                     break
         if not progress_made:
@@ -1667,6 +1779,7 @@ def process_all_flows(
                 "relative_matrix": direct_matrix.tolist(),
                 "relative_to": master_info["batch_name"],
                 "strategy": "master_direct",
+                "local_transform_revision": target_info.get("local_transform_revision"),
                 **direct_metrics,
             }
             ordered_global_matrices[batch_name] = direct_matrix
@@ -1699,6 +1812,7 @@ def process_all_flows(
                         "relative_matrix": matrix.tolist(),
                         "relative_to": ref_name,
                         "strategy": "neighbor_chain",
+                        "local_transform_revision": target_info.get("local_transform_revision"),
                         **metrics,
                     }
                     progress_made = True
@@ -1761,26 +1875,1035 @@ def process_all_flows(
             1 for item in global_flow["cross_checks"] if not item["consistent"]
         ),
     }
+    global_flow["registration_graph"] = {
+        "version": 1,
+        "strategy": "master_seed_neighbor_bfs",
+        "root": master_info["batch_name"],
+        "nodes": [
+            {
+                "id": info["batch_name"],
+                "sequence_index": index,
+                "status": global_flow["batches"].get(info["batch_name"], {}).get(
+                    "status", "rejected"
+                ),
+            }
+            for index, info in enumerate(anchors_info)
+        ],
+        "edges": global_graph_edges,
+    }
     global_flow["master_metrics"] = {
         "batch": master_info["batch_name"],
         "star_count": master_info["star_count"],
         "fwhm": master_info["fwhm"],
         "anchor_quality": master_info.get("anchor_quality", 0.0),
     }
+    global_flow["geometry_revision"] = _geometry_revision(global_flow)
 
     global_path = base_dir / "global_flow.json"
     if cancel_event.is_set():
         return {"status": "cancelled"}
     from app.infrastructure.json_store import atomic_json_write
-    atomic_json_write(global_path, global_flow)
+    # Prepare an immutable revision for readers. The legacy JSON files remain
+    # as compatibility copies, while the manifest switches all consumers to a
+    # complete local/global set in one atomic operation.
+    revision = str(global_flow.get("transform_revision") or hashlib.sha256(
+        json.dumps(global_flow, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()[:16])
+    snapshot_root = base_dir / ".flow_revisions" / revision
+    local_flows = {}
+    try:
+        for batch_folder in batch_folders:
+            local_path = batch_folder / "flow_local.json"
+            if not local_path.exists():
+                continue
+            local_data = load_local_flow(batch_folder) if 'load_local_flow' in locals() else json.loads(local_path.read_text(encoding="utf-8"))
+            if isinstance(local_data, dict):
+                local_snapshot = snapshot_root / "batches" / batch_folder.name / "flow_local.json"
+                atomic_json_write(local_snapshot, local_data)
+                local_flows[batch_folder.name] = str(local_snapshot.relative_to(base_dir))
+        global_snapshot = snapshot_root / "global_flow.json"
+        atomic_json_write(global_snapshot, global_flow)
+        manifest = {
+            "schema_version": 2,
+            "active_revision": revision,
+            "local_flows": local_flows,
+            "global_flow": str(global_snapshot.relative_to(base_dir)),
+        }
+        if cancel_event.is_set():
+            return {"status": "cancelled"}
+        atomic_json_write(base_dir / "flow_revision.json", manifest)
+        # Keep the compatibility files available for older scripts. Readers
+        # in this application use the manifest above.
+        atomic_json_write(global_path, global_flow)
+    except Exception as exc:
+        app_print(f"[GLOBAL] Falha ao publicar revisão imutável: {exc}\n")
+        return {"status": "failed", "reason": f"flow revision publish failed: {exc}"}
 
     app_progress(total_batches, total_batches, "AstroFlow Finalizado.")
     app_print(
         f"\n>>> AstroFlow Finalizado. {len(accepted_batches)}/{len(anchors_info)} Batches aceitas no Global Flow. <<<\n"
     )
-    return {"status": "partial" if rejected_batches else "success",
-            "message": f"Flow: {len(accepted_batches)}/{len(anchors_info)} batches aceitas.",
-            "output_path": str(global_path)}
+    return {
+        "status": "partial" if rejected_batches else "success",
+        "message": f"Flow: {len(accepted_batches)}/{len(anchors_info)} batches aceitas.",
+        "output_path": str(global_path),
+    }
+
+
+def _natural_frame_key(value: Path | str) -> tuple:
+    """Return a deterministic human/numeric ordering for frame names."""
+    name = Path(value).name.casefold()
+    parts = re.split(r"(\d+)", name)
+    return tuple((0, int(part)) if part.isdigit() else (1, part) for part in parts) + ((2, name),)
+
+
+def _registration_input_fingerprint(files: list[Path], parameters: dict) -> str:
+    """Fingerprint the registration inputs without decoding image pixels."""
+    manifest = []
+    for path in sorted(files, key=_natural_frame_key):
+        try:
+            stat = path.stat()
+            manifest.append({
+                "name": path.name,
+                "size": int(stat.st_size),
+                "mtime_ns": int(stat.st_mtime_ns),
+            })
+        except OSError:
+            manifest.append({"name": path.name, "missing": True})
+    payload = json.dumps(
+        {"files": manifest, "parameters": parameters},
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _geometry_revision(value: dict, matrix_key: str = "matrix") -> str:
+    """Stable revision for final geometry, independent of reference metadata."""
+    matrices = []
+    if isinstance(value, dict):
+        entries = value.get("frames") or value.get("batches") or {}
+        if isinstance(entries, dict):
+            for name in sorted(entries, key=_natural_frame_key):
+                matrix = entries[name].get(matrix_key) if isinstance(entries[name], dict) else None
+                if matrix is not None:
+                    matrices.append((name, np.asarray(matrix, dtype=np.float64).round(12).tolist()))
+    payload = json.dumps(matrices, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _persisted_local_flow_is_current(batch_folder: Path, local_data: dict) -> bool:
+    """Reject old graph results when files or registration settings changed."""
+    if not isinstance(local_data, dict) or not local_data.get("input_fingerprint"):
+        return False
+    files = sorted(
+        [
+            path
+            for path in batch_folder.iterdir()
+            if path.is_file() and path.suffix.lower() in {".fit", ".fits", ".fts"}
+        ],
+        key=_natural_frame_key,
+    )
+    parameters = dict(local_data.get("parameters") or {})
+    fingerprint = _registration_input_fingerprint(
+        files,
+        {
+            **parameters,
+            "registration_strategy": local_data.get("registration_strategy", "neighbor_bfs"),
+            "engine": local_data.get("engine", "DAO"),
+            "engine_profile": local_data.get("engine_profile", "Stable"),
+            "fallback": local_data.get("transform_fallback", "Disabled"),
+        },
+    )
+    return fingerprint == local_data.get("input_fingerprint")
+
+
+def _flow_json_value(value):
+    """Convert small numpy scalars/containers into JSON-safe values."""
+    if isinstance(value, np.generic):
+        return _flow_json_value(value.item())
+    if isinstance(value, np.ndarray):
+        return _flow_json_value(value.tolist())
+    if isinstance(value, float) and not np.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {str(key): _flow_json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_flow_json_value(item) for item in value]
+    return value
+
+
+def _attempt_local_edge(
+    ref_name: str,
+    target_name: str,
+    ref_frame: dict,
+    target_frame: dict,
+    anchor_name: str,
+    matching_radius: float,
+    ransac_thresh: float,
+    limits: dict,
+    fallback_engine: str,
+    primary: bool,
+    direction_history: list[tuple[float, float, float]] | None,
+    sequence_gap: int,
+):
+    """Try one parent/target edge using the existing registration contract.
+
+    ``primary`` retains the legacy normal/relaxed attempts for the nearest
+    parent. A farther parent is a bounded recovery attempt and gets one wider
+    probe. Keeping this distinction makes the graph deterministic while
+    preserving the old rejection and fallback semantics.
+    """
+    if (
+        not isinstance(ref_frame, dict)
+        or not isinstance(target_frame, dict)
+        or ref_frame.get("phase_data") is None
+        or target_frame.get("phase_data") is None
+    ):
+        return None, {"reason": "missing_phase_data", "matches": 0, "inliers": 0,
+                      "inlier_ratio": 0.0, "rms": 999.0}, "missing_data"
+
+    try:
+        phase_shift, phase_response = cv2.phaseCorrelate(
+            ref_frame["phase_data"], target_frame["phase_data"]
+        )
+        dx, dy = float(phase_shift[0]), float(phase_shift[1])
+        phase_response = float(phase_response)
+    except Exception:
+        dx, dy, phase_response = 0.0, 0.0, 0.0
+
+    if primary:
+        attempts = [("normal", matching_radius),
+                    ("relaxed_radius", matching_radius * 2.0)]
+    else:
+        attempts = [("anchor" if ref_name == anchor_name else "neighbor",
+                     matching_radius * 2.0)]
+
+    best_metrics = {
+        "reason": "phase_correlation_failed",
+        "matches": 0,
+        "inliers": 0,
+        "inlier_ratio": 0.0,
+        "rms": 999.0,
+    }
+    for attempt_name, radius in attempts:
+        m_ref, m_cur = _match_incremental_stars(
+            ref_frame["stars"], target_frame["stars"], (dx, dy), radius
+        )
+        rel_matrix, metrics = _estimate_incremental_transform(
+            m_ref, m_cur, ransac_thresh, limits["min_stars"]
+        )
+        metrics = dict(metrics or {})
+        metrics["spatial_inlier_coverage"] = _spatial_inlier_coverage(
+            m_ref,
+            m_cur,
+            rel_matrix,
+            target_frame["phase_data"].shape,
+            residual_threshold=ransac_thresh,
+        )
+        metrics["phase_shift"] = [round(dx, 3), round(dy, 3)]
+        metrics["phase_response"] = round(phase_response, 5)
+        valid, reason = validate_transform(rel_matrix, metrics, limits)
+
+        if valid and rel_matrix is not None and direction_history is not None:
+            tx, ty, rot, _ = extract_geometric_properties(rel_matrix)
+            if len(direction_history) >= 4:
+                recent = direction_history[-8:]
+                med_dx = float(np.median([item[0] for item in recent]))
+                med_dy = float(np.median([item[1] for item in recent]))
+                med_rot = float(np.median([item[2] for item in recent]))
+                gap_scale = max(1, int(sequence_gap))
+                if (
+                    abs(tx - med_dx) > 120.0 * gap_scale
+                    or abs(ty - med_dy) > 120.0 * gap_scale
+                    or abs(rot - med_rot) > 2.0 * gap_scale
+                ):
+                    valid = False
+                    reason = "temporal_validation_failed"
+
+        if valid:
+            return make_homogeneous(rel_matrix), metrics, attempt_name
+
+        metrics["reason"] = reason
+        if (
+            int(metrics.get("inliers", 0)) > int(best_metrics.get("inliers", 0))
+            or (
+                int(metrics.get("inliers", 0)) == int(best_metrics.get("inliers", 0))
+                and float(metrics.get("rms", 999.0)) < float(best_metrics.get("rms", 999.0))
+            )
+        ):
+            best_metrics = metrics
+
+    if str(fallback_engine).lower() in {"astroalign", "astroalign-asterism"}:
+        try:
+            _register_flow_engines()
+            fallback = registry.resolve("flow.transform_fallback", "astroalign-asterism")
+            relative_homogeneous, metrics = fallback(
+                target_frame["stars"], ref_frame["stars"]
+            )
+            relative_homogeneous = np.asarray(relative_homogeneous, dtype=np.float64)
+            rel_matrix = relative_homogeneous[:2, :]
+            valid, reason = validate_transform(rel_matrix, metrics, limits)
+            if valid:
+                return relative_homogeneous, dict(metrics), "astroalign_asterism"
+            best_metrics = {**dict(metrics), "reason": reason}
+        except Exception:
+            # Optional engines must never stop normal Flow execution.
+            pass
+
+    return None, best_metrics, best_metrics.get("reason", "registration_failed")
+
+
+def _build_local_registration_graph(
+    files: list[Path],
+    anchor_file: Path,
+    config: dict,
+    limits: dict,
+    matching_radius: float,
+    ransac_thresh: float,
+    engine_val: str,
+    engine_profile: str,
+    fallback_engine: str,
+    worker_count: int,
+    budget,
+    cancelled,
+    app_print,
+    batch_name: str,
+):
+    """Build a bounded, deterministic local registration graph."""
+    files = sorted(files, key=_natural_frame_key)
+    name_to_index = {path.name: index for index, path in enumerate(files)}
+    anchor_name = anchor_file.name
+    anchor_index = name_to_index[anchor_name]
+    cache_limit = max(3, min(16, int(config.get("flow_cache_frames", budget.max_in_flight + 4))))
+    frame_cache: OrderedDict[str, dict | None] = OrderedDict()
+
+    def prepare(name: str):
+        if name in frame_cache:
+            frame_cache.move_to_end(name)
+            return frame_cache[name]
+        path = files[name_to_index[name]]
+        _, frame = _process_single_frame(
+            path,
+            float(config.get("fwhm", 4.0)),
+            float(config.get("sigma", 5.0)),
+            int(config.get("max_stars", 250)),
+            limits["min_stars"],
+            engine_val,
+            engine_profile,
+        )
+        frame_cache[name] = frame
+        frame_cache.move_to_end(name)
+        while len(frame_cache) > cache_limit:
+            old_name, old_frame = frame_cache.popitem(last=False)
+            if old_name == anchor_name:
+                frame_cache[old_name] = old_frame
+                break
+        return frame
+
+    def prefetch(names):
+        """Prepare an independent bounded batch without changing graph order."""
+        wanted = []
+        seen = set()
+        for name in names:
+            if name in seen or name in frame_cache or name not in name_to_index:
+                continue
+            seen.add(name)
+            wanted.append(name)
+        if not wanted:
+            return
+        with ThreadPoolExecutor(max_workers=max(1, worker_count),
+                                thread_name_prefix="astroflow-prepare") as executor:
+            futures = {
+                name: executor.submit(
+                    _process_single_frame,
+                    files[name_to_index[name]],
+                    float(config.get("fwhm", 4.0)),
+                    float(config.get("sigma", 5.0)),
+                    int(config.get("max_stars", 250)),
+                    limits["min_stars"],
+                    engine_val,
+                    engine_profile,
+                )
+                for name in wanted
+            }
+            for name in wanted:
+                try:
+                    _, frame = futures[name].result()
+                except Exception as exc:
+                    app_print(f"[{files[name_to_index[name]].name}] Erro no worker: {exc}\n")
+                    frame = None
+                frame_cache[name] = frame
+                frame_cache.move_to_end(name)
+                while len(frame_cache) > cache_limit:
+                    old_name, old_frame = frame_cache.popitem(last=False)
+                    if old_name == anchor_name:
+                        frame_cache[old_name] = old_frame
+                        break
+    anchor = prepare(anchor_name)
+    if (
+        anchor is None
+        or anchor.get("status") == "error"
+        or len(anchor.get("stars", [])) < limits["min_stars"]
+    ):
+        app_print(f"[{batch_name}] ERRO: Falha na âncora.\n")
+        return None
+
+    anchor_quality = calculate_anchor_quality(len(anchor["stars"]), anchor["fwhm"])
+    registration_parameters = {
+        "fwhm": float(config.get("fwhm", 4.0)),
+        "sigma": float(config.get("sigma", 5.0)),
+        "max_stars": int(config.get("max_stars", 250)),
+        "matching_radius": matching_radius,
+        "ransac": ransac_thresh,
+        "neighbor_window": int(config.get("neighbor_window", 4)),
+        **limits,
+    }
+    input_fingerprint = _registration_input_fingerprint(files, {
+        **registration_parameters,
+        "registration_strategy": "neighbor_bfs",
+        "engine": engine_val,
+        "engine_profile": engine_profile,
+        "fallback": fallback_engine,
+    })
+
+    flow_data = {
+        "schema_version": 3,
+        "batch_anchor": anchor_name,
+        "selected_reference": anchor_name,
+        "mode": "neighbor_bfs",
+        "registration_strategy": "neighbor_bfs",
+        "workers": worker_count,
+        "engine": engine_val,
+        "engine_profile": engine_profile,
+        "transform_fallback": fallback_engine,
+        "input_fingerprint": input_fingerprint,
+        "transform_revision": input_fingerprint[:16],
+        "parameters": registration_parameters,
+        "anchor_metrics": {
+            "star_count": len(anchor["stars"]),
+            "fwhm": anchor["fwhm"],
+            "quality": anchor_quality,
+            **anchor.get("metrics", {}),
+        },
+        "frames": {},
+    }
+
+    flow_data["frames"][anchor_name] = {
+        "status": "accepted",
+        "confidence": "reference",
+        "confidence_reason": "Coordinate reference; not an independently verified registration",
+        "recovery_method": "reference",
+        "matrix": np.eye(3).tolist(),
+        "relative_to": None,
+        "matches": len(anchor["stars"]),
+        "inliers": len(anchor["stars"]),
+        "inlier_ratio": 1.0,
+        "rms": 0.0,
+        "translation": [0.0, 0.0],
+        "translation_magnitude": 0.0,
+        "rotation_deg": 0.0,
+        "scale": 1.0,
+        "cumulative_rms": 0.0,
+        "hop_count": 0,
+        "sequence_index": anchor_index,
+        "star_count": len(anchor["stars"]),
+        "fwhm": anchor["fwhm"],
+        **_shape_metrics_for_frame(anchor),
+    }
+
+    accepted_names = {anchor_name}
+    remaining_names = {path.name for path in files if path.name != anchor_name}
+    direction_history: dict[int, list[tuple[float, float, float]]] = {-1: [], 1: []}
+    edges: list[dict] = []
+    last_failures: dict[str, dict] = {}
+    edge_attempt_cache: dict[tuple[str, str, bool], tuple[np.ndarray | None, dict, str]] = {}
+    neighbor_window = max(1, int(config.get("neighbor_window", 4)))
+
+    def candidates_for(target_name: str):
+        target_index = name_to_index[target_name]
+        candidates = []
+        for candidate_name in accepted_names:
+            candidate_index = name_to_index[candidate_name]
+            distance = abs(candidate_index - target_index)
+            if candidate_name != anchor_name and distance > neighbor_window:
+                continue
+            parent_entry = flow_data["frames"].get(candidate_name, {})
+            candidates.append((
+                0 if distance == 1 else 1,
+                int(parent_entry.get("hop_count", 0)),
+                distance,
+                _natural_frame_key(candidate_name),
+                candidate_name,
+            ))
+        candidates.sort()
+        return [item[-1] for item in candidates]
+
+    while remaining_names and not cancelled():
+        made_progress = False
+        ordered_remaining = sorted(
+            remaining_names,
+            key=lambda name: (abs(name_to_index[name] - anchor_index),
+                              _natural_frame_key(name)),
+        )
+        # Overlap FITS decoding and star detection for the next bounded
+        # frontier. Results are still consumed and committed in natural order.
+        frontier = ordered_remaining[:max(1, worker_count * 2)]
+        # Prefetch only new targets. Prefetching every accepted parent here
+        # caused cache churn and repeated FITS preparation on long batches.
+        prefetch(frontier)
+        for target_name in ordered_remaining:
+            if cancelled():
+                return None
+            target_frame = prepare(target_name)
+            if (
+                target_frame is None
+                or target_frame.get("status") == "error"
+                or len(target_frame.get("stars", [])) < limits["min_stars"]
+            ):
+                flow_data["frames"][target_name] = {
+                    "status": "rejected",
+                    "confidence": "rejected",
+                    "confidence_reason": "insufficient_stars_or_error",
+                    "reason": "insufficient_stars_or_error",
+                    "sequence_index": name_to_index[target_name],
+                    **_shape_metrics_for_frame(target_frame),
+                }
+                remaining_names.remove(target_name)
+                made_progress = True
+                continue
+
+            candidates = candidates_for(target_name)
+            if not candidates:
+                continue
+            # The first candidates are the nearest, lowest-hop routes. Keep a
+            # bounded recovery probe and retain the anchor as a last resort.
+            max_candidates = max(2, int(config.get("max_edge_candidates", 3)))
+            if len(candidates) > max_candidates:
+                selected = candidates[:max_candidates]
+                if anchor_name in candidates and anchor_name not in selected:
+                    selected[-1] = anchor_name
+                candidates = selected
+            target_index = name_to_index[target_name]
+            successful_edges = []
+            edge_jobs = []
+            edge_executor = ThreadPoolExecutor(
+                max_workers=max(1, min(worker_count, len(candidates))),
+                thread_name_prefix="astroflow-edge",
+            ) if config.get("flow_workers") is not None and worker_count > 1 and len(candidates) > 1 else None
+            for candidate_position, parent_name in enumerate(candidates):
+                parent_frame = prepare(parent_name)
+                parent_index = name_to_index[parent_name]
+                direction = 1 if target_index > parent_index else -1
+                cache_key = (parent_name, target_name, candidate_position == 0)
+                if cache_key in edge_attempt_cache:
+                    cached_relative, cached_metrics, cached_method = edge_attempt_cache[cache_key]
+                    relative = None if cached_relative is None else cached_relative.copy()
+                    metrics = dict(cached_metrics)
+                    method = cached_method
+                else:
+                    history = list(direction_history[direction])
+                    if edge_executor is not None:
+                        edge_jobs.append((candidate_position, parent_name, parent_index, cache_key,
+                                          edge_executor.submit(
+                            _attempt_local_edge, parent_name, target_name, parent_frame,
+                            target_frame, anchor_name, matching_radius, ransac_thresh, limits,
+                            fallback_engine, candidate_position == 0, history,
+                            abs(target_index - parent_index))))
+                        continue
+                    relative, metrics, method = _attempt_local_edge(
+                        parent_name, target_name, parent_frame, target_frame, anchor_name,
+                        matching_radius, ransac_thresh, limits, fallback_engine,
+                        primary=(candidate_position == 0), direction_history=history,
+                        sequence_gap=abs(target_index - parent_index))
+                    edge_attempt_cache[cache_key] = (None if relative is None else relative.copy(),
+                                                     dict(metrics), method)
+                if edge_executor is not None and cache_key not in edge_attempt_cache:
+                    continue
+                # Fall through using the cached or freshly computed result.
+                if cache_key in edge_attempt_cache:
+                    relative, metrics, method = edge_attempt_cache[cache_key]
+                    relative = None if relative is None else relative.copy()
+                    metrics = dict(metrics)
+                if relative is not None:
+                    parent_entry = flow_data["frames"][parent_name]
+                    parent_matrix = np.asarray(parent_entry["matrix"], dtype=np.float64)
+                    cumulative_matrix = parent_matrix @ relative
+                    parent_rms = float(parent_entry.get("cumulative_rms", 0.0))
+                    current_rms = float(metrics.get("rms", 0.0))
+                    cumulative_rms = float(np.sqrt(parent_rms ** 2 + current_rms ** 2))
+                    successful_edges.append((
+                        int(parent_entry.get("hop_count", 0)) + 1,
+                        cumulative_rms,
+                        abs(target_index - parent_index),
+                        _natural_frame_key(parent_name),
+                        parent_name,
+                        relative,
+                        metrics,
+                        method,
+                        cumulative_matrix,
+                    ))
+                else:
+                    last_failures[target_name] = metrics
+
+            if edge_executor is not None:
+                edge_executor.shutdown(wait=True)
+                for candidate_position, parent_name, parent_index, cache_key, future in edge_jobs:
+                    try:
+                        relative, metrics, method = future.result()
+                    except Exception:
+                        relative, metrics, method = None, {"reason": "registration_failed"}, "registration_failed"
+                    edge_attempt_cache[cache_key] = (
+                        None if relative is None else relative.copy(), dict(metrics), method)
+                    if relative is not None:
+                        parent_entry = flow_data["frames"][parent_name]
+                        parent_matrix = np.asarray(parent_entry["matrix"], dtype=np.float64)
+                        parent_rms = float(parent_entry.get("cumulative_rms", 0.0))
+                        current_rms = float(metrics.get("rms", 0.0))
+                        successful_edges.append((
+                            int(parent_entry.get("hop_count", 0)) + 1,
+                            float(np.sqrt(parent_rms ** 2 + current_rms ** 2)),
+                            abs(target_index - parent_index), _natural_frame_key(parent_name),
+                            parent_name, relative, metrics, method, parent_matrix @ relative))
+                    else:
+                        last_failures[target_name] = metrics
+
+            if not successful_edges:
+                continue
+
+            successful_edges.sort(key=lambda item: item[:4])
+            route_warnings = []
+            if len(successful_edges) > 1:
+                best_candidate = successful_edges[0]
+                best_matrix = best_candidate[8]
+                height, width = target_frame["phase_data"].shape[:2]
+                probe_points = np.asarray(
+                    [[0.0, 0.0], [max(0, width - 1), 0.0],
+                     [0.0, max(0, height - 1)],
+                     [max(0, width - 1), max(0, height - 1)],
+                     [width / 2.0, height / 2.0]],
+                    dtype=np.float32,
+                ).reshape(-1, 1, 2)
+                best_probe = cv2.perspectiveTransform(
+                    probe_points, np.asarray(best_matrix, dtype=np.float64)
+                ).reshape(-1, 2)
+                for alternate in successful_edges[1:]:
+                    alternate_probe = cv2.perspectiveTransform(
+                        probe_points, np.asarray(alternate[8], dtype=np.float64)
+                    ).reshape(-1, 2)
+                    probe_error = float(np.sqrt(np.mean((best_probe - alternate_probe) ** 2)))
+                    if probe_error > ransac_thresh:
+                        route_warnings.append({
+                            "alternate_parent": alternate[4],
+                            "probe_error": round(probe_error, 4),
+                            "threshold": ransac_thresh,
+                        })
+            (
+                hop_count,
+                cumulative_rms,
+                _distance,
+                _parent_key,
+                parent_name,
+                relative,
+                metrics,
+                method,
+                cumulative_matrix,
+            ) = successful_edges[0]
+            parent_index = name_to_index[parent_name]
+            direction = 1 if target_index > parent_index else -1
+            tx, ty, rot, _ = extract_geometric_properties(relative[:2, :])
+            if method != "anchor":
+                direction_history[direction].append((tx, ty, rot))
+                if len(direction_history[direction]) > 8:
+                    del direction_history[direction][:-8]
+
+            flow_data["frames"][target_name] = {
+                "status": "accepted",
+                "confidence": _classify_flow_confidence(metrics, limits),
+                "confidence_reason": _flow_confidence_reason(metrics, limits),
+                "matrix": cumulative_matrix.tolist(),
+                "relative_matrix": relative.tolist(),
+                "relative_to": parent_name,
+                "recovery_method": method,
+                "cumulative_rms": cumulative_rms,
+                "hop_count": hop_count,
+                "sequence_index": target_index,
+                "route_consistent": not route_warnings,
+                "route_warnings": route_warnings,
+                "fwhm": target_frame["fwhm"],
+                "star_count": len(target_frame["stars"]),
+                **_flow_json_value(metrics),
+                **_shape_metrics_for_frame(target_frame),
+            }
+            edge = {
+                "source": parent_name,
+                "target": target_name,
+                "relative_matrix": relative.tolist(),
+                "method": method,
+                "hop_count": hop_count,
+                "cumulative_rms": cumulative_rms,
+                "metrics": _flow_json_value(metrics),
+                "route_warnings": route_warnings,
+            }
+            edges.append(edge)
+            accepted_names.add(target_name)
+            remaining_names.remove(target_name)
+            made_progress = True
+            app_print(
+                f"[{target_name}] OK ({method}) <- {parent_name} | "
+                f"{metrics.get('inliers', 0)}/{metrics.get('matches', 0)} inliers | "
+                f"ratio={float(metrics.get('inlier_ratio', 0.0)):.1%} | "
+                f"RMS={float(metrics.get('rms', 999.0)):.3f}px\n"
+            )
+
+        if not made_progress:
+            break
+
+    for target_name in sorted(remaining_names, key=_natural_frame_key):
+        metrics = last_failures.get(target_name, {})
+        flow_data["frames"][target_name] = {
+            "status": "rejected",
+            "confidence": "rejected",
+            "confidence_reason": metrics.get("reason", "disconnected_from_reference"),
+            "reason": metrics.get("reason", "disconnected_from_reference"),
+            "sequence_index": name_to_index[target_name],
+            "matches": metrics.get("matches", 0),
+            "inliers": metrics.get("inliers", 0),
+            "inlier_ratio": metrics.get("inlier_ratio", 0.0),
+            "rms": metrics.get("rms", 999.0),
+            "phase_shift": metrics.get("phase_shift", [0.0, 0.0]),
+            "phase_response": metrics.get("phase_response", 0.0),
+            **_shape_metrics_for_frame(prepare(target_name)),
+        }
+        app_print(
+            f"[{target_name}] REJEITADO: {flow_data['frames'][target_name]['reason']} | "
+            f"inliers={flow_data['frames'][target_name]['inliers']} | "
+            f"RMS={float(flow_data['frames'][target_name]['rms']):.3f}px\n"
+        )
+
+    flow_data["registration_graph"] = {
+        "version": 1,
+        "strategy": "neighbor_bfs",
+        "root": anchor_name,
+        "neighbor_window": neighbor_window,
+        "nodes": [
+            {
+                "id": path.name,
+                "sequence_index": index,
+                "status": flow_data["frames"].get(path.name, {}).get("status", "rejected"),
+            }
+            for index, path in enumerate(files)
+        ],
+        "edges": edges,
+    }
+    flow_data["statistics"] = {
+        "total_frames": len(files),
+        "accepted_frames": sum(1 for item in flow_data["frames"].values()
+                                if item.get("status") == "accepted"),
+        "rejected_frames": sum(1 for item in flow_data["frames"].values()
+                                if item.get("status") == "rejected"),
+        "coverage": sum(1 for item in flow_data["frames"].values()
+                         if item.get("status") == "accepted") / max(len(files), 1),
+        "first_frame": files[0].name,
+        "last_frame": files[-1].name,
+        "first_frame_valid": flow_data["frames"].get(files[0].name, {}).get("status") == "accepted",
+        "last_frame_valid": flow_data["frames"].get(files[-1].name, {}).get("status") == "accepted",
+        "chain_segments": _count_chain_segments(flow_data),
+    }
+    for node in flow_data["registration_graph"]["nodes"]:
+        frame = flow_data["frames"].get(node["id"], {})
+        node["parent"] = frame.get("relative_to")
+        node["hop_count"] = int(frame.get("hop_count", 0))
+    flow_data["geometry_revision"] = _geometry_revision(flow_data)
+    flow_data = _flow_json_value(flow_data)
+    accepted_count = int(flow_data["statistics"]["accepted_frames"])
+    anchor_metrics = flow_data["anchor_metrics"]
+    return flow_data, anchor, anchor_quality, accepted_count
+
+
+def _graph_adjacency(graph: dict) -> dict[str, list[tuple[str, np.ndarray]]]:
+    """Build an undirected adjacency map from persisted graph edges."""
+    adjacency: dict[str, list[tuple[str, np.ndarray]]] = {}
+    for edge in graph.get("edges", []) if isinstance(graph, dict) else []:
+        source = edge.get("source")
+        target = edge.get("target")
+        matrix = edge.get("relative_matrix")
+        if not source or not target or matrix is None:
+            continue
+        try:
+            relative = np.asarray(matrix, dtype=np.float64)
+            if relative.shape != (3, 3):
+                continue
+            inverse = np.linalg.inv(relative)
+        except (TypeError, ValueError, np.linalg.LinAlgError):
+            continue
+        # The stored relative matrix maps target pixels into source pixels.
+        adjacency.setdefault(source, []).append((target, relative))
+        adjacency.setdefault(target, []).append((source, inverse))
+    return adjacency
+
+
+def rebase_flow_reference(flow_data: dict, new_reference: str) -> dict:
+    """Re-root a connected local Flow without decoding FITS or detecting stars.
+
+    Frame matrices map a frame into the current local reference. Re-rooting
+    therefore uses ``inverse(L_reference) @ L_frame``. When a registration
+    graph is present, paths and ``relative_to`` fields are rebuilt so later
+    propagation and provenance remain explicit.
+    """
+    if not isinstance(flow_data, dict):
+        raise ValueError("Flow result is not a mapping")
+    frames = flow_data.get("frames")
+    if not isinstance(frames, dict) or new_reference not in frames:
+        raise ValueError(f"Reference frame not found: {new_reference}")
+    reference_entry = frames[new_reference]
+    if reference_entry.get("status") != "accepted" or reference_entry.get("matrix") is None:
+        raise ValueError(f"Reference frame is disconnected: {new_reference}")
+
+    result = copy.deepcopy(flow_data)
+    result_frames = result["frames"]
+    reference_matrix = np.asarray(reference_entry["matrix"], dtype=np.float64)
+    try:
+        inverse_reference = np.linalg.inv(reference_matrix)
+    except np.linalg.LinAlgError as exc:
+        raise ValueError("Reference transform is singular") from exc
+
+    graph = result.get("registration_graph")
+    adjacency = _graph_adjacency(graph) if isinstance(graph, dict) else {}
+    visited = {new_reference}
+    queue = deque([new_reference])
+    root_matrix = {new_reference: np.eye(3, dtype=np.float64)}
+    parent_map: dict[str, tuple[str, np.ndarray, int]] = {}
+    while queue:
+        parent = queue.popleft()
+        for child, relative in sorted(
+            adjacency.get(parent, []),
+            key=lambda item: _natural_frame_key(item[0]),
+        ):
+            if child in visited:
+                continue
+            if result_frames.get(child, {}).get("status") != "accepted":
+                continue
+            visited.add(child)
+            root_matrix[child] = root_matrix[parent] @ relative
+            parent_hops = parent_map[parent][2] if parent in parent_map else 0
+            parent_map[child] = (parent, relative, int(parent_hops) + 1)
+            queue.append(child)
+
+    accepted_names = {
+        name for name, item in result_frames.items() if item.get("status") == "accepted"
+    }
+    if adjacency:
+        disconnected = sorted(accepted_names - visited, key=_natural_frame_key)
+        if disconnected:
+            raise ValueError(
+                "Reference frame is not connected to accepted frames: " + ", ".join(disconnected)
+            )
+    else:
+        # Legacy flow files predate the persisted graph. Their cumulative
+        # matrices still provide the exact rebase operation, so retain them
+        # without claiming a reconstructed path.
+        visited = set(accepted_names)
+
+    # Use the graph path when available; the matrix formula is the fallback
+    # for legacy flow files without graph metadata.
+    for name, item in result_frames.items():
+        if item.get("status") != "accepted" or item.get("matrix") is None:
+            continue
+        old_matrix = np.asarray(item["matrix"], dtype=np.float64)
+        # The matrix formula is authoritative for final geometry. The graph
+        # traversal below only supplies the new provenance parent/path.
+        rebased = inverse_reference @ old_matrix
+        item["matrix"] = rebased.tolist()
+        item["reference_rebased"] = True
+        item["reference_rebased_from"] = flow_data.get("batch_anchor")
+        if name == new_reference:
+            item["relative_to"] = None
+            item["relative_matrix"] = np.eye(3, dtype=np.float64).tolist()
+            item["hop_count"] = 0
+            item["recovery_method"] = "reference"
+            item["confidence"] = "reference"
+        elif name in parent_map:
+            parent, relative, hop_count = parent_map[name]
+            item["relative_to"] = parent
+            item["relative_matrix"] = relative.tolist()
+            item["hop_count"] = hop_count
+            item["recovery_method"] = "reference_rebased"
+
+    # Keep graph-level provenance in lockstep with the compatibility fields.
+    if isinstance(graph, dict):
+        for node in result["registration_graph"].get("nodes", []):
+            if not isinstance(node, dict):
+                continue
+            name = node.get("id", node.get("name"))
+            if name == new_reference:
+                node["parent"] = None
+                node["hop_count"] = 0
+            elif name in parent_map:
+                node["parent"] = parent_map[name][0]
+                node["hop_count"] = parent_map[name][2]
+
+    result["batch_anchor"] = new_reference
+    result["selected_reference"] = new_reference
+    result["reference_provenance"] = {
+        "action": "rebase",
+        "from": flow_data.get("batch_anchor"),
+        "to": new_reference,
+        "source_revision": flow_data.get("transform_revision"),
+        "analysis_reused": True,
+        "fits_decoded": False,
+        "star_detection_reused": False,
+        "input_fingerprint": flow_data.get("input_fingerprint"),
+    }
+    old_revision = str(flow_data.get("transform_revision", ""))
+    result["transform_revision"] = hashlib.sha256(
+        f"{old_revision}|reference:{new_reference}".encode("utf-8")
+    ).hexdigest()[:16]
+    if isinstance(graph, dict):
+        result["registration_graph"]["root"] = new_reference
+        result["registration_graph"]["rebase_from"] = graph.get("root")
+        result["registration_graph"]["rebase_revision"] = result["transform_revision"]
+    return _flow_json_value(result)
+
+
+def rebase_global_transform(global_matrix, local_reference_matrix) -> np.ndarray:
+    """Preserve final geometry when a batch reference is changed."""
+    return np.asarray(global_matrix, dtype=np.float64) @ np.asarray(
+        local_reference_matrix, dtype=np.float64
+    )
+
+
+def apply_reference_change(
+    batch_dir: Path,
+    new_reference: str,
+    base_dir: Path | None = None,
+    cancellation_event=None,
+) -> dict:
+    """Rebase a connected Flow graph and switch one immutable revision.
+
+    Payloads are written below ``.flow_revisions/<revision>`` first. Readers
+    consume the single manifest switch, so a failed write or cancellation
+    leaves the previously active local/global pair selected.
+    """
+    def cancelled() -> bool:
+        return bool(cancellation_event is not None and cancellation_event.is_set())
+
+    batch_dir = Path(batch_dir).resolve()
+    root_dir = Path(base_dir).resolve() if base_dir is not None else batch_dir.parent
+    if cancelled():
+        return {"status": "cancelled"}
+
+    try:
+        # Import lazily to keep the Flow module independent of Align at import
+        # time while making all consumers honour the active manifest.
+        from astroalign_logic import load_global_flow, load_local_flow
+        local_flow = load_local_flow(batch_dir)
+        if not isinstance(local_flow, dict):
+            return {"status": "failed", "reason": "flow_local_missing"}
+        if not _persisted_local_flow_is_current(batch_dir, local_flow):
+            return {"status": "failed", "reason": "flow_local_stale_recompute_required"}
+        old_reference_entry = local_flow.get("frames", {}).get(new_reference)
+        if not isinstance(old_reference_entry, dict):
+            return {"status": "failed", "reason": "reference_not_found"}
+        old_reference_matrix = np.asarray(old_reference_entry.get("matrix"), dtype=np.float64)
+        updated_local = rebase_flow_reference(local_flow, new_reference)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        return {"status": "failed", "reason": str(exc)}
+    if cancelled():
+        return {"status": "cancelled"}
+
+    updated_local["geometry_revision"] = local_flow.get("geometry_revision") or _geometry_revision(local_flow)
+    updated_global = None
+    try:
+        from astroalign_logic import load_global_flow
+        global_flow = load_global_flow(root_dir)
+        if isinstance(global_flow, dict):
+            batch_entry = global_flow.get("batches", {}).get(batch_dir.name)
+            source_revision = (global_flow.get("source_revisions", {}) or {}).get(batch_dir.name)
+            if source_revision is None and isinstance(batch_entry, dict):
+                source_revision = batch_entry.get("local_transform_revision")
+            if source_revision and source_revision != local_flow.get("transform_revision"):
+                return {"status": "failed", "reason": "global_flow_stale_recompute_required"}
+            if isinstance(batch_entry, dict) and batch_entry.get("matrix") is not None:
+                updated_global = copy.deepcopy(global_flow)
+                batch_entry = updated_global["batches"][batch_dir.name]
+                batch_entry["matrix"] = rebase_global_transform(
+                    batch_entry["matrix"], old_reference_matrix
+                ).tolist()
+                if batch_entry.get("relative_matrix") is not None:
+                    batch_entry["relative_matrix"] = (
+                        np.asarray(batch_entry["relative_matrix"], dtype=np.float64)
+                        @ old_reference_matrix
+                    ).tolist()
+                batch_entry["reference_rebased_from"] = local_flow.get("batch_anchor")
+                batch_entry["reference_rebased_to"] = new_reference
+                batch_entry["local_transform_revision"] = updated_local["transform_revision"]
+                updated_global.setdefault("source_revisions", {})[batch_dir.name] = updated_local["transform_revision"]
+                try:
+                    inverse_reference = np.linalg.inv(old_reference_matrix)
+                except np.linalg.LinAlgError as exc:
+                    return {"status": "failed", "reason": "reference_transform_singular"}
+                for edge in updated_global.get("registration_graph", {}).get("edges", []):
+                    if edge.get("relative_matrix") is None:
+                        continue
+                    relative = np.asarray(edge["relative_matrix"], dtype=np.float64)
+                    if edge.get("target") == batch_dir.name:
+                        edge["relative_matrix"] = (relative @ old_reference_matrix).tolist()
+                    elif edge.get("source") == batch_dir.name:
+                        edge["relative_matrix"] = (inverse_reference @ relative).tolist()
+                    if edge.get("source") == batch_dir.name or edge.get("target") == batch_dir.name:
+                        edge["method"] = "reference_rebased"
+                updated_global["geometry_revision"] = global_flow.get("geometry_revision") or _geometry_revision(global_flow, "matrix")
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        return {"status": "failed", "reason": str(exc)}
+    if cancelled():
+        return {"status": "cancelled"}
+
+    from app.infrastructure.json_store import atomic_json_write
+    revision = updated_local["transform_revision"]
+    snapshot_root = root_dir / ".flow_revisions" / revision
+    local_snapshot = snapshot_root / "batches" / batch_dir.name / "flow_local.json"
+    global_snapshot = snapshot_root / "global_flow.json" if updated_global is not None else None
+    manifest_path = root_dir / "flow_revision.json"
+    current_manifest = {}
+    if manifest_path.exists():
+        try:
+            current_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            current_manifest = {}
+
+    local_flows = dict(current_manifest.get("local_flows", {})) if isinstance(current_manifest, dict) else {}
+    for candidate in sorted(root_dir.iterdir(), key=lambda p: p.name.casefold()) if root_dir.is_dir() else []:
+        if candidate.is_dir() and "batch" in candidate.name.lower() and candidate.name not in local_flows:
+            legacy = candidate / "flow_local.json"
+            if legacy.exists():
+                local_flows[candidate.name] = str(legacy.relative_to(root_dir))
+    local_flows[batch_dir.name] = str(local_snapshot.relative_to(root_dir))
+    manifest = {
+        "schema_version": 2,
+        "active_revision": revision,
+        "local_flows": local_flows,
+        "global_flow": str(global_snapshot.relative_to(root_dir)) if global_snapshot is not None else current_manifest.get("global_flow"),
+    }
+    try:
+        atomic_json_write(local_snapshot, updated_local)
+        if global_snapshot is not None:
+            atomic_json_write(global_snapshot, updated_global)
+        if cancelled():
+            return {"status": "cancelled"}
+        # This is the only operation that changes the active revision.
+        atomic_json_write(manifest_path, manifest)
+    except Exception as exc:
+        return {"status": "failed", "reason": f"reference revision publish failed: {exc}"}
+    return {
+        "status": "success",
+        "revision": revision,
+        "analysis_reused": True,
+        "fits_decoded": False,
+        "output_path": str(local_snapshot),
+        "manifest_path": str(manifest_path),
+    }
 
 
 # ============================================================
@@ -1797,7 +2920,8 @@ def preview_star_detection(
             p
             for p in batch_dir.iterdir()
             if p.is_file() and p.suffix.lower() in {".fit", ".fits", ".fts"}
-        ]
+        ],
+        key=_natural_frame_key,
     )
     if not files:
         return (None, 0, 0.0)

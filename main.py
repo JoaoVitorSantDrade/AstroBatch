@@ -14,29 +14,33 @@ import numpy as np
 # ============================================================
 # Imports da lógica de processamento
 # ============================================================
-from batch_logic import ProcessingConfig
 from app.application.runner import PipelineRunner
 from app.application.log_buffer import ActivityBuffer
-from app.application.commands import ResourceSettings
+from app.application.commands import (
+    AlignCommand,
+    BatchCommand,
+    CalibrationCommand,
+    FlowCommand,
+    HDRCommand,
+    ReferenceChangeCommand,
+    ResourceSettings,
+    StackCommand,
+)
 from app.application.pipelines import execute_pipeline
+from app.application.stages import STAGE_DEFINITIONS, StageContext
 from app.infrastructure.json_store import SettingsRepository
-from views.align_view import AlignView
-from views.batch_view import BatchView
-
-# Importando as views separadas
-from views.calibration_view import CalibrationView
-from views.flow_view import FlowView
-from views.stacking_view import StackingView
-from views.hdr_view import HDRView
-from views.hdr_model import HDRViewModel
 from views.scrollable_host import ScrollableHost
+from views.preview_service import PreviewService
+from views.anchor_selector import AnchorSelectionController
 
 
 class AstroProcessManager(tk.Tk):
     APP_NAME = "Astro Process Manager"
     CONFIG_FILE = Path("astro_config.json")
-    PIPELINE_BUTTONS = (("Calibration", "calib"), ("Batch", "batch"), ("Flow", "flow"),
-                        ("Align", "align"), ("Stack", "stack"), ("HDR", "hdr"))
+    PIPELINE_BUTTONS = tuple(
+        (definition.identifier, definition.run_suffix)
+        for definition in STAGE_DEFINITIONS
+    )
 
     BG = "#ffffff"
     PANEL = "#ffffff"
@@ -61,10 +65,19 @@ class AstroProcessManager(tk.Tk):
         self.cancel_event = self.runner.cancel_event
         self._closing = False
         self.custom_anchors = {}
+        self._active_operation_stage = None
 
         self._init_variables()
         self._configure_style()
         self.load_settings()
+        self.anchor_selector = AnchorSelectionController(
+            self,
+            self.batch_dir_var,
+            self.custom_anchors,
+            on_apply_reference=self._request_reference_change,
+            on_commit_reference=self._commit_reference_change,
+            on_log=self.print_to_console,
+        )
         self._create_widgets()
         self._start_cpu_kernel_warmup()
 
@@ -470,34 +483,129 @@ class AstroProcessManager(tk.Tk):
         self.notebook = ttk.Notebook(notebook_container)
         self.notebook.grid(row=0, column=0, sticky="nsew")
 
-        self._tab_hosts = {}
-        for key, label, view_type in (("calib", "1  Calibration", CalibrationView),
-                                     ("batch", "2  Batch", BatchView),
-                                     ("flow", "3  Flow", FlowView),
-                                     ("align", "4  Align", AlignView)):
-            host = ScrollableHost(self.notebook)
-            view = view_type(host.canvas, app=self)
-            host.mount(view)
-            setattr(self, f"tab_{key}", view)
-            self._tab_hosts[key] = host
-            self.notebook.add(host, text=label)
-        # Stack already owns a scroll canvas, so it needs no second wrapper.
-        self.tab_stack = StackingView(self.notebook, app=self)
-        self.notebook.add(self.tab_stack, text="5  Stack")
-        hdr_model = HDRViewModel(
-            self.hdr_input_var, self.hdr_output_var, self.hdr_saturation_var,
-            self.hdr_noise_var, self.hdr_rowband_var, self.hdr_exptime_var,
-            lambda: self.browse_dir(self.hdr_input_var),
-            lambda: self.browse_save_file(self.hdr_output_var),
-            self.use_align_output_for_hdr, self.start_hdr, self.cancel_processing)
-        hdr_host = ScrollableHost(self.notebook)
-        self.tab_hdr = HDRView(hdr_host.canvas, hdr_model)
-        hdr_host.mount(self.tab_hdr)
-        self._tab_hosts["hdr"] = hdr_host
-        self.btn_run_hdr = self.tab_hdr.run_button
-        self.btn_cancel_hdr = self.tab_hdr.cancel_button
+        variables = {
+            "calib_input": self.calib_input_var,
+            "calib_output": self.calib_output_var,
+            "apply_dark": self.apply_dark_var,
+            "dark_path": self.dark_path_var,
+            "apply_flat": self.apply_flat_var,
+            "flat_path": self.flat_path_var,
+            "calib_create_master": self.calib_create_master_var,
+            "calib_overwrite": self.calib_overwrite_var,
+            "batch_input_dir": self.batch_input_dir_var,
+            "batch_dir": self.batch_dir_var,
+            "opt_method": self.opt_method_var,
+            "crop_size": self.crop_size_var,
+            "downsample_method": self.downsample_method_var,
+            "downsample_scale": self.downsample_scale_var,
+            "threshold": self.threshold_var,
+            "copy_files": self.copy_files_var,
+            "batch_overwrite": self.batch_overwrite_var,
+            "dry_run": self.dry_run_var,
+            "flow_global_master": self.flow_global_master_var,
+            "flow_fwhm": self.flow_fwhm_var,
+            "flow_sigma": self.flow_sigma_var,
+            "flow_matching_radius": self.flow_matching_radius_var,
+            "flow_ransac": self.flow_ransac_var,
+            "flow_debug": self.flow_debug_var,
+            "flow_min_stars": self.flow_min_stars_var,
+            "flow_min_inliers": self.flow_min_inliers_var,
+            "flow_min_ratio": self.flow_min_ratio_var,
+            "flow_engine": self.flow_engine_var,
+            "flow_profile": self.flow_profile_var,
+            "flow_detector_engine": self.flow_detector_engine_var,
+            "flow_transform_fallback": self.flow_transform_fallback_var,
+            "resource_memory": self.resource_memory_var,
+            "resource_workers": self.resource_workers_var,
+            "align_output_dir": self.align_output_dir_var,
+            "align_debayer_pattern": self.align_debayer_pattern_var,
+            "align_debayer_method": self.align_debayer_method_var,
+            "align_interpolation": self.align_interpolation_var,
+            "align_rgb_registration": self.align_rgb_registration_var,
+            "align_overwrite": self.align_overwrite_var,
+            "align_delete_intermediates": self.align_delete_intermediates_var,
+            "align_dry_run": self.align_dry_run_var,
+            "align_keep_header": self.align_keep_header_var,
+            "align_compress_output": self.align_compress_output_var,
+            "align_profile": self.align_profile_var,
+            "align_warp_engine": self.align_warp_engine_var,
+            "align_quality_gate": self.align_quality_gate_var,
+            "align_quality_shift": self.align_quality_shift_var,
+            "stack_input_dir": self.stack_input_dir_var,
+            "stack_output_dir": self.stack_output_dir_var,
+            "stack_selection_mode": self.stack_selection_mode_var,
+            "stack_selection_percentage": self.stack_selection_percentage_var,
+            "stack_selection_percentage_text": self.stack_selection_percentage_text_var,
+            "stack_selection_metric": self.stack_selection_metric_var,
+            "stack_trail_filter": self.stack_trail_filter_var,
+            "stack_min_roundness": self.stack_min_roundness_var,
+            "stack_min_shape_stars": self.stack_min_shape_stars_var,
+            "stack_method": self.stack_method_var,
+            "stack_rejection_method": self.stack_rejection_method_var,
+            "stack_rejection_low": self.stack_rejection_low_var,
+            "stack_rejection_high": self.stack_rejection_high_var,
+            "stack_normalize": self.stack_normalize_var,
+            "stack_normalize_method": self.stack_normalize_method_var,
+            "stack_dither_correction": self.stack_dither_correction_var,
+            "stack_output_name": self.stack_output_name_var,
+            "stack_output_bit_depth": self.stack_output_bit_depth_var,
+            "stack_compress": self.stack_compress_var,
+            "stack_profile": self.stack_profile_var,
+            "stack_reducer_engine": self.stack_reducer_engine_var,
+            "hdr_input": self.hdr_input_var,
+            "hdr_output": self.hdr_output_var,
+            "hdr_saturation": self.hdr_saturation_var,
+            "hdr_noise": self.hdr_noise_var,
+            "hdr_rowband": self.hdr_rowband_var,
+            "hdr_exptime": self.hdr_exptime_var,
+        }
+        callbacks = {
+            "browse_dir": self.browse_dir,
+            "browse_file_or_dir": self.browse_file_or_dir,
+            "browse_save_file": self.browse_save_file,
+            "start_calibration": self.start_calibration,
+            "start_batch": self.start_batch_processing,
+            "start_flow_processing": self.start_flow_processing,
+            "start_align_processing": self.start_align_processing,
+            "start_stacking": self.start_stacking,
+            "start_hdr": self.start_hdr,
+            "cancel_processing": self.cancel_processing,
+            "toggle_opt_options": self.toggle_opt_options,
+            "open_anchor_selector": self.open_anchor_selector,
+            "show_astroflow_preview": self.show_astroflow_preview,
+            "show_flow_visualization": self.show_flow_visualization,
+            "save_settings": self.save_settings,
+            "print_to_console": self.print_to_console,
+            "start_operation": self._start_operation,
+            "is_busy": lambda: self.runner.busy,
+            "use_align_output_for_stack": self.use_align_output_for_stack,
+            "apply_unguided_preset": self.apply_unguided_preset,
+            "use_align_output_for_hdr": self.use_align_output_for_hdr,
+        }
+        self._stage_context = StageContext(
+            variables=variables,
+            callbacks=callbacks,
+            custom_anchors=self.custom_anchors,
+            background=self.BG,
+        )
 
-        self.notebook.add(hdr_host, text="6  HDR")
+        self._tab_hosts = {}
+        for definition in STAGE_DEFINITIONS:
+            key = definition.run_suffix
+            host = ScrollableHost(self.notebook) if definition.use_scrollable_host else None
+            parent = host.canvas if host is not None else self.notebook
+            _model, view = definition.build_view(parent, self._stage_context)
+            if host is not None:
+                host.mount(view)
+                tab = host
+                self._tab_hosts[key] = host
+            else:
+                tab = view
+            setattr(self, f"tab_{key}", view)
+            run_name, cancel_name = definition.view_controls
+            setattr(self, f"btn_run_{key}", getattr(view, run_name))
+            setattr(self, f"btn_cancel_{key}", getattr(view, cancel_name))
+            self.notebook.add(tab, text=definition.label)
 
         self._build_footer()
 
@@ -792,9 +900,10 @@ class AstroProcessManager(tk.Tk):
         self._refresh_operation_clock()
         self.cancel_event.clear()
 
+        cancel_stage = "Flow" if module_name == "ReferenceChange" else module_name
         for stage, run_button, cancel_button in self._operation_buttons():
             run_button.configure(state="disabled")
-            cancel_button.configure(state="normal" if stage == module_name else "disabled")
+            cancel_button.configure(state="normal" if stage == cancel_stage else "disabled")
         self.status_var.set(f"Processando Astro{module_name}...")
 
     def _unlock_ui(self):
@@ -806,8 +915,11 @@ class AstroProcessManager(tk.Tk):
 
 
     def _start_operation(self, stage, *args):
-        if self.runner.busy:
+        if getattr(self, "runner", None) is not None and self.runner.busy:
             return
+        if getattr(self, "runner", None) is None and getattr(self, "worker", None) is not None and self.worker.is_alive():
+            return
+        self._active_operation_stage = stage
         self._lock_ui(stage)
         try:
             self.worker = self.runner.start(
@@ -851,6 +963,9 @@ class AstroProcessManager(tk.Tk):
             )
         self.status_var.set(status)
         self.print_to_console(f"[GUI] {status}\n")
+        if self._active_operation_stage == "ReferenceChange" and hasattr(self, "anchor_selector"):
+            self.anchor_selector.finish_reference_change(outcome)
+        self._active_operation_stage = None
         self._unlock_ui()
 
     # --------------------------------------------------------
@@ -860,20 +975,16 @@ class AstroProcessManager(tk.Tk):
         if self.worker and self.worker.is_alive():
             return
         try:
-            config = {
-                "input_dir": str(
-                    Path(self.calib_input_var.get()).expanduser().resolve()
-                ),
-                "output_dir": str(
-                    Path(self.calib_output_var.get()).expanduser().resolve()
-                ),
-                "apply_dark": self.apply_dark_var.get(),
-                "dark_path": self.dark_path_var.get(),
-                "apply_flat": self.apply_flat_var.get(),
-                "flat_path": self.flat_path_var.get(),
-                "create_master": self.calib_create_master_var.get(),
-                "overwrite": self.calib_overwrite_var.get(),
-            }
+            config = CalibrationCommand.from_values(
+                self.calib_input_var.get(),
+                self.calib_output_var.get(),
+                self.apply_dark_var.get(),
+                self.dark_path_var.get(),
+                self.apply_flat_var.get(),
+                self.flat_path_var.get(),
+                self.calib_create_master_var.get(),
+                self.calib_overwrite_var.get(),
+            )
         except Exception as exc:
             messagebox.showerror("Parâmetros inválidos", str(exc), parent=self)
             return
@@ -887,17 +998,12 @@ class AstroProcessManager(tk.Tk):
         if self.worker and self.worker.is_alive():
             return
         try:
-            config = ProcessingConfig(
-                input_dir=Path(self.batch_input_dir_var.get()).expanduser().resolve(),
-                output_dir=Path(self.batch_dir_var.get()).expanduser().resolve(),
-                threshold_factor=float(self.threshold_var.get()),
-                crop_size=int(self.crop_size_var.get()),
-                dry_run=self.dry_run_var.get(),
-                copy_files=self.copy_files_var.get(),
-                overwrite=self.batch_overwrite_var.get(),
-                opt_method=self.opt_method_var.get(),
-                downsample_method=self.downsample_method_var.get(),
-                downsample_scale=float(self.downsample_scale_var.get()),
+            config = BatchCommand.from_values(
+                self.batch_input_dir_var.get(), self.batch_dir_var.get(),
+                self.threshold_var.get(), self.crop_size_var.get(),
+                self.dry_run_var.get(), self.copy_files_var.get(),
+                self.batch_overwrite_var.get(), self.opt_method_var.get(),
+                self.downsample_method_var.get(), self.downsample_scale_var.get(),
             )
         except Exception as exc:
             messagebox.showerror("Parâmetros inválidos", str(exc), parent=self)
@@ -917,30 +1023,31 @@ class AstroProcessManager(tk.Tk):
             return
         try:
             self._resource_settings()
-            config = {
-                "custom_anchors": dict(self.custom_anchors),
-                "global_master": self.flow_global_master_var.get(),
-                "fwhm": self.flow_fwhm_var.get(),
-                "sigma": self.flow_sigma_var.get(),
-                "matching_radius": self.flow_matching_radius_var.get(),
-                "ransac": self.flow_ransac_var.get(),
-                "debug_images": self.flow_debug_var.get(),
-                "min_stars": self.flow_min_stars_var.get(),
-                "min_inliers": self.flow_min_inliers_var.get(),
-                "min_ratio": self.flow_min_ratio_var.get(),
-                "max_stars": 150,
-                "engine": self.flow_engine_var.get(),
-                "engine_profile": self.flow_profile_var.get(),
-                "detector_engine": self.flow_detector_engine_var.get(),
-                "transform_fallback": self.flow_transform_fallback_var.get(),
-                "memory_budget_mb": self.resource_memory_var.get(),
-                "flow_workers": self.resource_workers_var.get(),
-            }
+            config = FlowCommand.from_values(
+                batch_dir,
+                custom_anchors=dict(self.custom_anchors),
+                global_master=self.flow_global_master_var.get(),
+                fwhm=self.flow_fwhm_var.get(),
+                sigma=self.flow_sigma_var.get(),
+                matching_radius=self.flow_matching_radius_var.get(),
+                ransac=self.flow_ransac_var.get(),
+                debug_images=self.flow_debug_var.get(),
+                min_stars=self.flow_min_stars_var.get(),
+                min_inliers=self.flow_min_inliers_var.get(),
+                min_ratio=self.flow_min_ratio_var.get(),
+                max_stars=150,
+                engine=self.flow_engine_var.get(),
+                engine_profile=self.flow_profile_var.get(),
+                detector_engine=self.flow_detector_engine_var.get(),
+                transform_fallback=self.flow_transform_fallback_var.get(),
+                memory_budget_mb=self.resource_memory_var.get(),
+                flow_workers=self.resource_workers_var.get(),
+            )
         except (tk.TclError, TypeError, ValueError) as exc:
             messagebox.showerror("Parâmetros inválidos", str(exc), parent=self)
             return
         self.save_settings()
-        self._start_operation("Flow", batch_dir, config)
+        self._start_operation("Flow", config)
 
     def run_flow_logic(self, batch_dir, config):
         """Compatibility entry point; UI launches use PipelineRunner."""
@@ -964,28 +1071,30 @@ class AstroProcessManager(tk.Tk):
             if base_dir == output_dir:
                 raise ValueError("A pasta de destino deve ser diferente da pasta base.")
 
-            config = {
-                "debayer_pattern": self.align_debayer_pattern_var.get(),
-                "debayer_method": self.align_debayer_method_var.get(),
-                "interpolation": self.align_interpolation_var.get(),
-                "overwrite": self.align_overwrite_var.get(),
-                "dry_run": self.align_dry_run_var.get(),
-                "keep_header": self.align_keep_header_var.get(),
-                "delete_intermediates": self.align_delete_intermediates_var.get(),
-                "compress_output": self.align_compress_output_var.get(),
-                "engine_profile": self.align_profile_var.get(),
-                "warp_engine": self.align_warp_engine_var.get(),
-                "memory_budget_mb": self.resource_memory_var.get(),
-                "workers": self.resource_workers_var.get(),
-                "quality_gate": self.align_quality_gate_var.get(),
-                "quality_max_shift": self.align_quality_shift_var.get(),
-            }
+            config = AlignCommand.from_values(
+                base_dir,
+                output_dir,
+                debayer_pattern=self.align_debayer_pattern_var.get(),
+                debayer_method=self.align_debayer_method_var.get(),
+                interpolation=self.align_interpolation_var.get(),
+                overwrite=self.align_overwrite_var.get(),
+                dry_run=self.align_dry_run_var.get(),
+                keep_header=self.align_keep_header_var.get(),
+                delete_intermediates=self.align_delete_intermediates_var.get(),
+                compress_output=self.align_compress_output_var.get(),
+                engine_profile=self.align_profile_var.get(),
+                warp_engine=self.align_warp_engine_var.get(),
+                memory_budget_mb=self.resource_memory_var.get(),
+                workers=self.resource_workers_var.get(),
+                quality_gate=self.align_quality_gate_var.get(),
+                quality_max_shift=self.align_quality_shift_var.get(),
+            )
 
         except Exception as exc:
             messagebox.showerror("Parâmetros inválidos", str(exc), parent=self)
             return
 
-        self._start_operation("Align", base_dir, output_dir, config)
+        self._start_operation("Align", config)
 
     def run_align_logic(self, base_dir, output_dir, config_dict):
         """Compatibility entry point; UI launches use PipelineRunner."""
@@ -994,7 +1103,6 @@ class AstroProcessManager(tk.Tk):
     def start_hdr(self):
         if self.worker and self.worker.is_alive(): return
         try:
-            from hdr_logic import build_hdr_config
             folder_text = self.hdr_input_var.get().strip()
             folder = Path(folder_text)
             if not folder_text or not folder.is_dir():
@@ -1008,116 +1116,63 @@ class AstroProcessManager(tk.Tk):
                 raise ValueError("São necessários pelo menos dois FITS alinhados.")
             config = {"input_paths": paths, "output_path": output_text,
                       "noise_floor": self.hdr_noise_var.get(), "row_band": self.hdr_rowband_var.get()}
-            if self.hdr_saturation_var.get(): config["saturation"] = float(self.hdr_saturation_var.get())
-            if self.hdr_exptime_var.get(): config["exposure_override"] = float(self.hdr_exptime_var.get())
-            if not np.isfinite(float(config["noise_floor"])) or float(config["noise_floor"]) <= 0: raise ValueError("Ruído inválido")
-            if config["row_band"] <= 0: raise ValueError("A faixa de linhas deve ser positiva.")
-            for key in ("saturation", "exposure_override"):
-                if key in config and (not np.isfinite(config[key]) or config[key] <= 0):
-                    raise ValueError(f"{key}: informe um número positivo e finito.")
-            build_hdr_config(config)
+            if self.hdr_saturation_var.get(): config["saturation"] = self.hdr_saturation_var.get()
+            if self.hdr_exptime_var.get(): config["exposure_override"] = self.hdr_exptime_var.get()
+            command = HDRCommand.from_values(config)
         except (tk.TclError, OSError, TypeError, ValueError) as exc:
             messagebox.showerror("HDR", str(exc)); return
-        self._start_operation("HDR", config)
+        self._start_operation("HDR", command)
 
     def start_stacking(self):
-        if self.worker and self.worker.is_alive():
+        if getattr(self, "runner", None) is not None and self.runner.busy:
             return
-
-        # ---- Verifica os critérios de triagem de frames sem guiagem ----
+        if getattr(self, "runner", None) is None and getattr(self, "worker", None) is not None and self.worker.is_alive():
+            return
         try:
-            trail_filter_enabled = bool(self.stack_trail_filter_var.get())
-            min_roundness = float(self.stack_min_roundness_var.get())
-            min_shape_stars_value = float(self.stack_min_shape_stars_var.get())
-            if not np.isfinite(min_shape_stars_value) or not min_shape_stars_value.is_integer():
-                raise ValueError("O mínimo de estrelas medidas deve ser inteiro.")
-            min_shape_stars = int(min_shape_stars_value)
-        except (tk.TclError, TypeError, ValueError):
-            messagebox.showerror(
-                "Parâmetros inválidos",
-                "Informe uma roundness mínima entre 0 e 1 e pelo menos 1 estrela medida.",
-                parent=self,
+            StackCommand.validate_options(
+                self.stack_min_roundness_var.get(), self.stack_min_shape_stars_var.get()
             )
+        except (tk.TclError, TypeError, ValueError) as exc:
+            messagebox.showerror("Parâmetros inválidos", str(exc), parent=self)
+            return
+        try:
+            input_dir = self.stack_input_dir_var.get()
+            values = {
+                "base_dir": str(self.batch_dir_var.get()),
+                "selection_mode": self.stack_selection_mode_var.get(),
+                "selection_percentage": self.stack_selection_percentage_var.get(),
+                "selection_metric": self.stack_selection_metric_var.get(),
+                "trail_filter_enabled": self.stack_trail_filter_var.get(),
+                "min_roundness": self.stack_min_roundness_var.get(),
+                "min_shape_stars": self.stack_min_shape_stars_var.get(),
+                "method": self.stack_method_var.get(),
+                "rejection_method": self.stack_rejection_method_var.get(),
+                "rejection_low": self.stack_rejection_low_var.get(),
+                "rejection_high": self.stack_rejection_high_var.get(),
+                "normalize": self.stack_normalize_var.get(),
+                "normalize_method": self.stack_normalize_method_var.get(),
+                "output_name": self.stack_output_name_var.get(),
+                "compress_output": self.stack_compress_var.get(),
+                "apply_dither_correction": self.stack_dither_correction_var.get(),
+                "engine_profile": self.stack_profile_var.get(),
+                "reducer_engine": self.stack_reducer_engine_var.get(),
+            }
+            command = StackCommand.from_values(
+                input_dir, self.stack_output_dir_var.get(), **values
+            )
+        except (tk.TclError, OSError, TypeError, ValueError) as exc:
+            messagebox.showerror("Parâmetros inválidos", str(exc), parent=self)
             return
 
-        if not np.isfinite(min_roundness) or not 0.0 <= min_roundness <= 1.0:
-            messagebox.showerror(
-                "Parâmetros inválidos",
-                "A roundness mínima b/a deve ser um número finito entre 0 e 1.",
-                parent=self,
+        from astroalign_logic import load_global_flow, load_local_flow
+        if not any(
+            batch.is_dir() and load_local_flow(batch) is not None
+            for batch in command.input_dir.iterdir()
+        ) and load_global_flow(command.input_dir.parent) is None:
+            self.print_to_console(
+                "[Stack] Aviso: nenhum Flow encontrado; os nomes dos arquivos serão usados.\n"
             )
-            return
-        if not 1 <= min_shape_stars <= 64:
-            messagebox.showerror(
-                "Parâmetros inválidos",
-                "O mínimo de estrelas medidas deve ficar entre 1 e 64.",
-                parent=self,
-            )
-            return
-
-        # ---- Verifica pasta de entrada ----
-        input_dir = Path(self.stack_input_dir_var.get()).expanduser().resolve()
-        if not input_dir.is_dir():
-            messagebox.showerror(
-                "Erro",
-                "Selecione uma pasta de entrada com os frames alinhados.\n\n"
-                "Esta deve ser a pasta de saída do AstroAlign (ex: .../aligned).",
-                parent=self,
-            )
-            return
-
-        # ---- Verifica pasta de saída ----
-        output_dir = Path(self.stack_output_dir_var.get()).expanduser().resolve()
-        if not str(self.stack_output_dir_var.get()).strip():
-            messagebox.showerror(
-                "Erro",
-                "Selecione uma pasta de saída para a imagem empilhada.",
-                parent=self,
-            )
-            return
-
-        # ---- Verifica se há arquivos de flow (opcional, mas recomendado) ----
-        has_flow = False
-        for batch_dir in input_dir.iterdir():
-            if batch_dir.is_dir() and (batch_dir / "flow_local.json").exists():
-                has_flow = True
-                break
-
-        if not has_flow:
-            # Verifica se há global_flow.json na pasta pai
-            if not (input_dir.parent / "global_flow.json").exists():
-                # Avisa, mas não impede
-                self.print_to_console(
-                    "[Stack] Aviso: Nenhum arquivo de flow encontrado.\n"
-                    "  O Stacking usará apenas os nomes dos arquivos para organizar os frames.\n"
-                )
-
-        # ---- Configuração ----
-        config = {
-            "base_dir": str(self.batch_dir_var.get()),
-            "input_dir": str(input_dir),
-            "output_dir": str(output_dir),
-            "selection_mode": self.stack_selection_mode_var.get(),
-            "selection_percentage": self.stack_selection_percentage_var.get(),
-            "selection_metric": self.stack_selection_metric_var.get(),
-            "trail_filter_enabled": trail_filter_enabled,
-            "min_roundness": min_roundness,
-            "min_shape_stars": min_shape_stars,
-            "method": self.stack_method_var.get(),
-            "rejection_method": self.stack_rejection_method_var.get(),
-            "rejection_low": self.stack_rejection_low_var.get(),
-            "rejection_high": self.stack_rejection_high_var.get(),
-            "normalize": self.stack_normalize_var.get(),
-            "normalize_method": self.stack_normalize_method_var.get(),
-            "output_name": self.stack_output_name_var.get(),
-            "output_bit_depth": self.stack_output_bit_depth_var.get(),
-            "compress_output": self.stack_compress_var.get(),
-            "apply_dither_correction": self.stack_dither_correction_var.get(),
-            "engine_profile": self.stack_profile_var.get(),
-            "reducer_engine": self.stack_reducer_engine_var.get(),
-        }
-
-        self._start_operation("Stack", input_dir, config)
+        self._start_operation("Stack", command)
 
     def use_align_output_for_stack(self):
         """Use a saída do AstroAlign como entrada apenas após clique explícito."""
@@ -1204,12 +1259,39 @@ class AstroProcessManager(tk.Tk):
             "detector_engine": self.flow_detector_engine_var.get(),
         }
 
-        try:
-            img_preview, count, fwhm_measured = preview_star_detection(
-                target_batch, config
-            )
+        prev_window = tk.Toplevel(self)
+        prev_window.title(f"AstroFlow — Preview — {target_batch.name}")
+        prev_window.geometry("850x700")
+        prev_window.minsize(650, 500)
 
+        state = {"closed": False}
+        poll_id = {"value": None}
+
+        def close_preview():
+            state["closed"] = True
+            preview_service.close()
+            if poll_id["value"] is not None:
+                try:
+                    prev_window.after_cancel(poll_id["value"])
+                except tk.TclError:
+                    pass
+                poll_id["value"] = None
+            if prev_window.winfo_exists():
+                prev_window.destroy()
+
+        prev_window.protocol("WM_DELETE_WINDOW", close_preview)
+        ttk.Label(
+            prev_window,
+            text="Carregando preview…",
+            style="Muted.TLabel",
+        ).pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+
+        def render_preview(result):
+            if state["closed"] or not prev_window.winfo_exists():
+                return
+            img_preview, count, fwhm_measured = result
             if img_preview is None:
+                close_preview()
                 messagebox.showwarning(
                     "Aviso",
                     "Não foi possível carregar a imagem para preview.",
@@ -1217,47 +1299,65 @@ class AstroProcessManager(tk.Tk):
                 )
                 return
 
-        except Exception as exc:
-            messagebox.showerror("Erro", f"Falha ao gerar preview:\n{exc}", parent=self)
-            return
+            for child in prev_window.winfo_children():
+                child.destroy()
 
-        prev_window = tk.Toplevel(self)
-        prev_window.title(f"AstroFlow — Preview — {target_batch.name}")
-        prev_window.geometry("850x700")
-        prev_window.minsize(650, 500)
+            info = ttk.Frame(prev_window, padding=12)
+            info.pack(fill=tk.X)
 
-        info = ttk.Frame(prev_window, padding=12)
-        info.pack(fill=tk.X)
+            ttk.Label(
+                info,
+                text=(
+                    f"{target_batch.name}   •   {count} estrelas   •   FWHM {fwhm_measured:.1f}px   •   Engine: {self.flow_engine_var.get()}"
+                ),
+                font=("Segoe UI Semibold", 10),
+            ).pack(anchor="w")
 
-        ttk.Label(
-            info,
-            text=(
-                f"{target_batch.name}   •   {count} estrelas   •   FWHM {fwhm_measured:.1f}px   •   Engine: {self.flow_engine_var.get()}"
-            ),
-            font=("Segoe UI Semibold", 10),
-        ).pack(anchor="w")
+            fig = Figure(figsize=(8, 5), dpi=90)
+            ax = fig.add_subplot(111)
 
-        fig = Figure(figsize=(8, 5), dpi=90)
-        ax = fig.add_subplot(111)
+            if img_preview.ndim == 3:
+                ax.imshow(cv2.cvtColor(img_preview, cv2.COLOR_BGR2RGB))
+            else:
+                ax.imshow(img_preview, cmap="gray")
 
-        if img_preview.ndim == 3:
-            ax.imshow(cv2.cvtColor(img_preview, cv2.COLOR_BGR2RGB))
-        else:
-            ax.imshow(img_preview, cmap="gray")
+            ax.set_title("Detecção de estrelas")
+            ax.axis("off")
+            fig.tight_layout(pad=0.5)
 
-        ax.set_title("Detecção de estrelas")
-        ax.axis("off")
-        fig.tight_layout(pad=0.5)
+            canvas = FigureCanvasTkAgg(fig, master=prev_window)
+            canvas.draw()
+            canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=12, pady=5)
 
-        canvas = FigureCanvasTkAgg(fig, master=prev_window)
-        canvas.draw()
-        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=12, pady=5)
+            ttk.Label(
+                prev_window,
+                text="Ajuste FWHM/Sigma na aba Flow e execute o preview novamente.",
+                style="Muted.TLabel",
+            ).pack(pady=(0, 10))
 
-        ttk.Label(
-            prev_window,
-            text="Ajuste FWHM/Sigma na aba Flow e execute o preview novamente.",
-            style="Muted.TLabel",
-        ).pack(pady=(0, 10))
+        preview_service = PreviewService(
+            lambda batch: preview_star_detection(batch, config),
+            max_workers=2,
+            max_pending=2,
+        )
+
+        def poll_preview():
+            poll_id["value"] = None
+            if state["closed"] or not prev_window.winfo_exists():
+                return
+            for result in preview_service.drain():
+                if result.error:
+                    close_preview()
+                    messagebox.showerror(
+                        "Erro", f"Falha ao gerar preview:\n{result.error}", parent=self
+                    )
+                else:
+                    render_preview(result.image)
+            if not state["closed"]:
+                poll_id["value"] = prev_window.after(40, poll_preview)
+
+        preview_service.replace(1, [("flow", target_batch)])
+        poll_preview()
 
     def show_flow_visualization(self):
         import math
@@ -1270,9 +1370,9 @@ class AstroProcessManager(tk.Tk):
         from matplotlib.figure import Figure
 
         base_dir = Path(self.batch_dir_var.get()).expanduser().resolve()
-        global_json = base_dir / "global_flow.json"
-
-        if not global_json.exists():
+        from astroalign_logic import load_global_flow, load_local_flow
+        global_data = load_global_flow(base_dir)
+        if global_data is None:
             messagebox.showerror(
                 "Erro",
                 "Execute o AstroFlow primeiro. global_flow.json não encontrado.",
@@ -1281,9 +1381,6 @@ class AstroProcessManager(tk.Tk):
             return
 
         try:
-            with global_json.open("r", encoding="utf-8") as f:
-                global_data = json.load(f)
-
             points_x, points_y, rotations, time_seq = [], [], [], []
             center_pt = np.array([0, 0, 1])
             frame_counter = 0
@@ -1293,13 +1390,9 @@ class AstroProcessManager(tk.Tk):
                     continue
 
                 g_matrix = np.array(g_info["matrix"], dtype=np.float64)
-                local_json = base_dir / batch_name / "flow_local.json"
-
-                if not local_json.exists():
+                local_data = load_local_flow(base_dir / batch_name)
+                if local_data is None:
                     continue
-
-                with local_json.open("r", encoding="utf-8") as f:
-                    local_data = json.load(f)
 
                 for _, l_info in local_data.get("frames", {}).items():
                     if (
@@ -1404,193 +1497,31 @@ class AstroProcessManager(tk.Tk):
         canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
     def open_anchor_selector(self, target_batch=None):
-        import functools
-        import threading
+        """Delegate Flow reference selection to its presentation controller."""
+        return self.anchor_selector.open(target_batch=target_batch)
 
-        import cv2
-        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-        from matplotlib.figure import Figure
+    def _request_reference_change(self, base_dir, batch_name, frame_name):
+        """Start a metadata-only reference rebase, or save a future anchor."""
+        from astroalign_logic import load_local_flow
 
-        from astroflow_logic import extract_luminance, load_fits_data
-
-        base_dir_str = self.batch_dir_var.get()
-        if not base_dir_str:
-            messagebox.showerror(
-                "Erro", "Selecione a Pasta Base primeiro.", parent=self
+        batch_dir = Path(base_dir) / batch_name
+        if load_local_flow(batch_dir) is None:
+            self._commit_reference_change(batch_name, frame_name)
+            self.print_to_console(
+                "[AstroFlow] Nenhum Flow Local existente; referência aplicada para o próximo Flow.\n"
             )
-            return
+            return False
+        if self.runner.busy:
+            self.print_to_console("[AstroFlow] Já existe uma operação em andamento.\n")
+            return False
+        command = ReferenceChangeCommand.from_values(batch_dir, frame_name, base_dir)
+        self._start_operation("ReferenceChange", command)
+        return True
 
-        base_dir = Path(base_dir_str).expanduser().resolve()
-        if not base_dir.is_dir():
-            messagebox.showerror("Erro", "A Pasta Base não existe.", parent=self)
-            return
-
-        batch_folders = sorted(
-            [d for d in base_dir.iterdir() if d.is_dir() and "batch" in d.name.lower()]
-        )
-        if not batch_folders:
-            messagebox.showerror(
-                "Erro", "Nenhuma pasta de Batch encontrada.", parent=self
-            )
-            return
-
-        win = tk.Toplevel(self)
-        win.title("AstroFlow — Selecionar referência")
-        win.geometry("1000x800")
-        win.minsize(750, 600)
-
-        top = ttk.Frame(win, padding=12)
-        top.pack(fill=tk.X)
-        ttk.Label(top, text="Batch:").pack(side=tk.LEFT)
-
-        batch_combo = ttk.Combobox(
-            top, values=[b.name for b in batch_folders], state="readonly", width=18
-        )
-        batch_combo.pack(side=tk.LEFT, padx=(7, 15))
-
-        ttk.Label(top, text="Frame:").pack(side=tk.LEFT)
-        frame_combo = ttk.Combobox(top, state="readonly", width=34)
-        frame_combo.pack(side=tk.LEFT, padx=7)
-
-        image_frame = ttk.Frame(win, padding=(12, 0))
-        image_frame.pack(fill=tk.BOTH, expand=True)
-
-        fig = Figure(figsize=(8, 6), dpi=85)
-        ax = fig.add_subplot(111)
-        ax.axis("off")
-
-        ax_img = ax.imshow(
-            np.zeros((10, 10)),
-            cmap="gray",
-            interpolation="nearest",
-            rasterized=True,
-            vmin=0,
-            vmax=255,
-        )
-        title_obj = ax.set_title("Stretched Preview", fontsize=10)
-
-        canvas = FigureCanvasTkAgg(fig, master=image_frame)
-        canvas.draw()
-        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-
-        @functools.lru_cache(maxsize=40)
-        def get_preview_data(filepath):
-            data, header = load_fits_data(filepath)
-            l_data = extract_luminance(data, header)
-            h, w = l_data.shape[:2]
-            small_w, small_h = max(w // 3, 1), max(h // 3, 1)
-            return cv2.resize(
-                l_data, (small_w, small_h), interpolation=cv2.INTER_NEAREST
-            )
-
-        generation = {"id": 0}
-
-        def update_frames(event=None):
-            b_name = batch_combo.get()
-            if not b_name:
-                return
-            b_path = base_dir / b_name
-            fits_files = sorted(
-                [
-                    f.name
-                    for f in b_path.iterdir()
-                    if f.is_file() and f.suffix.lower() in {".fit", ".fits", ".fts"}
-                ]
-            )
-            frame_combo.configure(values=fits_files)
-            if fits_files:
-                selected = self.custom_anchors.get(
-                    b_name, fits_files[len(fits_files) // 2]
-                )
-                if selected not in fits_files:
-                    selected = fits_files[0]
-                frame_combo.set(selected)
-                update_image()
-
-        def update_image(event=None):
-            b_name = batch_combo.get()
-            f_name = frame_combo.get()
-            if not b_name or not f_name:
-                return
-
-            generation["id"] += 1
-            current_id = generation["id"]
-            batch_combo.configure(state="disabled")
-            frame_combo.configure(state="disabled")
-
-            def worker():
-                try:
-                    f_path = base_dir / b_name / f_name
-                    small_data = get_preview_data(f_path)
-                    median = np.median(small_data)
-                    p25, p75 = np.percentile(small_data, [25, 75])
-                    std = max((p75 - p25) / 1.35, 1e-5)
-                    vmin, vmax = median - 0.5 * std, median + 6.0 * std
-                    norm = (
-                        np.clip((small_data - vmin) / max(vmax - vmin, 1e-5), 0, 1)
-                        * 255
-                    )
-                    img_8u = norm.astype(np.uint8)
-
-                    def update_gui():
-                        if current_id != generation["id"]:
-                            return
-                        ax_img.set_data(img_8u)
-                        ax_img.set_extent((0, img_8u.shape[1], img_8u.shape[0], 0))
-                        title_obj.set_text(f"Stretched Preview — {b_name} / {f_name}")
-                        canvas.draw_idle()
-                        batch_combo.configure(state="readonly")
-                        frame_combo.configure(state="readonly")
-
-                    self.after(0, update_gui)
-                except Exception:
-
-                    def handle_error():
-                        batch_combo.configure(state="readonly")
-                        frame_combo.configure(state="readonly")
-                        self.print_to_console(f"[Preview] Erro: {exc}\n")
-
-                    self.after(0, handle_error)
-
-            threading.Thread(target=worker, daemon=True).start()
-
-        batch_combo.bind("<<ComboboxSelected>>", update_frames)
-        frame_combo.bind("<<ComboboxSelected>>", update_image)
-
-        if batch_folders:
-            if target_batch and target_batch in [b.name for b in batch_folders]:
-                batch_combo.set(target_batch)
-            else:
-                batch_combo.set(batch_folders[0].name)
-            update_frames()
-
-        buttons = ttk.Frame(win, padding=12)
-        buttons.pack(fill=tk.X)
-
-        def save_selection():
-            b_name, f_name = batch_combo.get(), frame_combo.get()
-            if not b_name or not f_name:
-                return
-            self.custom_anchors[b_name] = f_name
-            self.save_settings()
-            self.print_to_console(f"[AstroFlow] Referência da {b_name}: {f_name}\n")
-            self.refresh_flow_reference_preview()
-            messagebox.showinfo(
-                "Referência salva",
-                f"Frame definido como referência da {b_name}:\n\n{f_name}",
-                parent=win,
-            )
-
-        ttk.Button(
-            buttons,
-            text="✓  Definir como referência",
-            style="Accent.TButton",
-            command=save_selection,
-        ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5), ipady=5)
-        ttk.Button(buttons, text="Fechar", command=win.destroy).pack(
-            side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 0), ipady=5
-        )
-
+    def _commit_reference_change(self, batch_name, frame_name):
+        self.custom_anchors[str(batch_name)] = str(frame_name)
+        self.save_settings()
+        self.refresh_flow_reference_preview()
     def _open_anchor_selector_for_batch(self, batch_name):
         self.open_anchor_selector(target_batch=batch_name)
 
@@ -1635,6 +1566,8 @@ class AstroProcessManager(tk.Tk):
             if not answer:
                 return
             self.cancel_event.set()
+        if hasattr(self, "anchor_selector"):
+            self.anchor_selector.close()
         self.save_settings()
         self.destroy()
 

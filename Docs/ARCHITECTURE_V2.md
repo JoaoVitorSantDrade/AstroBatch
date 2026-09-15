@@ -9,17 +9,29 @@ The following are now active code paths, superseding the corresponding
   all six stages, immutable progress/results, coalesced progress and UI polling.
 - `app/application/pipelines.py`: lazy pipeline adapters with explicit success,
   partial, failed and cancelled outcomes. Workers do not call Tk.
-- `app/application/commands.py`: validated resource settings independent of Tk.
+- `app/application/commands.py`: validated resource settings and typed
+  Calibration, Batch, Flow, Align, Stack, HDR and metadata-only
+  reference-change commands independent of Tk.
 - `app/application/log_buffer.py`: bounded, nonblocking recent activity.
 - `app/infrastructure/json_store.py`: versioned settings and atomic JSON writes.
 - `app/infrastructure/fits_masks.py`: shared scientific mask loading.
-- `views/hdr_model.py` and `views/hdr_view.py`: first passive form, supplied
-  variables and commands without a reference to the root controller.
+- `views/*_model.py` and the six stage views: passive forms receive variables
+  and commands without a reference to the root controller. Stack validation is
+  owned by `StackCommand`; Flow/Align/Stack retain legacy processing adapters.
 - `views/scrollable_host.py`: reusable scoped scrolling for legacy and new forms.
+- `views/preview_service.py`: bounded two-worker preview execution with queue
+  results and generation-based stale-result handling.
+- `app/application/stages.py`: stage definitions for identifiers, command
+  builders, execution adapters and operation controls.
 
 `main.py` composes these pieces and retains compatibility worker entry points.
-It still owns the other form variables and preview/anchor dialogs. This is an
-incremental migration, not a completed separation of every view and command.
+It owns the Tk-variable registry and shared feedback, while `StageContext`
+supplies explicit bindings to all six registry-built model/view pairs. The
+Flow, Align and Stack views and the anchor-selection controller no longer
+access the root controller. Flow thumbnail, detection and anchor preview
+workers return through queues; only Tk polling updates widgets.
+Flow reference cards also render persisted registration status and provenance
+when available, including recovery method, parent and hop count.
 
 For a new feature, add its domain callable and validated command, adapt its
 result in `execute_pipeline`, provide a passive view model, and register its
@@ -27,10 +39,20 @@ view/buttons in the composition root. Do not create another per-stage thread,
 Tk callback from a worker, or independent settings writer. Test its adapter and
 command without Tk, then test the native form binding and shared lifecycle.
 
-Next: migrate the remaining views and preview lifecycle, extract the remaining
-typed commands, then consolidate stage registration. Preserve field parity
-before changing the visual design. Current verification is recorded in
-`Docs/WORKFLOW_REVIEW.md` (126 tests passed for this delivery).
+Flow and Align persist reusable registration graphs with fingerprints and
+revision metadata. Local Flow expands from the selected reference through
+validated neighbors, Global Flow seeds all successful direct matches, and a
+reference-change command re-roots connected transforms without re-reading
+FITS. Active local/global payloads are immutable snapshots selected by one
+manifest, with legacy JSON fallback. Align's bounded lazy graph-parent quality
+cache excludes self-comparisons and uses validity/saturation masks without
+changing the `global × local` geometry. Expanded union canvases remain
+deferred.
+
+Next: complete manual visual review across themes, DPI and small windows, and
+keep the lifecycle regressions close to future preview changes. Preserve field
+parity before changing visual design. Current verification is recorded in
+`Docs/WORKFLOW_REVIEW.md`.
 
 ## Why change now
 

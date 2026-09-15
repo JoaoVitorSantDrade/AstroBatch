@@ -50,6 +50,51 @@ class AlignQualityDeliveryTests(unittest.TestCase):
             self.assertLessEqual(max(preview.shape[:2]), 512)
             self.assertEqual(preview.shape[:2], mask.shape)
 
+    def test_quality_gate_reports_insufficient_overlap_from_graph_cache(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); batch = root / "batch_001"; out = root / "out"
+            batch.mkdir()
+            data = np.zeros((128, 128), np.float32)
+            data[40:48, 50:58] = 1000
+            fits.PrimaryHDU(data).writeto(batch / "frame.fits")
+            cfg = align._build_align_config(root, out, {"quality_gate": True, "overwrite": True})
+            empty_preview = (np.zeros((64, 64), np.float32), np.zeros((64, 64), np.uint8))
+            result = align._process_single_alignment(
+                "frame.fits",
+                {"matrix": np.eye(3).tolist(), "_quality_reference_labels": ["parent"]},
+                batch,
+                out,
+                np.eye(3).tolist(),
+                "bilinear",
+                cfg,
+                reference_previews={"parent": empty_preview},
+            )
+            self.assertIn("insufficient_overlap", result[1])
+
+    def test_quality_gate_never_accepts_a_frame_against_its_own_preview(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); batch = root / "batch_001"; out = root / "out"
+            batch.mkdir()
+            data = np.zeros((96, 96), np.float32)
+            data[35:45, 42:52] = 1000
+            fits.PrimaryHDU(data).writeto(batch / "frame.fits")
+            preview = align.prepare_reference_preview(
+                batch / "frame.fits", np.eye(3), "bilinear"
+            )
+            cfg = align._build_align_config(root, out, {"quality_gate": True, "overwrite": True})
+            result = align._process_single_alignment(
+                "frame.fits",
+                {
+                    "matrix": np.eye(3).tolist(),
+                    "_quality_reference_labels": ["self"],
+                    "_quality_frame_identity": ("batch_001", "frame.fits"),
+                },
+                batch, out, np.eye(3).tolist(), "bilinear", cfg,
+                reference_previews={"self": preview},
+                reference_preview_sources={"self": ("batch_001", "frame.fits")},
+            )
+            self.assertIn("unverified", result[1])
+
     def test_zero_and_negative_pixels_remain_valid(self):
         data = np.array([[0.0, -2.0], [3.0, 4.0]], np.float32)
         mask = align.generate_valid_mask(data.shape, np.eye(3))

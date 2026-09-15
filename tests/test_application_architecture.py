@@ -8,11 +8,121 @@ from unittest.mock import Mock, patch
 
 from app.application.runner import PipelineRunner, OperationResult
 from app.application.pipelines import execute_pipeline
+from app.application.commands import AlignCommand, BatchCommand, CalibrationCommand, FlowCommand, HDRCommand, ReferenceChangeCommand, StackCommand
 from app.application.log_buffer import ActivityBuffer
 from app.infrastructure.json_store import SettingsRepository
 
 
 class RunnerTests(unittest.TestCase):
+    def test_calibration_command_normalizes_paths_and_preserves_legacy_shape(self):
+        command = CalibrationCommand.from_values(
+            "~/lights", "~/calibrated", False, None, True, "flat.fits", True, False
+        )
+        config = command.to_legacy_config()
+        self.assertTrue(Path(config["input_dir"]).is_absolute())
+        self.assertTrue(Path(config["output_dir"]).is_absolute())
+        self.assertFalse(config["apply_dark"])
+        self.assertEqual(config["flat_path"], "flat.fits")
+
+    def test_calibration_command_rejects_non_boolean_options(self):
+        with self.assertRaises(ValueError):
+            CalibrationCommand.from_values("lights", "out", apply_dark="yes")
+
+    def test_pipeline_accepts_typed_calibration_command(self):
+        command = CalibrationCommand.from_values("lights", "out")
+        with patch("calibration_logic.run_calibration_pipeline", return_value={"status": "success"}) as run:
+            result = execute_pipeline("Calibration", (command,), Mock(), Mock(), threading.Event())
+        self.assertEqual(result.outcome, "success")
+        self.assertEqual(run.call_args.args[0], command.to_legacy_config())
+
+    def test_batch_command_validates_values_and_adapts_legacy_config(self):
+        command = BatchCommand.from_values(
+            "input", "output", 3, 1000, True, False, False,
+            "Crop", "Nearest", .25,
+        )
+        self.assertEqual(command.to_legacy_config().crop_size, 1000)
+        with self.assertRaises(ValueError):
+            BatchCommand.from_values(
+                "input", "output", 0, 1000, True, False, False,
+                "Crop", "Nearest", .25,
+            )
+
+    def test_flow_command_adapter_is_accepted_by_pipeline(self):
+        command = FlowCommand.from_values(
+            "batch", custom_anchors={}, global_master="Auto", fwhm=4,
+            sigma=5, matching_radius=15, ransac=3, debug_images=False,
+            min_stars=4, min_inliers=4, min_ratio=.15, max_stars=150,
+            engine="DAO", engine_profile="Stable", detector_engine="",
+            transform_fallback="Disabled", memory_budget_mb=512, flow_workers=2,
+        )
+        with patch("astroflow_logic.process_all_flows", return_value={"status": "success"}) as run:
+            result = execute_pipeline("Flow", (command,), Mock(), Mock(), threading.Event())
+        self.assertEqual(result.outcome, "success")
+        self.assertEqual(run.call_args.args[0], command.batch_dir)
+        self.assertEqual(run.call_args.args[1], command.to_legacy_config())
+
+    def test_align_command_adapter_preserves_legacy_arguments(self):
+        command = AlignCommand.from_values(
+            "base", "output", debayer_pattern="Auto", debayer_method="Bilinear",
+            interpolation="Lanczos", overwrite=False, dry_run=False,
+            keep_header=True, delete_intermediates=False, compress_output=True,
+            engine_profile="Stable", warp_engine="", memory_budget_mb=512,
+            workers=2, quality_gate=False, quality_max_shift=1.5,
+        )
+        with patch("astroalign_logic.process_all_alignments", return_value=(1, 0)) as run:
+            result = execute_pipeline("Align", (command,), Mock(), Mock(), threading.Event())
+        self.assertEqual(result.outcome, "success")
+        self.assertEqual(run.call_args.args[0], command.base_dir)
+        self.assertEqual(run.call_args.args[1], command.output_dir)
+        self.assertEqual(run.call_args.args[2], command.to_legacy_config())
+
+    def test_reference_change_command_uses_shared_runner_adapter(self):
+        command = ReferenceChangeCommand.from_values("batch_001", "03.fits", "session")
+        with patch("astroflow_logic.apply_reference_change", return_value={"status": "success"}) as apply:
+            result = execute_pipeline("ReferenceChange", (command,), Mock(), Mock(), threading.Event())
+        self.assertEqual(result.outcome, "success")
+        self.assertEqual(apply.call_args.args[:3], (command.batch_dir, "03.fits", command.base_dir))
+
+    def test_stack_command_owns_validation_and_adapts_settings(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); input_dir = root / "aligned"; input_dir.mkdir()
+            command = StackCommand.from_values(
+                input_dir, root / "stacked", min_roundness=.7,
+                min_shape_stars=5, selection_percentage=80,
+                rejection_low=3, rejection_high=3,
+                trail_filter_enabled=False, normalize=True,
+                compress_output=True, apply_dither_correction=False,
+                engine_profile="Stable",
+            )
+            self.assertEqual(command.to_legacy_config()["output_bit_depth"], "16-bit")
+            with self.assertRaises(ValueError):
+                StackCommand.from_values(input_dir, root / "stacked", min_roundness=1.5)
+
+    def test_hdr_command_owns_hdr_config_validation_and_adapts_pipeline(self):
+        command = HDRCommand.from_values({
+            "input_paths": ["one.fits", "two.fits"],
+            "output_path": "hdr.fits",
+            "row_band": 64,
+            "noise_floor": 1.0,
+        })
+        self.assertEqual(command.to_legacy_config().row_band, 64)
+        with self.assertRaises(ValueError):
+            HDRCommand.from_values({
+                "input_paths": ["one.fits"],
+                "output_path": "hdr.fits",
+                "row_band": 0,
+            })
+
+    def test_pipeline_accepts_typed_hdr_command(self):
+        command = HDRCommand.from_values({
+            "input_paths": ["one.fits", "two.fits"],
+            "output_path": "hdr.fits",
+        })
+        with patch("hdr_logic.run_hdr_pipeline", return_value={"status": "success"}) as run:
+            result = execute_pipeline("HDR", (command,), Mock(), Mock(), threading.Event())
+        self.assertEqual(result.outcome, "success")
+        self.assertIs(run.call_args.args[0], command.to_legacy_config())
+
     def test_progress_coalesced_completion_once_on_consumer_thread(self):
         runner=PipelineRunner(Mock())
         def operation(log, progress, cancel):

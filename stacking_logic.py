@@ -243,13 +243,21 @@ def load_flow_cache(
     if not base_dir or not str(base_dir).strip() or str(base_dir) == ".":
         return cache
 
-    for batch_name in batch_metadata:
-        flow_path = base_dir / batch_name / "flow_local.json"
-        if not flow_path.is_file():
-            continue
+    try:
+        from astroalign_logic import load_local_flow
+    except Exception:
+        load_local_flow = None
 
+    for batch_name in batch_metadata:
         try:
-            cache[batch_name] = load_json(flow_path)
+            if load_local_flow is not None:
+                value = load_local_flow(base_dir / batch_name)
+                if isinstance(value, dict):
+                    cache[batch_name] = value
+                continue
+            flow_path = base_dir / batch_name / "flow_local.json"
+            if flow_path.is_file():
+                cache[batch_name] = load_json(flow_path)
         except Exception:
             cache[batch_name] = {}
 

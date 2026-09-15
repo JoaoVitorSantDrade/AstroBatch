@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import shutil
@@ -6,6 +7,7 @@ import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from dataclasses import dataclass
+from collections import OrderedDict
 from pathlib import Path
 
 import colour_demosaicing
@@ -187,10 +189,46 @@ def load_json(
         return json.load(f)
 
 
+def _flow_manifest(base_dir: Path) -> dict | None:
+    """Read the active Flow revision manifest when one is present."""
+    manifest_path = Path(base_dir) / "flow_revision.json"
+    if not manifest_path.exists():
+        return None
+    try:
+        value = load_json(manifest_path)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _manifest_path(base_dir: Path, value: str | None) -> Path | None:
+    if not value:
+        return None
+    path = Path(value)
+    return path if path.is_absolute() else Path(base_dir) / path
+
+
 def load_local_flow(
     batch_dir: Path,
 ) -> dict | None:
-    flow_path = batch_dir / "flow_local.json"
+    batch_dir = Path(batch_dir)
+    root = batch_dir.parent
+    manifest = _flow_manifest(root)
+    flow_path = None
+    if manifest:
+        local_flows = manifest.get("local_flows", {})
+        if isinstance(local_flows, dict):
+            flow_path = _manifest_path(root, local_flows.get(batch_dir.name))
+        if flow_path is None and manifest.get("batch") == batch_dir.name:
+            flow_path = _manifest_path(root, manifest.get("local_flow"))
+    if flow_path is None:
+        # A batch-local manifest is supported for projects that do not have a
+        # global Flow revision yet.
+        local_manifest = _flow_manifest(batch_dir)
+        if local_manifest:
+            flow_path = _manifest_path(batch_dir, local_manifest.get("local_flow"))
+    if flow_path is None:
+        flow_path = batch_dir / "flow_local.json"
 
     if not flow_path.exists():
         return None
@@ -201,7 +239,11 @@ def load_local_flow(
 def load_global_flow(
     base_dir: Path,
 ) -> dict | None:
-    flow_path = base_dir / "global_flow.json"
+    base_dir = Path(base_dir)
+    manifest = _flow_manifest(base_dir)
+    flow_path = _manifest_path(base_dir, manifest.get("global_flow")) if manifest else None
+    if flow_path is None:
+        flow_path = base_dir / "global_flow.json"
 
     if not flow_path.exists():
         return None
@@ -552,15 +594,108 @@ def prepare_reference_preview(filepath: Path, matrix: np.ndarray,
                               max_size: int = 512) -> tuple[np.ndarray, np.ndarray]:
     """Load and warp an alignment anchor once for bounded quality checks."""
     data, header = load_fits_data(filepath)
+    source_valid, source_sat = load_fits_masks(filepath, data.shape)
+    finite_source = np.isfinite(data)
+    source_valid &= np.all(finite_source, axis=2) if data.ndim == 3 else finite_source
+    saturation = header.get("SATURATE", header.get("SATLEVEL"))
+    if saturation is not None:
+        clipped = data >= float(saturation)
+        source_sat |= np.any(clipped, axis=2) if data.ndim == 3 else clipped
     pattern = get_bayer_pattern(header)
     data, _ = process_in_memory_debayer(data, header, pattern, "Bilinear")
     warped = warp_frame(data, matrix, interpolation_mode, rgb_registration=False)
     mask = generate_valid_mask(data.shape, matrix).astype(bool)
+    source_valid = _warp_affine_cpu(source_valid.astype(np.float32), matrix, "nearest") > 0.5
+    source_sat = _warp_affine_cpu(source_sat.astype(np.float32), matrix, "nearest") > 0.5
+    mask &= source_valid
+    mask &= np.isfinite(np.mean(warped, axis=2) if warped.ndim == 3 else warped)
+    mask &= ~source_sat
     stride = max(1, int(np.ceil(max(data.shape[:2]) / max_size)))
     if stride > 1:
         warped = warped[::stride, ::stride]
         mask = mask[::stride, ::stride]
     return np.asarray(warped, dtype=np.float32), np.asarray(mask, dtype=np.uint8)
+
+
+class ReferencePreviewCache:
+    """Thread-safe, bounded, demand-driven quality preview cache.
+
+    The cache stores only preview arrays. FITS decoding and warping happen on
+    the worker that first requests a graph neighbour, so large jobs do not
+    eagerly retain every batch reference.
+    """
+
+    def __init__(self, targets: dict[str, tuple[Path, str, dict, np.ndarray, str]], max_size: int = 8):
+        self.targets = dict(targets)
+        self.max_size = max(1, int(max_size))
+        self._values: OrderedDict[str, tuple[np.ndarray, np.ndarray]] = OrderedDict()
+        self._inflight: dict[str, threading.Event] = {}
+        self._lock = threading.RLock()
+
+    def keys(self):
+        return self.targets.keys()
+
+    def __contains__(self, label: str) -> bool:
+        """Support the mapping protocol used by the alignment worker."""
+        return label in self.targets
+
+    def get(self, label: str):
+        with self._lock:
+            cached = self._values.get(label)
+            if cached is not None:
+                self._values.move_to_end(label)
+                return cached
+            target = self.targets.get(label)
+            pending = self._inflight.get(label)
+            if pending is None:
+                pending = threading.Event()
+                self._inflight[label] = pending
+                owner = True
+            else:
+                owner = False
+        if target is None:
+            if owner:
+                with self._lock:
+                    self._inflight.pop(label, None)
+                    pending.set()
+            raise KeyError(label)
+        if not owner:
+            # Another alignment worker is already decoding/warping this
+            # preview. Waiting avoids duplicate full FITS reads and warps.
+            pending.wait()
+            return self.get(label)
+        batch_folder, frame_name, _info, matrix, interpolation_mode = target
+        try:
+            value = prepare_reference_preview(
+                batch_folder / frame_name,
+                matrix,
+                interpolation_mode,
+                max_size=512,
+            )
+            with self._lock:
+                self._values[label] = value
+                self._values.move_to_end(label)
+                while len(self._values) > self.max_size:
+                    self._values.popitem(last=False)
+            return value
+        finally:
+            with self._lock:
+                self._inflight.pop(label, None)
+                pending.set()
+
+
+def _alignment_transform_revision(frame_info: dict, interpolation_mode: str | None = None) -> str:
+    geometry_revision = frame_info.get("_geometry_revision")
+    if geometry_revision:
+        source = str(geometry_revision)
+    else:
+        source = (
+            f"{frame_info.get('_local_transform_revision', '')}|"
+            f"{frame_info.get('_global_transform_revision', '')}"
+        )
+    return hashlib.sha256(
+        f"{source}|{interpolation_mode or ''}".encode("utf-8")
+    ).hexdigest()[:16]
 
 
 def generate_valid_mask(
@@ -713,6 +848,8 @@ def _process_single_alignment(
     cancel_event: threading.Event | None = None,
     reference_preview: tuple[np.ndarray, np.ndarray] | None = None,
     writer_executor: ThreadPoolExecutor | None = None,
+    reference_previews: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
+    reference_preview_sources: dict[str, tuple[str, str]] | None = None,
 ) -> tuple[str, str | None]:
 
     try:
@@ -733,10 +870,20 @@ def _process_single_alignment(
         output_path = output_dir / frame_name
 
         if output_path.exists() and not config.overwrite:
-            return (
-                frame_name,
-                (f"ERRO: destino já existe, arquivo ignorado: {output_path}"),
-            )
+            sidecar_path = output_path.with_suffix(output_path.suffix + ".align.json")
+            try:
+                if sidecar_path.exists():
+                    previous_quality = json.loads(sidecar_path.read_text(encoding="utf-8"))
+                    previous_revision = previous_quality.get("alignment_revision")
+                    current_revision = _alignment_transform_revision(frame_info, interpolation_mode)
+                    if previous_revision and previous_revision != current_revision:
+                        return frame_name, (
+                            "STALE_OUTPUT_REQUIRES_REGENERATION "
+                            f"(revision {previous_revision} -> {current_revision})"
+                        )
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                pass
+            return frame_name, f"ERRO: destino já existe, arquivo ignorado: {output_path}"
 
         # ----------------------------------------------------
         # Matriz
@@ -856,13 +1003,48 @@ def _process_single_alignment(
                 shifted_sat = cv2.warpAffine(original_sat.astype(np.uint8),
                     np.float32([[1,0,dx],[0,1,dy]]), (mask.shape[1],mask.shape[0]), flags=cv2.INTER_NEAREST)
                 source_sat |= shifted_sat > 0
-        if reference_preview is None:
-            quality = {"shift_x": 0.0, "shift_y": 0.0, "rms": 0.0,
-                       "confidence": 0.0, "coverage": float(np.mean(mask))}
-        else:
-            ref_data, ref_mask = reference_preview
-            # Compare on the anchor preview grid; this also keeps quality work
-            # bounded for large sensors.
+        quality_candidates: list[tuple[str, tuple[np.ndarray, np.ndarray]]] = []
+        if reference_previews:
+            preferred_labels = frame_info.get("_quality_reference_labels", [])
+            seen_labels = set()
+            # The task carries an ordered parent/reference shortlist. Do not
+            # enumerate every batch preview for every frame: that turns the
+            # bounded cache into an O(frames*batches) workload and repeatedly
+            # evicts previews on large jobs. Four candidates cover the direct
+            # graph parent, batch reference, global parent and master fallback
+            # while retaining the configured bounded cache.
+            candidate_labels = list(preferred_labels)
+            if not candidate_labels:
+                candidate_labels = list(reference_previews.keys())[:1]
+            for label in candidate_labels[:4]:
+                if label in seen_labels or label not in reference_previews:
+                    continue
+                seen_labels.add(label)
+                source = (reference_preview_sources or {}).get(label)
+                current = frame_info.get("_quality_frame_identity")
+                if source is not None and current is not None and tuple(source) == tuple(current):
+                    # A frame must never validate itself. This is especially
+                    # important for batch anchors, which otherwise compare a
+                    # warped image against the same cached preview.
+                    continue
+                try:
+                    candidate = reference_previews.get(label)
+                except (KeyError, OSError, ValueError) as exc:
+                    candidate = None
+                    frame_info.setdefault("_quality_preview_errors", {})[label] = str(exc)
+                if candidate is not None:
+                    quality_candidates.append((label, candidate))
+        elif reference_preview is not None:
+            quality_candidates.append(("legacy_reference", reference_preview))
+
+        best_quality = None
+        best_label = None
+        overlap_found = False
+        for label, candidate in quality_candidates:
+            ref_data, ref_mask = candidate
+            # Compare on the candidate preview grid; this also keeps quality
+            # work bounded for large sensors and allows a graph parent with a
+            # different valid footprint to be tried next.
             sy = max(1, int(np.ceil(warped_data.shape[0] / ref_data.shape[0])))
             sx = max(1, int(np.ceil(warped_data.shape[1] / ref_data.shape[1])))
             preview = warped_data[::sy, ::sx]
@@ -872,17 +1054,56 @@ def _process_single_alignment(
             preview_mask = preview_mask[:h, :w]
             ref_cmp = ref_data[:preview.shape[0], :preview.shape[1]]
             refm_cmp = np.asarray(ref_mask, dtype=bool)[:preview.shape[0], :preview.shape[1]]
+            sat_cmp = source_sat[::sy, ::sx][:preview.shape[0], :preview.shape[1]]
             common = preview_mask.astype(bool) & refm_cmp
-            quality = estimate_alignment_quality(ref_cmp, preview, common & ~source_sat[::sy,::sx][:h,:w])
-            # The preview shift is measured in preview pixels; report and gate
-            # it in source/output pixels for a stable user-facing threshold.
-            quality["shift_x"] *= sx
-            quality["shift_y"] *= sy
+            if np.any(common & ~sat_cmp):
+                overlap_found = True
+            candidate_quality = estimate_alignment_quality(
+                ref_cmp,
+                preview,
+                common & ~sat_cmp,
+            )
+            candidate_quality["shift_x"] *= sx
+            candidate_quality["shift_y"] *= sy
+            if best_quality is None:
+                best_quality, best_label = candidate_quality, label
+                continue
+            best_score = (
+                float(best_quality.get("coverage", 0.0)) >= config.quality_min_coverage,
+                float(best_quality.get("confidence", 0.0)),
+                -float(best_quality.get("rms", float("inf"))),
+            )
+            candidate_score = (
+                float(candidate_quality.get("coverage", 0.0)) >= config.quality_min_coverage,
+                float(candidate_quality.get("confidence", 0.0)),
+                -float(candidate_quality.get("rms", float("inf"))),
+            )
+            if candidate_score > best_score:
+                best_quality, best_label = candidate_quality, label
+
+        if not quality_candidates:
+            quality = {"shift_x": 0.0, "shift_y": 0.0, "rms": 0.0,
+                       "confidence": 0.0, "coverage": float(np.mean(mask))}
+        else:
+            quality = best_quality or {
+                "shift_x": 0.0,
+                "shift_y": 0.0,
+                "rms": float("inf"),
+                "confidence": 0.0,
+                "coverage": 0.0,
+            }
         accepted = (quality["confidence"] >= config.quality_min_confidence and
                     quality["rms"] <= config.quality_max_rms and
                     quality["coverage"] >= config.quality_min_coverage and
                     float(np.hypot(quality["shift_x"], quality["shift_y"])) <= config.quality_max_shift)
-        decision = "unverified" if reference_preview is None else "accepted" if accepted else "low_confidence"
+        if not quality_candidates:
+            decision = "unverified"
+        elif not overlap_found or float(quality.get("coverage", 0.0)) < config.quality_min_coverage:
+            decision = "insufficient_overlap"
+        elif accepted:
+            decision = "verified"
+        else:
+            decision = "failed_quality"
         if config.quality_gate and not accepted:
             return frame_name, f"QUALITY_REJECTED ({decision})"
 
@@ -904,11 +1125,13 @@ def _process_single_alignment(
                         "CALHDR", "EGAIN", "ISOSPEED", "XBINNING", "YBINNING", "SATKNOWN"):
                 if key in updated_header:
                     output_header[key] = updated_header[key]
+        alignment_revision = _alignment_transform_revision(frame_info, interpolation_mode)
         save_args = (warped_data, mask, output_header, output_path,
                      config.compress_output,
                      {"ALNSTAT": decision, "ALNRMS": quality["rms"],
                       "ALNCONF": quality["confidence"], "ALNCOV": quality["coverage"],
-                      "ALNSHIX": quality["shift_x"], "ALNSHIY": quality["shift_y"]}, cancel_event, source_sat)
+                      "ALNSHIX": quality["shift_x"], "ALNSHIY": quality["shift_y"],
+                      "ALNREV": alignment_revision}, cancel_event, source_sat)
         if cancel_event is not None and cancel_event.is_set():
             return frame_name, "CANCELLED"
         if writer_executor is None:
@@ -920,7 +1143,12 @@ def _process_single_alignment(
             from app.infrastructure.json_store import atomic_json_write
             safe_quality = {k: v if np.isfinite(v) else None for k,v in quality.items()}
             atomic_json_write(output_path.with_suffix(output_path.suffix + ".align.json"),
-                              {"frame": frame_name, "decision": decision, "quality": safe_quality})
+                              {"frame": frame_name, "decision": decision,
+                               "quality": safe_quality, "quality_reference": best_label,
+                               "alignment_revision": alignment_revision,
+                               "local_transform_revision": frame_info.get("_local_transform_revision"),
+                               "global_transform_revision": frame_info.get("_global_transform_revision"),
+                               "source_matrix_revision": frame_info.get("_local_transform_revision")})
         except OSError as exc:
             return frame_name, f"Science FITS saved; quality sidecar failed: {exc}"
 
@@ -1232,6 +1460,7 @@ def process_all_alignments(
 
     total_processed = 0
     total_failed = 0
+    preflight_failed = 0
 
     # V2 scheduler: flatten accepted frames from every batch into one bounded
     # executor. This avoids leaving CPU idle when individual batches are small
@@ -1245,6 +1474,20 @@ def process_all_alignments(
         global_matrix = batch_entry.get("matrix")
         if global_matrix is None:
             continue
+        local_revision = local_flow.get("transform_revision")
+        global_revision = (global_flow.get("source_revisions", {}) or {}).get(batch_folder.name)
+        if global_revision is None:
+            global_revision = batch_entry.get("local_transform_revision")
+        if local_revision and global_revision and local_revision != global_revision:
+            preflight_failed += sum(
+                1 for info in local_flow.get("frames", {}).values()
+                if info.get("status", "accepted") == "accepted" and info.get("matrix") is not None
+            )
+            app_print(
+                f"[{batch_folder.name}] ERRO: Flow Local e Global usam revisões diferentes; "
+                "reexecute o Flow antes do Align.\n"
+            )
+            continue
         valid_frames = {
             fname: finfo
             for fname, finfo in local_flow.get("frames", {}).items()
@@ -1255,27 +1498,113 @@ def process_all_alignments(
         task_counts[batch_folder] = len(valid_frames)
         batch_failures[batch_folder] = 0
         for fname, finfo in valid_frames.items():
-            tasks.append((batch_folder, fname, finfo, global_matrix, output_dir, interpolation_mode))
+            task_info = dict(finfo)
+            task_info["_local_transform_revision"] = local_revision
+            task_info["_global_transform_revision"] = global_flow.get("transform_revision")
+            task_info["_geometry_revision"] = (
+                f"{local_flow.get('geometry_revision', '')}|"
+                f"{global_flow.get('geometry_revision', '')}"
+            )
+            labels = [batch_folder.name]
+            local_parent = finfo.get("relative_to")
+            if local_parent and local_parent in local_flow.get("frames", {}):
+                labels.insert(0, f"{batch_folder.name}/{local_parent}")
+            parent_batch = batch_entry.get("relative_to")
+            if parent_batch and parent_batch != batch_folder.name:
+                labels.append(str(parent_batch))
+            master_batch = global_flow.get("global_master_batch")
+            if master_batch and master_batch not in labels:
+                labels.append(str(master_batch))
+            task_info["_quality_reference_labels"] = labels
+            task_info["_quality_frame_identity"] = (batch_folder.name, fname)
+            tasks.append((batch_folder, fname, task_info, global_matrix, output_dir, interpolation_mode))
 
     if len(tasks) != total_frames:
         total_frames = len(tasks)
         progress_state["total"] = total_frames
     if not tasks:
         app_print("Nenhum frame valido para alinhamento.\n")
-        return (0, 0)
+        return (0, preflight_failed)
 
-    # Establish one immutable quality anchor in the output coordinate system.
-    # A missing/unreadable anchor leaves advisory metrics unverified and makes
-    # quality_gate fail closed in the worker.
-    reference_preview = None
-    try:
-        anchor_batch, anchor_name, anchor_info, anchor_global, _, anchor_interp = tasks[0]
-        anchor_matrix = compute_final_matrix(anchor_info["matrix"], anchor_global)
-        reference_preview = prepare_reference_preview(
-            anchor_batch / anchor_name, anchor_matrix, anchor_interp, max_size=512
+    total_failed = preflight_failed
+
+    # Build a bounded, demand-driven cache of graph reference previews in the
+    # same output coordinate system used by Align. Workers prefer their own
+    # batch, then the global parent/master; unrelated cached previews are
+    # fallbacks only when overlap is insufficient.
+    preview_targets: dict[str, tuple[Path, str, dict, np.ndarray, str]] = {}
+    preview_sources: dict[str, tuple[str, str]] = {}
+    for batch_folder in batches_with_flow:
+        local_flow = load_local_flow(batch_folder) or {}
+        batch_entry = global_flow.get("batches", {}).get(batch_folder.name, {})
+        global_matrix = batch_entry.get("matrix")
+        if global_matrix is None:
+            continue
+        local_revision = local_flow.get("transform_revision")
+        global_revision = (global_flow.get("source_revisions", {}) or {}).get(batch_folder.name)
+        if global_revision is None:
+            global_revision = batch_entry.get("local_transform_revision")
+        if local_revision and global_revision and local_revision != global_revision:
+            continue
+        anchor_name = local_flow.get("batch_anchor")
+        anchor_info = (local_flow.get("frames", {}) or {}).get(anchor_name, {})
+        if anchor_info.get("status", "accepted") != "accepted":
+            anchor_name, anchor_info = next(
+                (
+                    (name, info)
+                    for name, info in sorted(
+                        (local_flow.get("frames", {}) or {}).items(),
+                        key=lambda item: item[0].casefold(),
+                    )
+                    if info.get("status", "accepted") == "accepted" and info.get("matrix") is not None
+                ),
+                (None, None),
+            )
+        if anchor_name and isinstance(anchor_info, dict) and anchor_info.get("matrix") is not None:
+            preview_targets[batch_folder.name] = (
+                batch_folder,
+                anchor_name,
+                anchor_info,
+                np.asarray(global_matrix, dtype=np.float64),
+                INTERPOLATION_MODES.get(align_config.interpolation, "lanczos"),
+            )
+            preview_sources[batch_folder.name] = (batch_folder.name, anchor_name)
+
+        # A local graph parent often overlaps a distant frame better than the
+        # batch reference. Keep these targets available to the bounded cache;
+        # the task label order above makes the parent the first candidate.
+        for frame_name, frame_info in (local_flow.get("frames", {}) or {}).items():
+            parent_name = frame_info.get("relative_to") if isinstance(frame_info, dict) else None
+            if not parent_name or parent_name not in (local_flow.get("frames", {}) or {}):
+                continue
+            parent_info = local_flow["frames"].get(parent_name, {})
+            if parent_info.get("status", "accepted") != "accepted" or parent_info.get("matrix") is None:
+                continue
+            preview_targets.setdefault(
+                f"{batch_folder.name}/{parent_name}",
+                (
+                    batch_folder,
+                    parent_name,
+                    parent_info,
+                    np.asarray(global_matrix, dtype=np.float64),
+                    INTERPOLATION_MODES.get(align_config.interpolation, "lanczos"),
+                ),
+            )
+            preview_sources.setdefault(f"{batch_folder.name}/{parent_name}", (batch_folder.name, parent_name))
+
+    for label, target in list(preview_targets.items()):
+        batch_folder, frame_name, frame_info, global_matrix, interpolation_mode = target
+        preview_targets[label] = (
+            batch_folder,
+            frame_name,
+            frame_info,
+            compute_final_matrix(frame_info["matrix"], global_matrix),
+            interpolation_mode,
         )
-    except Exception as exc:
-        app_print(f"Aviso: referência de qualidade indisponível ({exc}).\n")
+    reference_previews = ReferencePreviewCache(
+        preview_targets,
+        max_size=max(1, int(config_dict.get("quality_preview_cache", 8))),
+    )
 
     from app.engines.execution import science_frame_bytes
     requested_workers = align_config.workers or get_optimal_worker_count()
@@ -1286,7 +1615,12 @@ def process_all_alignments(
         frame_bytes=frame_bytes)
     worker_count = budget.worker_count
     limit = min(align_config.max_in_flight or budget.max_in_flight, budget.max_in_flight)
-    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="astroalign-writer") as writer_executor, \
+    # Writes target independent files. A single writer made every alignment
+    # worker wait behind the slowest FITS compression/write and serialized the
+    # whole pipeline. Keep the writer pool bounded by the same execution
+    # budget so disk work can overlap without unbounded memory growth.
+    writer_workers = max(1, min(worker_count, 4))
+    with ThreadPoolExecutor(max_workers=writer_workers, thread_name_prefix="astroalign-writer") as writer_executor, \
          ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="astroalign-v2") as executor:
         iterator = iter(tasks)
         futures = {}
@@ -1299,7 +1633,7 @@ def process_all_alignments(
                     break
                 future = executor.submit(_process_single_alignment, fname, finfo, batch_folder, output_dir,
                                          global_matrix, interpolation_mode, align_config, cancel_event,
-                                         reference_preview, writer_executor)
+                                         None, writer_executor, reference_previews, preview_sources)
                 futures[future] = batch_folder
             if not futures:
                 break

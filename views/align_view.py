@@ -1,11 +1,12 @@
 from tkinter import ttk
 
 from .base_view import BaseAstroView
+from .align_model import AlignViewModel
 
 
 class AlignView(BaseAstroView):
-    def __init__(self, parent, app):
-        super().__init__(parent, app)
+    def __init__(self, parent, model: AlignViewModel):
+        super().__init__(parent, model)
         self.columnconfigure(0, weight=1)
         self._build_ui()
 
@@ -24,15 +25,15 @@ class AlignView(BaseAstroView):
             dirs,
             0,
             "Pasta base:",
-            self.app.batch_dir_var,
-            lambda: self.app.browse_dir(self.app.batch_dir_var),
+            self.model.batch_dir_var,
+            lambda: self.model.browse_dir(self.model.batch_dir_var),
         )
         self._path_row(
             dirs,
             1,
             "Pasta destino:",
-            self.app.align_output_dir_var,
-            lambda: self.app.browse_dir(self.app.align_output_dir_var),
+            self.model.align_output_dir_var,
+            lambda: self.model.browse_dir(self.model.align_output_dir_var),
         )
 
         # 2. Configurações de Debayer
@@ -48,7 +49,7 @@ class AlignView(BaseAstroView):
         ttk.Label(debayer, text="Padrão Bayer:").grid(row=0, column=0, sticky="w")
         ttk.Combobox(
             debayer,
-            textvariable=self.app.align_debayer_pattern_var,
+            textvariable=self.model.align_debayer_pattern_var,
             values=["Auto", "RGGB", "BGGR", "GRBG", "GBRG", "Nenhum"],
             state="readonly",
             width=16,
@@ -65,7 +66,7 @@ class AlignView(BaseAstroView):
         )
         self.debayer_method_combo = ttk.Combobox(
             debayer,
-            textvariable=self.app.align_debayer_method_var,
+            textvariable=self.model.align_debayer_method_var,
             values=["Bilinear", "VNG", "Menon2007"],
             state="readonly",
             width=16,
@@ -75,12 +76,12 @@ class AlignView(BaseAstroView):
         )
 
         def _update_debayer_controls(self, *_):
-            disabled = self.app.align_debayer_pattern_var.get() == "Nenhum"
+            disabled = self.model.align_debayer_pattern_var.get() == "Nenhum"
             self.debayer_method_combo.configure(
                 state="disabled" if disabled else "readonly"
             )
 
-        self.app.align_debayer_pattern_var.trace_add("write", _update_debayer_controls)
+        self.model.align_debayer_pattern_var.trace_add("write", _update_debayer_controls)
         _update_debayer_controls(self)
 
         ttk.Label(
@@ -103,7 +104,7 @@ class AlignView(BaseAstroView):
         )
         ttk.Combobox(
             params,
-            textvariable=self.app.align_interpolation_var,
+            textvariable=self.model.align_interpolation_var,
             values=["nearest", "bilinear", "bicubic", "lanczos"],
             state="readonly",
             width=16,
@@ -111,12 +112,12 @@ class AlignView(BaseAstroView):
 
         ttk.Label(params, text="Perfil:").grid(row=0, column=2, sticky="w", padx=(18, 0))
         ttk.Combobox(
-            params, textvariable=self.app.align_profile_var, values=["Stable", "Fast"],
+            params, textvariable=self.model.align_profile_var, values=["Stable", "Fast"],
             state="readonly", width=12,
         ).grid(row=0, column=3, sticky="w", padx=8)
         ttk.Label(params, text="Warp (Avancado):").grid(row=1, column=2, sticky="w", padx=(18, 0))
         ttk.Combobox(
-            params, textvariable=self.app.align_warp_engine_var,
+            params, textvariable=self.model.align_warp_engine_var,
             values=["", "opencv-stable", "opencv-fast"], state="readonly", width=18,
         ).grid(row=1, column=3, sticky="w", padx=8)
 
@@ -124,19 +125,19 @@ class AlignView(BaseAstroView):
         ttk.Checkbutton(
             params,
             text="Registro Cromático Avançado (Realinhar canais R e B usando G como âncora)",
-            variable=self.app.align_rgb_registration_var,
+            variable=self.model.align_rgb_registration_var,
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
         ttk.Checkbutton(
             params,
             text="Preservar Header FITS original",
-            variable=self.app.align_keep_header_var,
+            variable=self.model.align_keep_header_var,
         ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(7, 0))
 
         ttk.Checkbutton(
             params,
             text="Comprimir saída FITS (RICE_1)",
-            variable=self.app.align_compress_output_var,
+            variable=self.model.align_compress_output_var,
         ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(7, 0))
 
         ttk.Label(
@@ -148,37 +149,37 @@ class AlignView(BaseAstroView):
         ttk.Checkbutton(
             params,
             text="Sobrescrever arquivos existentes no destino",
-            variable=self.app.align_overwrite_var,
+            variable=self.model.align_overwrite_var,
         ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(7, 0))
 
         ttk.Checkbutton(
             params,
             text="Apagar batches intermediários após alinhar (Limpeza de Disco)",
-            variable=self.app.align_delete_intermediates_var,
+            variable=self.model.align_delete_intermediates_var,
         ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(7, 0))
 
         ttk.Checkbutton(
             params,
             text="Dry-Run (Simular processamento sem gravar no disco)",
-            variable=self.app.align_dry_run_var,
+            variable=self.model.align_dry_run_var,
         ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(7, 0))
 
         # 4. Ações
         actions = ttk.Frame(self)
         quality = ttk.LabelFrame(self, text="Verificação após alinhamento", padding=8)
         quality.grid(row=3, column=0, sticky="ew", pady=5)
-        ttk.Checkbutton(quality, text="Rejeitar desalinhamento residual", variable=self.app.align_quality_gate_var).grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(quality, text="Rejeitar desalinhamento residual", variable=self.model.align_quality_gate_var).grid(row=0, column=0, sticky="w")
         for column, label, variable in (
-            (1, "Desvio máx. (px)", self.app.align_quality_shift_var),
+            (1, "Desvio máx. (px)", self.model.align_quality_shift_var),
         ):
             ttk.Label(quality, text=label).grid(row=0, column=column, padx=6)
             ttk.Entry(quality, textvariable=variable, width=12).grid(row=1, column=column, padx=6)
         actions.grid(row=4, column=0, sticky="ew")
 
-        self.app.btn_run_align, self.app.btn_cancel_align = self._action_bar(
+        self.btn_run_align, self.btn_cancel_align = self._action_bar(
             actions,
             0,
-            self.app.start_align_processing,
-            self.app.cancel_processing,
+            self.model.start_align_processing,
+            self.model.cancel_processing,
             "▶ ALINHAMENTO",
         )
