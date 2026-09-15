@@ -123,6 +123,21 @@ pipeline completo, portanto permanece como override diagnóstico.
   somente leitura: inventário, geometria/scaling, perfil antigo, relatório
   temporal e uma folha de Stack limitada. O relatório precisa estar fora da
   árvore de origem e todos os FITS temporários são criados em `%TEMP%`.
+- O caminho diagnóstico que materializava cada frame corrigido em FITS foi
+  interrompido antes da redução completa: 1.213 arquivos chegaram a ocupar
+  aproximadamente 71,4 GB em `%TEMP%`. O diretório temporário foi removido
+  com uma verificação de caminho explícita; nenhum arquivo em `B:` foi tocado.
+  Para evitar repetir esse consumo, `benchmarks/lagoon_similarity_ram_stack.py`
+  constrói folhas pequenas diretamente na RAM, reduz cada folha com o mesmo
+  reducer `Stable + SigmaClip`, libera os arrays e só grava o FITS final e o
+  relatório JSON fora da captura. O tamanho da folha é calculado por uma
+  estimativa conservadora de 64 bytes/pixel/frame, limitado a 60% do orçamento
+  efetivo; o orçamento efetivo nunca usa mais que 75% da memória segura após
+  reservar 20% da RAM física (mínimo de 4 GiB). OpenCV e Numba ficam em uma
+  thread nesse modo, portanto não há pool de frames competindo com o reducer.
+  O benchmark legado `lagoon_similarity_sigma_stack.py` agora recusa essa
+  materialização por padrão; só aceita o caminho em disco com a opção explícita
+  `--allow-disk-materialization`.
 
 ## Auditoria da captura Lagoon (somente leitura)
 
@@ -147,6 +162,23 @@ o caminho escalado anterior foi `equal_nan=True`, diferença máxima finita zero
 O inventário e o relatório completo foram gravados fora de `B:` por:
 `C:\\Users\\jvito\\AppData\\Local\\Temp\\astrobatch_lagoon_audit_final_20260915.json`.
 Nenhum arquivo da árvore `B:` foi criado, removido, renomeado ou alterado.
+
+O smoke test do modo somente-RAM, usando três frames reais e orçamento de
+4.096 MiB, produziu FITS RGB `uint16` com `VALID_MASK` `uint8` e `RGBMODE`
+`similarity`. A memória disponível mínima observada foi 45.045 MiB, o RSS
+amostrado foi 370 MiB e a estimativa conservadora da folha foi 1.540 MiB;
+`files_unchanged=true`. Uma segunda execução com oito frames usou duas folhas
+de quatro (`leaf_sizes=[4,4]`) e também terminou com `files_unchanged=true`.
+Esses artefatos ficam em `%TEMP%\astrobatch_lagoon_ram_smoke2_20260915` e
+`%TEMP%\astrobatch_lagoon_ram_8_20260915`; não são entradas da captura. A
+redução completa de 1.213 frames foi então executada com `RGBMODE=hybrid`,
+16.384 MiB de orçamento e 68 folhas, sem criar os 71,4 GB de intermediários:
+RSS amostrado máximo de 9.642 MiB, mínimo de 34.915 MiB livres,
+`files_unchanged=true` e tempo de 1.955 s (~32,6 min). A comparação de
+qualidade comum a 38 estrelas está em
+`%TEMP%\astrobatch_lagoon_ram_full_hybrid_20260915\quality_compare\`; contra
+`stack_2`, o deslocamento mediano caiu de 0,348 para 0,190 px em R–G e de
+0,605 para 0,452 px em B–G.
 
 O corpus sintético oficial continua sendo o único gate de throughput: após as
 mudanças, sete execuções quentes em quatro workers mediram mediana Stable de

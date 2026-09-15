@@ -11,6 +11,7 @@ class AlignViewModel:
     align_debayer_method_var: Any
     align_interpolation_var: Any
     align_rgb_registration_var: Any
+    align_rgb_registration_mode_var: Any
     align_overwrite_var: Any
     align_delete_intermediates_var: Any
     align_dry_run_var: Any

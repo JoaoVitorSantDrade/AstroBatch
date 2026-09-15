@@ -167,6 +167,7 @@ class AstroProcessManager(tk.Tk):
         self.align_debayer_method_var = tk.StringVar(value="Bilinear")
         self.align_interpolation_var = tk.StringVar(value="Lanczos")
         self.align_rgb_registration_var = tk.BooleanVar(value=True)
+        self.align_rgb_registration_mode_var = tk.StringVar(value="translation")
         self.align_overwrite_var = tk.BooleanVar(value=False)
         self.align_dry_run_var = tk.BooleanVar(value=False)
         self.align_keep_header_var = tk.BooleanVar(value=True)
@@ -267,6 +268,7 @@ class AstroProcessManager(tk.Tk):
                 "debayer_method": self.align_debayer_method_var,
                 "interpolation": self.align_interpolation_var,
                 "rgb_registration": self.align_rgb_registration_var,
+                "rgb_registration_mode": self.align_rgb_registration_mode_var,
                 "overwrite": self.align_overwrite_var,
                 "dry_run": self.align_dry_run_var,
                 "keep_header": self.align_keep_header_var,
@@ -537,6 +539,7 @@ class AstroProcessManager(tk.Tk):
             "align_debayer_method": self.align_debayer_method_var,
             "align_interpolation": self.align_interpolation_var,
             "align_rgb_registration": self.align_rgb_registration_var,
+            "align_rgb_registration_mode": self.align_rgb_registration_mode_var,
             "align_overwrite": self.align_overwrite_var,
             "align_delete_intermediates": self.align_delete_intermediates_var,
             "align_dry_run": self.align_dry_run_var,
@@ -1096,6 +1099,8 @@ class AstroProcessManager(tk.Tk):
                 debayer_pattern=self.align_debayer_pattern_var.get(),
                 debayer_method=self.align_debayer_method_var.get(),
                 interpolation=self.align_interpolation_var.get(),
+                rgb_registration=self.align_rgb_registration_var.get(),
+                rgb_registration_mode=self.align_rgb_registration_mode_var.get(),
                 overwrite=self.align_overwrite_var.get(),
                 dry_run=self.align_dry_run_var.get(),
                 keep_header=self.align_keep_header_var.get(),
@@ -1546,7 +1551,7 @@ class AstroProcessManager(tk.Tk):
             return
 
         batches = report.get("batches", []) if isinstance(report, dict) else []
-        points: list[tuple[datetime, float | None, float | None, str]] = []
+        points: list[tuple[datetime, float | None, float | None, float | None, str]] = []
         suggested: list[str] = []
         suggested_windows: list[tuple[datetime, datetime]] = []
         unknown = 0
@@ -1561,7 +1566,9 @@ class AstroProcessManager(tk.Tk):
                     when = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
                 except ValueError:
                     continue
-                points.append((when, frame.get("quality"), frame.get("fwhm"), batch_name))
+                points.append(
+                    (when, frame.get("quality"), frame.get("fwhm"), frame.get("roundness"), batch_name)
+                )
 
         # Prefer the flattened session groups when available so a review span
         # can cross a batch boundary; older sidecars still use per-batch groups.
@@ -1605,20 +1612,68 @@ class AstroProcessManager(tk.Tk):
             note += f" • {len(suggested)} grupo(s) sugerido(s)"
         if unknown:
             note += f" • {unknown} frame(s) sem horário"
+        field_rotation = report.get("field_rotation", {}) if isinstance(report, dict) else {}
+        rotation_span = field_rotation.get("span_deg") if isinstance(field_rotation, dict) else None
+        if rotation_span is not None:
+            try:
+                note += f" • rotação entre lotes {float(rotation_span):.3f}° (corrigida no Align)"
+            except (TypeError, ValueError):
+                pass
         ttk.Label(info, text=f"{len(points)} frames temporizados • {note}", style="Muted.TLabel").pack(anchor="w")
 
-        fig = Figure(figsize=(9, 6), dpi=90)
-        quality_ax = fig.add_subplot(211)
-        fwhm_ax = fig.add_subplot(212, sharex=quality_ax)
+        fig = Figure(figsize=(9, 8), dpi=90)
+        quality_ax = fig.add_subplot(311)
+        roundness_ax = fig.add_subplot(312, sharex=quality_ax)
+        fwhm_ax = fig.add_subplot(313, sharex=quality_ax)
         x = [item[0] for item in points]
         quality = [float(item[1]) if item[1] is not None else np.nan for item in points]
         fwhm = [float(item[2]) if item[2] is not None else np.nan for item in points]
+        roundness = [float(item[3]) if item[3] is not None else np.nan for item in points]
+        seeing = report.get("seeing", {}) if isinstance(report, dict) else {}
+        roundness_threshold = seeing.get("roundness_threshold") if isinstance(seeing, dict) else None
+        roundness_outliers = []
+        if roundness_threshold is not None:
+            try:
+                threshold_value = float(roundness_threshold)
+                roundness_outliers = [
+                    value if np.isfinite(value) and value < threshold_value else np.nan
+                    for value in roundness
+                ]
+            except (TypeError, ValueError):
+                roundness_outliers = []
         quality_ax.plot(x, quality, marker=".", linestyle="-", color="#2563eb", linewidth=1)
         for start, end in suggested_windows:
             quality_ax.axvspan(start, end, color="#dc2626", alpha=0.14, zorder=0)
         quality_ax.set_ylabel("Qualidade")
         quality_ax.set_title("Tendência temporal (métricas aproximadas do Flow)")
         quality_ax.grid(True, alpha=0.25)
+        roundness_ax.plot(x, roundness, marker=".", linestyle="-", color="#7c3aed", linewidth=1)
+        if roundness_outliers:
+            roundness_ax.plot(
+                x,
+                roundness_outliers,
+                linestyle="none",
+                marker="o",
+                markersize=3.5,
+                color="#dc2626",
+                label="abaixo do limite",
+            )
+        if roundness_threshold is not None:
+            try:
+                roundness_ax.axhline(
+                    float(roundness_threshold),
+                    color="#dc2626",
+                    linestyle=":",
+                    linewidth=1,
+                    label=f"limite robusto {float(roundness_threshold):.3f}",
+                )
+                roundness_ax.legend(loc="lower left")
+            except (TypeError, ValueError):
+                pass
+        for start, end in suggested_windows:
+            roundness_ax.axvspan(start, end, color="#dc2626", alpha=0.14, zorder=0)
+        roundness_ax.set_ylabel("Roundness")
+        roundness_ax.grid(True, alpha=0.25)
         fwhm_ax.plot(x, fwhm, marker=".", linestyle="-", color="#d97706", linewidth=1)
         for start, end in suggested_windows:
             fwhm_ax.axvspan(start, end, color="#dc2626", alpha=0.14, zorder=0)

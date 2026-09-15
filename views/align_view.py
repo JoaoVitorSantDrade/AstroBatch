@@ -128,6 +128,22 @@ class AlignView(BaseAstroView):
             variable=self.model.align_rgb_registration_var,
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
+        ttk.Label(params, text="Modelo cromático:").grid(
+            row=2, column=2, sticky="w", padx=(18, 0), pady=(7, 0)
+        )
+        ttk.Combobox(
+            params,
+            textvariable=self.model.align_rgb_registration_mode_var,
+            values=["translation", "similarity", "hybrid"],
+            state="readonly",
+            width=16,
+        ).grid(row=2, column=3, sticky="w", padx=8, pady=(7, 0))
+        ttk.Label(
+            params,
+            text="similarity corrige escala/rotação; hybrid usa translação em R e similarity em B.",
+            style="Muted.TLabel",
+        ).grid(row=3, column=2, columnspan=2, sticky="w", padx=(18, 0))
+
         ttk.Checkbutton(
             params,
             text="Preservar Header FITS original",

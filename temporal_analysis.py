@@ -177,6 +177,9 @@ def _frame_quality(flow_frame: dict[str, Any] | None) -> dict[str, float | None]
     roundness = first("roundness")
     star_count = first("star_count", "shape_star_count")
     quality = first("quality")
+    rotation_deg = first("rotation_deg")
+    scale = first("scale")
+    cumulative_rms = first("cumulative_rms")
     if quality is None and star_count is not None:
         quality = star_count / max(fwhm or 0.0, 0.1)
     return {
@@ -184,6 +187,9 @@ def _frame_quality(flow_frame: dict[str, Any] | None) -> dict[str, float | None]
         "roundness": roundness,
         "star_count": star_count,
         "quality": quality,
+        "rotation_deg": rotation_deg,
+        "scale": scale,
+        "cumulative_rms": cumulative_rms,
     }
 
 
@@ -208,6 +214,14 @@ def _quality_summary(frames: list[dict[str, Any]], global_quality: dict[str, flo
     fwhm = _median(frame.get("fwhm") for frame in frames)
     roundness = _median(frame.get("roundness") for frame in frames)
     star_count = _median(frame.get("star_count") for frame in frames)
+    rotation = _median(frame.get("rotation_deg") for frame in frames)
+    scale = _median(frame.get("scale") for frame in frames)
+    cumulative_rms = _median(frame.get("cumulative_rms") for frame in frames)
+    rotation_values = [
+        abs(float(frame["rotation_deg"]))
+        for frame in frames
+        if _finite(frame.get("rotation_deg")) is not None
+    ]
     summary = {
         "frame_count": len(frames),
         "timed_frame_count": sum(frame.get("timestamp_state") == "valid" for frame in frames),
@@ -216,6 +230,13 @@ def _quality_summary(frames: list[dict[str, Any]], global_quality: dict[str, flo
         "median_fwhm": fwhm,
         "median_roundness": roundness,
         "median_star_count": star_count,
+        "median_rotation_deg": rotation,
+        "median_scale": scale,
+        "median_cumulative_rms": cumulative_rms,
+        "max_abs_rotation_deg": max(rotation_values) if rotation_values else None,
+        "roundness_threshold": None,
+        "roundness_review_suggested": False,
+        "roundness_review_reason": None,
     }
     if global_quality and quality is not None and global_quality.get("median") is not None:
         spread = global_quality.get("robust_sigma") or 0.0
@@ -300,6 +321,15 @@ def build_temporal_report(
     mad_quality = _mad(qualities, median_quality)
     robust_sigma = 1.4826 * mad_quality if mad_quality is not None else None
     global_quality = {"median": median_quality, "mad": mad_quality, "robust_sigma": robust_sigma}
+    roundness_values = [record.get("roundness") for record in timed]
+    median_roundness = _median(roundness_values)
+    mad_roundness = _mad(roundness_values, median_roundness)
+    robust_sigma_roundness = 1.4826 * mad_roundness if mad_roundness is not None else None
+    roundness_threshold = (
+        median_roundness - sigma * robust_sigma_roundness
+        if median_roundness is not None and robust_sigma_roundness is not None and robust_sigma_roundness > 0
+        else None
+    )
 
     groups: list[dict[str, Any]] = []
     current: list[dict[str, Any]] = []
@@ -337,6 +367,17 @@ def build_temporal_report(
             threshold = median_quality - sigma * robust_sigma
             summary["review_suggested"] = bool(summary["median_quality"] < threshold)
             summary["review_reason"] = "quality_below_robust_session_baseline" if summary["review_suggested"] else None
+        if summary.get("median_roundness") is not None and roundness_threshold is not None:
+            summary["roundness_threshold"] = roundness_threshold
+            summary["roundness_review_suggested"] = bool(summary["median_roundness"] < roundness_threshold)
+            summary["roundness_review_reason"] = (
+                "roundness_below_robust_session_baseline"
+                if summary["roundness_review_suggested"]
+                else None
+            )
+            if summary["roundness_review_suggested"] and not summary.get("review_suggested"):
+                summary["review_suggested"] = True
+                summary["review_reason"] = summary["roundness_review_reason"]
         serialized_groups.append({
             "id": f"group_{index:03d}" if timed_frames else "unknown",
             "frames": [frame["frame"] for frame in group_frames],
@@ -368,8 +409,18 @@ def build_temporal_report(
             "median_fwhm": _median(record.get("fwhm") for record in ordered),
             "median_roundness": _median(record.get("roundness") for record in ordered),
             "median_star_count": _median(record.get("star_count") for record in ordered),
+            "median_rotation_deg": _median(record.get("rotation_deg") for record in ordered),
+            "median_scale": _median(record.get("scale") for record in ordered),
+            "median_cumulative_rms": _median(record.get("cumulative_rms") for record in ordered),
+            "max_abs_rotation_deg": max(
+                (abs(float(record["rotation_deg"])) for record in ordered if _finite(record.get("rotation_deg")) is not None),
+                default=None,
+            ),
             "mad_quality": mad_quality,
             "robust_sigma_quality": robust_sigma,
+            "mad_roundness": mad_roundness,
+            "robust_sigma_roundness": robust_sigma_roundness,
+            "roundness_threshold": roundness_threshold,
             "review_only": True,
         },
         "unknown_timestamp_frames": [record["frame"] for record in untimed],
@@ -487,6 +538,15 @@ def _flatten_session_reports(
     mad_quality = _mad((item.get("quality") for item in timed), median_quality)
     robust_sigma = 1.4826 * mad_quality if mad_quality is not None else None
     global_quality = {"median": median_quality, "robust_sigma": robust_sigma}
+    roundness_values = [item.get("roundness") for item in timed]
+    median_roundness = _median(roundness_values)
+    mad_roundness = _mad(roundness_values, median_roundness)
+    robust_sigma_roundness = 1.4826 * mad_roundness if mad_roundness is not None else None
+    roundness_threshold = (
+        median_roundness - seeing_sigma * robust_sigma_roundness
+        if median_roundness is not None and robust_sigma_roundness is not None and robust_sigma_roundness > 0
+        else None
+    )
 
     groups: list[list[dict[str, Any]]] = []
     current: list[dict[str, Any]] = []
@@ -518,6 +578,17 @@ def _flatten_session_reports(
             threshold = median_quality - seeing_sigma * robust_sigma
             summary["review_suggested"] = bool(summary["median_quality"] < threshold)
             summary["review_reason"] = "quality_below_robust_session_baseline" if summary["review_suggested"] else None
+        if summary.get("median_roundness") is not None and roundness_threshold is not None:
+            summary["roundness_threshold"] = roundness_threshold
+            summary["roundness_review_suggested"] = bool(summary["median_roundness"] < roundness_threshold)
+            summary["roundness_review_reason"] = (
+                "roundness_below_robust_session_baseline"
+                if summary["roundness_review_suggested"]
+                else None
+            )
+            if summary["roundness_review_suggested"] and not summary.get("review_suggested"):
+                summary["review_suggested"] = True
+                summary["review_reason"] = summary["roundness_review_reason"]
         serialized.append({
             "id": f"group_{index:03d}" if timed_group else "unknown",
             "frames": [f"{item['batch']}/{item['frame']}" for item in group],
@@ -545,8 +616,18 @@ def _flatten_session_reports(
             "median_fwhm": _median(item.get("fwhm") for item in timed),
             "median_roundness": _median(item.get("roundness") for item in timed),
             "median_star_count": _median(item.get("star_count") for item in timed),
+            "median_rotation_deg": _median(item.get("rotation_deg") for item in timed),
+            "median_scale": _median(item.get("scale") for item in timed),
+            "median_cumulative_rms": _median(item.get("cumulative_rms") for item in timed),
+            "max_abs_rotation_deg": max(
+                (abs(float(item["rotation_deg"])) for item in timed if _finite(item.get("rotation_deg")) is not None),
+                default=None,
+            ),
             "mad_quality": mad_quality,
             "robust_sigma_quality": robust_sigma,
+            "mad_roundness": mad_roundness,
+            "robust_sigma_roundness": robust_sigma_roundness,
+            "roundness_threshold": roundness_threshold,
             "review_only": True,
         },
     }
@@ -590,6 +671,39 @@ def build_session_temporal_report(
             flow_data = None
         reports.append(build_temporal_report(batch, flow_data, session_gap, session_sigma))
     session_view = _flatten_session_reports(reports, session_gap, session_sigma)
+    # The global Flow transform is the authoritative between-batch derotation
+    # record.  Keep it as diagnostics only; Stack never consumes this value as
+    # a weight or an exclusion rule.
+    batch_rotations: list[dict[str, Any]] = []
+    try:
+        import json
+
+        global_path = Path(base_dir) / "global_flow.json"
+        global_data = json.loads(global_path.read_text(encoding="utf-8")) if global_path.exists() else {}
+        for batch_name, entry in (global_data.get("batches", {}) or {}).items():
+            if not isinstance(entry, dict):
+                continue
+            rotation = _finite(entry.get("rotation_deg"))
+            if rotation is None and isinstance(entry.get("matrix"), list):
+                matrix = entry["matrix"]
+                try:
+                    rotation = math.degrees(math.atan2(float(matrix[1][0]), float(matrix[0][0])))
+                except (IndexError, TypeError, ValueError, ZeroDivisionError):
+                    rotation = None
+            batch_rotations.append({
+                "batch": str(batch_name),
+                "status": entry.get("status", "unknown"),
+                "rotation_deg": rotation,
+                "scale": _finite(entry.get("scale")),
+                "rms": _finite(entry.get("rms")),
+            })
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        batch_rotations = []
+    usable_rotations = [
+        float(item["rotation_deg"])
+        for item in batch_rotations
+        if _finite(item.get("rotation_deg")) is not None
+    ]
     return {
         "schema_version": TIMESTAMP_SCHEMA_VERSION,
         "kind": "session_temporal_analysis",
@@ -598,6 +712,15 @@ def build_session_temporal_report(
         "seeing_sigma": session_sigma,
         "batches": reports,
         **session_view,
+        "field_rotation": {
+            "batch_transforms": batch_rotations,
+            "min_rotation_deg": min(usable_rotations) if usable_rotations else None,
+            "max_rotation_deg": max(usable_rotations) if usable_rotations else None,
+            "span_deg": (max(usable_rotations) - min(usable_rotations)) if usable_rotations else None,
+            "max_abs_rotation_deg": max((abs(value) for value in usable_rotations), default=None),
+            "source": "global_flow",
+            "review_only": True,
+        },
         "review_only": True,
         "files_unchanged": True,
     }

@@ -91,6 +91,12 @@ class AlignConfig:
     # writer; production callers can opt into a bounded pool after measuring
     # compression throughput on their storage.
     writer_workers: int = 0
+    # ``translation`` preserves the historical correction. ``similarity``
+    # additionally fits a small scale/rotation term from stellar centroids,
+    # while ``hybrid`` uses the more conservative translation for R and the
+    # similarity fit for B.  Both alternatives are opt-in and leave the
+    # default Stable output unchanged.
+    rgb_registration_mode: str = "translation"
 
 
 def _build_align_config(
@@ -105,6 +111,12 @@ def _build_align_config(
         debayer_method=config_dict.get("debayer_method", "Bilinear"),
         interpolation=config_dict.get("interpolation", "Lanczos"),
         rgb_registration=bool(config_dict.get("rgb_registration", True)),
+        rgb_registration_mode=(
+            str(config_dict.get("rgb_registration_mode", "translation")).strip().lower()
+            if str(config_dict.get("rgb_registration_mode", "translation")).strip().lower()
+            in {"translation", "similarity", "hybrid"}
+            else "translation"
+        ),
         overwrite=bool(config_dict.get("overwrite", False)),
         dry_run=bool(config_dict.get("dry_run", False)),
         keep_header=bool(config_dict.get("keep_header", True)),
@@ -478,6 +490,181 @@ def _warp_affine_cpu(
     return engine(data, matrix, interpolation_mode)
 
 
+def _weighted_channel_centroid(
+    image: np.ndarray,
+    x: int,
+    y: int,
+    radius: int = 4,
+) -> tuple[float, float, float] | None:
+    """Return a bounded, background-subtracted centroid around one star."""
+
+    height, width = image.shape
+    if (
+        x - radius < 0
+        or y - radius < 0
+        or x + radius >= width
+        or y + radius >= height
+    ):
+        return None
+    cutout = np.asarray(image[y - radius : y + radius + 1, x - radius : x + radius + 1], dtype=np.float32)
+    finite = np.isfinite(cutout)
+    if int(finite.sum()) < max(9, cutout.size // 2):
+        return None
+    border = np.concatenate((cutout[0], cutout[-1], cutout[:, 0], cutout[:, -1]))
+    border = border[np.isfinite(border)]
+    if border.size < 4:
+        return None
+    background = float(np.median(border))
+    weights = np.where(finite, cutout - np.float32(background), 0.0)
+    weights = np.maximum(weights, 0.0)
+    total = float(np.sum(weights, dtype=np.float64))
+    if not np.isfinite(total) or total <= 0.0:
+        return None
+    yy, xx = np.indices(weights.shape, dtype=np.float32)
+    cx = float(np.sum(weights * xx, dtype=np.float64) / total) + x - radius
+    cy = float(np.sum(weights * yy, dtype=np.float64) / total) + y - radius
+    peak = float(np.max(weights))
+    # Hot pixels and clipped single samples do not provide a stable color
+    # centroid.  The shape detector already applies the same conservative
+    # principle to Flow metrics; keep the RGB correction bounded as well.
+    if peak <= 0.0 or peak / total > 0.88:
+        return None
+    return cx, cy, total
+
+
+def _estimate_rgb_similarity_warp(
+    reference: np.ndarray,
+    channel: np.ndarray,
+    *,
+    max_shift: float,
+    max_points: int = 96,
+) -> tuple[np.ndarray, float] | None:
+    """Fit a small channel-to-green similarity transform from star centroids.
+
+    A single phase-correlation translation cannot model the scale component
+    of longitudinal chromatic aberration.  This estimator uses the green
+    channel as the optical anchor, measures the same local stellar centroids
+    in the candidate channel, and fits a bounded similarity transform with
+    RANSAC.  It is deliberately opt-in so existing Stable products remain
+    unchanged unless the user selects the stronger correction.
+    """
+
+    ref = np.asarray(reference, dtype=np.float32)
+    candidate = np.asarray(channel, dtype=np.float32)
+    if ref.ndim != 2 or candidate.shape != ref.shape or ref.size == 0:
+        return None
+    finite = np.isfinite(ref) & np.isfinite(candidate)
+    if int(finite.sum()) < 64:
+        return None
+
+    # High-pass the reference so nebulosity and gradients do not become
+    # corners.  The operation remains in native OpenCV code and is bounded by
+    # ``max_points`` for every frame.
+    ref_work = np.where(finite, ref, 0.0).astype(np.float32, copy=False)
+    # Feature discovery does not need native sensor resolution.  Keeping the
+    # centroid measurement on the original arrays while downsampling this
+    # bounded probe cuts the per-frame cost on an 8 MP Uranus-C capture by an
+    # order of magnitude and does not change the fitted full-resolution warp.
+    probe_scale = max(1, int(np.ceil(max(ref.shape) / 1024.0)))
+    if probe_scale > 1:
+        probe = cv2.resize(
+            ref_work,
+            (max(16, ref.shape[1] // probe_scale), max(16, ref.shape[0] // probe_scale)),
+            interpolation=cv2.INTER_AREA,
+        )
+    else:
+        probe = ref_work
+    blur = cv2.GaussianBlur(probe, (0, 0), 1.0)
+    high = np.maximum(probe - blur, 0.0)
+    probe_finite = np.isfinite(probe)
+    positive = high[probe_finite & (high > 0.0)]
+    if positive.size < 16:
+        return None
+    threshold = float(np.percentile(positive, 99.2))
+    if not np.isfinite(threshold) or threshold <= 0.0:
+        return None
+    response = np.clip(high / np.float32(threshold), 0.0, 1.0)
+    points = cv2.goodFeaturesToTrack(
+        response,
+        maxCorners=int(max_points),
+        qualityLevel=0.03,
+        minDistance=max(3.0, 18.0 / float(probe_scale)),
+        blockSize=7,
+        useHarrisDetector=False,
+    )
+    if points is None or len(points) < 6:
+        return None
+
+    reference_points: list[tuple[float, float]] = []
+    channel_points: list[tuple[float, float]] = []
+    for point in points.reshape(-1, 2):
+        x = int(np.rint(float(point[0]) * probe_scale))
+        y = int(np.rint(float(point[1]) * probe_scale))
+        ref_centroid = _weighted_channel_centroid(ref, x, y)
+        channel_centroid = _weighted_channel_centroid(candidate, x, y)
+        if ref_centroid is None or channel_centroid is None:
+            continue
+        rx, ry, ref_flux = ref_centroid
+        cx, cy, channel_flux = channel_centroid
+        if ref_flux <= 0.0 or channel_flux <= 0.0:
+            continue
+        displacement = float(np.hypot(cx - rx, cy - ry))
+        # Permit a little more than the eventual acceptance threshold for the
+        # RANSAC fit, but reject unrelated peaks early.
+        if not np.isfinite(displacement) or displacement > max(4.0, max_shift * 3.0):
+            continue
+        reference_points.append((rx, ry))
+        channel_points.append((cx, cy))
+
+    if len(reference_points) < 6:
+        return None
+    source = np.asarray(channel_points, dtype=np.float32)
+    target = np.asarray(reference_points, dtype=np.float32)
+    matrix, inliers = cv2.estimateAffinePartial2D(
+        source,
+        target,
+        method=cv2.RANSAC,
+        ransacReprojThreshold=1.5,
+        maxIters=1000,
+        confidence=0.995,
+        refineIters=10,
+    )
+    if matrix is None or inliers is None or not np.isfinite(matrix).all():
+        return None
+    inlier_mask = inliers.ravel().astype(bool)
+    inlier_count = int(inlier_mask.sum())
+    if inlier_count < 5:
+        return None
+    transformed = cv2.transform(source.reshape(-1, 1, 2), matrix).reshape(-1, 2)
+    residual = np.linalg.norm(transformed - target, axis=1)
+    confidence = float(np.clip(inlier_count / max(1, len(source)), 0.0, 1.0))
+    if not np.isfinite(residual[inlier_mask]).all():
+        return None
+    if float(np.median(residual[inlier_mask])) > 1.25:
+        return None
+    center = np.asarray([(ref.shape[1] - 1) * 0.5, (ref.shape[0] - 1) * 0.5], dtype=np.float32)
+    center_target = cv2.transform(center.reshape(1, 1, 2), matrix).reshape(2)
+    if float(np.linalg.norm(center_target - center)) > max(0.5, max_shift):
+        return None
+    # The center check alone cannot reject a rotation around the optical
+    # center: a pathological fit could leave the center fixed while moving
+    # stars at the field edge by tens of pixels.  Bound the actual footprint
+    # displacement at every corner as well, keeping the opt-in correction
+    # genuinely sub-pixel/small on the 5800X capture.
+    corners = np.asarray(
+        [[0.0, 0.0], [ref.shape[1] - 1.0, 0.0],
+         [0.0, ref.shape[0] - 1.0],
+         [ref.shape[1] - 1.0, ref.shape[0] - 1.0]],
+        dtype=np.float32,
+    )
+    transformed_corners = cv2.transform(corners.reshape(-1, 1, 2), matrix).reshape(-1, 2)
+    if not np.isfinite(transformed_corners).all():
+        return None
+    if float(np.max(np.linalg.norm(transformed_corners - corners, axis=1))) > max_shift:
+        return None
+    return np.asarray(matrix, dtype=np.float32), confidence
+
+
 def warp_frame(
     data: np.ndarray,
     final_matrix: np.ndarray,
@@ -487,6 +674,7 @@ def warp_frame(
     warp_engine: str | None = None,
     diagnostics: dict | None = None,
     rgb_max_shift: float = 2.0,
+    rgb_registration_mode: str = "translation",
 ) -> np.ndarray:
     """
     Aplica a transformação afim global e, opcionalmente, executa
@@ -530,10 +718,44 @@ def warp_frame(
 
         # 2. Nível 1: Micro-Registro RGB pós-warp
         if rgb_registration and data.shape[2] >= 3:
+            registration_mode = str(rgb_registration_mode or "translation").strip().lower()
+            if registration_mode not in {"translation", "similarity", "hybrid"}:
+                registration_mode = "translation"
             if profile is EngineProfile.FAST:
                 reference = output[:, :, 1]
                 height, width = reference.shape
                 for channel in (0, 2):
+                    if registration_mode == "similarity" or (
+                        registration_mode == "hybrid" and channel == 2
+                    ):
+                        similarity = _estimate_rgb_similarity_warp(
+                            reference,
+                            output[:, :, channel],
+                            max_shift=rgb_max_shift,
+                        )
+                        if similarity is not None:
+                            matrix, confidence = similarity
+                            tx = float(matrix[0, 2])
+                            ty = float(matrix[1, 2])
+                            if diagnostics is not None:
+                                diagnostics.setdefault("rgb_models", {})[channel] = {
+                                    "matrix": np.asarray(matrix, dtype=np.float64).tolist(),
+                                    "confidence": float(confidence),
+                                }
+                                diagnostics.setdefault("rgb_shifts", {})[channel] = (
+                                    tx,
+                                    ty,
+                                    float(confidence),
+                                )
+                            output[:, :, channel] = cv2.warpAffine(
+                                output[:, :, channel],
+                                np.asarray(matrix, dtype=np.float32),
+                                (width, height),
+                                flags=cv2.INTER_LINEAR,
+                                borderMode=cv2.BORDER_CONSTANT,
+                                borderValue=0.0,
+                            )
+                            continue
                     dx, dy, confidence = rgb_registration_shift(reference, output[:, :, channel])
                     if confidence < 0.15 or not np.isfinite(dx + dy) or np.hypot(dx, dy) > rgb_max_shift:
                         continue
@@ -551,6 +773,37 @@ def warp_frame(
             ref_channel = output[:, :, 1]
 
             for c in [0, 2]:  # Processa o Vermelho (0) e o Azul (2)
+                if registration_mode == "similarity" or (
+                    registration_mode == "hybrid" and c == 2
+                ):
+                    similarity = _estimate_rgb_similarity_warp(
+                        ref_channel,
+                        output[:, :, c],
+                        max_shift=rgb_max_shift,
+                    )
+                    if similarity is not None:
+                        matrix, confidence = similarity
+                        tx = float(matrix[0, 2])
+                        ty = float(matrix[1, 2])
+                        if diagnostics is not None:
+                            diagnostics.setdefault("rgb_models", {})[c] = {
+                                "matrix": np.asarray(matrix, dtype=np.float64).tolist(),
+                                "confidence": float(confidence),
+                            }
+                            diagnostics.setdefault("rgb_shifts", {})[c] = (
+                                tx,
+                                ty,
+                                float(confidence),
+                            )
+                        output[:, :, c] = cv2.warpAffine(
+                            output[:, :, c],
+                            np.asarray(matrix, dtype=np.float32),
+                            (output.shape[1], output.shape[0]),
+                            flags=cv2.INTER_LINEAR,
+                            borderMode=cv2.BORDER_CONSTANT,
+                            borderValue=0.0,
+                        )
+                        continue
                 # Calcula o desvio sub-pixel exato do canal em relação ao verde
                 shift_vector, error, diffphase = phase_cross_correlation(
                     ref_channel,
@@ -734,7 +987,11 @@ class ReferencePreviewCache:
                 pending.set()
 
 
-def _alignment_transform_revision(frame_info: dict, interpolation_mode: str | None = None) -> str:
+def _alignment_transform_revision(
+    frame_info: dict,
+    interpolation_mode: str | None = None,
+    rgb_registration_mode: str | None = None,
+) -> str:
     geometry_revision = frame_info.get("_geometry_revision")
     if geometry_revision:
         source = str(geometry_revision)
@@ -744,7 +1001,7 @@ def _alignment_transform_revision(frame_info: dict, interpolation_mode: str | No
             f"{frame_info.get('_global_transform_revision', '')}"
         )
     return hashlib.sha256(
-        f"{source}|{interpolation_mode or ''}".encode("utf-8")
+        f"{source}|{interpolation_mode or ''}|{rgb_registration_mode or 'translation'}".encode("utf-8")
     ).hexdigest()[:16]
 
 
@@ -925,7 +1182,11 @@ def _process_single_alignment(
                 if sidecar_path.exists():
                     previous_quality = json.loads(sidecar_path.read_text(encoding="utf-8"))
                     previous_revision = previous_quality.get("alignment_revision")
-                    current_revision = _alignment_transform_revision(frame_info, interpolation_mode)
+                    current_revision = _alignment_transform_revision(
+                        frame_info,
+                        interpolation_mode,
+                        config.rgb_registration_mode,
+                    )
                     if previous_revision and previous_revision != current_revision:
                         return frame_name, (
                             "STALE_OUTPUT_REQUIRES_REGENERATION "
@@ -1020,6 +1281,7 @@ def _process_single_alignment(
             engine_profile=config.engine_profile,
             warp_engine=config.warp_engine,
             diagnostics=warp_diagnostics,
+            rgb_registration_mode=config.rgb_registration_mode,
         )
 
         # ----------------------------------------------------
@@ -1043,14 +1305,29 @@ def _process_single_alignment(
             mask = (mask.astype(bool) & np.all(np.isfinite(warped_data), axis=2)).astype(np.uint8)
             original_mask = mask.copy()
             original_sat = source_sat.copy()
-            for dx, dy, confidence in warp_diagnostics.get("rgb_shifts", {}).values():
+            # Apply the exact per-channel geometry to the common valid footprint.
+            # Similarity registration can include a tiny scale/rotation; reducing it
+            # to a translation would leave invalid edge pixels marked as usable.
+            rgb_shifts = warp_diagnostics.get("rgb_shifts", {})
+            rgb_models = warp_diagnostics.get("rgb_models", {})
+            for channel, shift in rgb_shifts.items():
+                dx, dy, _confidence = shift
+                model = rgb_models.get(channel)
+                matrix = None
+                if isinstance(model, dict):
+                    candidate = np.asarray(model.get("matrix"), dtype=np.float32)
+                    if candidate.shape == (2, 3) and np.all(np.isfinite(candidate)):
+                        matrix = candidate
+                if matrix is None:
+                    matrix = np.float32([[1, 0, dx], [0, 1, dy]])
                 shifted = cv2.warpAffine(original_mask.astype(np.float32),
-                    np.float32([[1, 0, dx], [0, 1, dy]]),
+                    matrix,
                     (mask.shape[1], mask.shape[0]), flags=cv2.INTER_NEAREST,
                     borderMode=cv2.BORDER_CONSTANT, borderValue=0)
                 mask = (mask.astype(bool) & (shifted > 0.5)).astype(np.uint8)
                 shifted_sat = cv2.warpAffine(original_sat.astype(np.uint8),
-                    np.float32([[1,0,dx],[0,1,dy]]), (mask.shape[1],mask.shape[0]), flags=cv2.INTER_NEAREST)
+                    matrix, (mask.shape[1], mask.shape[0]), flags=cv2.INTER_NEAREST,
+                    borderMode=cv2.BORDER_CONSTANT, borderValue=0)
                 source_sat |= shifted_sat > 0
         quality_candidates: list[tuple[str, tuple[np.ndarray, np.ndarray]]] = []
         if reference_previews:
@@ -1174,12 +1451,17 @@ def _process_single_alignment(
                         "CALHDR", "EGAIN", "ISOSPEED", "XBINNING", "YBINNING", "SATKNOWN"):
                 if key in updated_header:
                     output_header[key] = updated_header[key]
-        alignment_revision = _alignment_transform_revision(frame_info, interpolation_mode)
+        alignment_revision = _alignment_transform_revision(
+            frame_info,
+            interpolation_mode,
+            config.rgb_registration_mode,
+        )
         save_args = (warped_data, mask, output_header, output_path,
                      config.compress_output,
                      {"ALNSTAT": decision, "ALNRMS": quality["rms"],
                       "ALNCONF": quality["confidence"], "ALNCOV": quality["coverage"],
                       "ALNSHIX": quality["shift_x"], "ALNSHIY": quality["shift_y"],
+                      "RGBMODE": config.rgb_registration_mode,
                       "ALNREV": alignment_revision}, cancel_event, source_sat)
         if cancel_event is not None and cancel_event.is_set():
             return frame_name, "CANCELLED"
@@ -1194,6 +1476,8 @@ def _process_single_alignment(
             atomic_json_write(output_path.with_suffix(output_path.suffix + ".align.json"),
                               {"frame": frame_name, "decision": decision,
                                "quality": safe_quality, "quality_reference": best_label,
+                               "rgb_registration_mode": config.rgb_registration_mode,
+                               "rgb_models": warp_diagnostics.get("rgb_models", {}),
                                "alignment_revision": alignment_revision,
                                "local_transform_revision": frame_info.get("_local_transform_revision"),
                                "global_transform_revision": frame_info.get("_global_transform_revision"),

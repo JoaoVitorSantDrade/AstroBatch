@@ -109,6 +109,40 @@ class AlignQualityDeliveryTests(unittest.TestCase):
         self.assertAlmostEqual(dx, -3, delta=0.5)
         self.assertAlmostEqual(dy, 2, delta=0.5)
 
+    def test_similarity_rgb_registration_corrects_scale_and_translation(self):
+        reference = np.zeros((256, 256), np.float32)
+        for x, y in ((40, 50), (100, 70), (170, 40), (220, 150),
+                     (60, 200), (150, 210), (210, 220), (30, 150),
+                     (120, 130), (190, 100)):
+            cv2.circle(reference, (x, y), 3, 1000, -1)
+        target_matrix = np.asarray(
+            [[1.002, 0.0005, -1.2], [-0.0005, 1.002, 0.8]],
+            dtype=np.float32,
+        )
+        channel = cv2.warpAffine(
+            reference,
+            cv2.invertAffineTransform(target_matrix),
+            (256, 256),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+        )
+        rgb = np.dstack((channel, reference, reference))
+        diagnostics = {}
+        corrected = align.warp_frame(
+            rgb,
+            np.eye(3),
+            "bilinear",
+            rgb_registration=True,
+            engine_profile="Fast",
+            diagnostics=diagnostics,
+            rgb_registration_mode="similarity",
+        )
+        self.assertIn(0, diagnostics["rgb_models"])
+        self.assertLess(
+            float(np.mean((corrected[:, :, 0] - reference) ** 2)),
+            float(np.mean((channel - reference) ** 2)) * 0.2,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

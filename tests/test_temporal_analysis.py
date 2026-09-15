@@ -170,6 +170,67 @@ class TemporalAnalysisTests(unittest.TestCase):
             self.assertEqual(report["groups"][0]["frames"], ["batch_01/frame_001.fits"])
             self.assertTrue(report["files_unchanged"])
 
+    def test_session_report_exposes_global_field_rotation_as_review_only(self):
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            for index, rotation in enumerate((0.0, -0.422), start=1):
+                batch = root / f"batch_{index:03d}"
+                batch.mkdir()
+                path = batch / "frame_001.fits"
+                fits.PrimaryHDU(
+                    np.ones((2, 2), dtype=np.uint16),
+                    fits.Header({"DATE-OBS": f"2026-01-01T00:0{index}:00Z"}),
+                ).writeto(path)
+                (batch / "flow_local.json").write_text(
+                    json.dumps({"frames": {"frame_001.fits": {"status": "accepted"}}}),
+                    encoding="utf-8",
+                )
+            (root / "global_flow.json").write_text(
+                json.dumps({
+                    "batches": {
+                        "batch_001": {"status": "accepted", "rotation_deg": 0.0, "scale": 1.0, "rms": 0.0},
+                        "batch_002": {"status": "accepted", "rotation_deg": -0.422, "scale": 0.999917, "rms": 0.82},
+                    }
+                }),
+                encoding="utf-8",
+            )
+            report = build_session_temporal_report(root)
+            rotation = report["field_rotation"]
+            self.assertEqual(rotation["source"], "global_flow")
+            self.assertTrue(rotation["review_only"])
+            self.assertTrue(report["review_only"])
+            self.assertAlmostEqual(rotation["span_deg"], 0.422)
+            self.assertEqual(rotation["batch_transforms"][1]["batch"], "batch_002")
+
+    def test_roundness_review_uses_session_robust_baseline_without_excluding_frames(self):
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            flow_frames = {}
+            values = (
+                ("frame_01.fits", "2026-01-01T00:00:00Z", 0.65),
+                ("frame_02.fits", "2026-01-01T00:01:00Z", 0.65),
+                ("frame_03.fits", "2026-01-01T00:30:00Z", 0.40),
+                ("frame_04.fits", "2026-01-01T00:31:00Z", 0.40),
+            )
+            for name, stamp, roundness in values:
+                fits.PrimaryHDU(
+                    np.ones((2, 2), dtype=np.uint16),
+                    fits.Header({"DATE-OBS": stamp}),
+                ).writeto(root / name)
+                flow_frames[name] = {"status": "accepted", "roundness": roundness}
+            report = build_temporal_report(
+                root,
+                {"frames": flow_frames},
+                gap_minutes=15,
+                seeing_sigma=0.5,
+            )
+            self.assertIsNotNone(report["seeing"]["roundness_threshold"])
+            self.assertEqual(len(report["groups"]), 2)
+            self.assertFalse(report["groups"][0]["quality"]["review_suggested"])
+            self.assertTrue(report["groups"][1]["quality"]["roundness_review_suggested"])
+            self.assertTrue(report["groups"][1]["quality"]["review_suggested"])
+            self.assertTrue(report["files_unchanged"])
+
 
 if __name__ == "__main__":
     unittest.main()

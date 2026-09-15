@@ -133,7 +133,7 @@ def _build_align_model(context: StageContext) -> AlignViewModel:
     return AlignViewModel(
         v("batch_dir"), v("align_output_dir"), v("align_debayer_pattern"),
         v("align_debayer_method"), v("align_interpolation"),
-        v("align_rgb_registration"), v("align_overwrite"),
+        v("align_rgb_registration"), v("align_rgb_registration_mode"), v("align_overwrite"),
         v("align_delete_intermediates"), v("align_dry_run"),
         v("align_keep_header"), v("align_compress_output"),
         v("align_profile"), v("align_warp_engine"), v("align_quality_gate"),

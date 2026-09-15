@@ -262,6 +262,10 @@ class AlignCommand:
             config[name] = int(value)
         for name in ("overwrite", "dry_run", "keep_header", "delete_intermediates", "compress_output", "quality_gate"):
             config[name] = cls._as_bool(name, config[name])
+        mode = str(config.get("rgb_registration_mode", "translation")).strip().lower()
+        if mode not in {"translation", "similarity", "hybrid"}:
+            raise ValueError("rgb_registration_mode: escolha translation, similarity ou hybrid.")
+        config["rgb_registration_mode"] = mode
         if config.get("engine_profile", "Stable") not in {"Stable", "Fast"}:
             raise ValueError("engine_profile: escolha Stable ou Fast.")
         return cls(base, output, config)

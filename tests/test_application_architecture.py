@@ -100,6 +100,35 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(run.call_args.args[1], command.output_dir)
         self.assertEqual(run.call_args.args[2], command.to_legacy_config())
 
+    def test_align_command_validates_chromatic_registration_mode(self):
+        command = AlignCommand.from_values(
+            "base", "output", rgb_registration=True,
+            rgb_registration_mode="similarity", overwrite=False,
+            dry_run=False, keep_header=True, delete_intermediates=False,
+            compress_output=True, engine_profile="Stable", warp_engine="",
+            memory_budget_mb=512, workers=2, quality_gate=False,
+            quality_max_shift=1.5,
+        )
+        self.assertEqual(command.config["rgb_registration_mode"], "similarity")
+        hybrid = AlignCommand.from_values(
+            "base", "output", rgb_registration=True,
+            rgb_registration_mode="hybrid", overwrite=False,
+            dry_run=False, keep_header=True, delete_intermediates=False,
+            compress_output=True, engine_profile="Stable", warp_engine="",
+            memory_budget_mb=512, workers=2, quality_gate=False,
+            quality_max_shift=1.5,
+        )
+        self.assertEqual(hybrid.config["rgb_registration_mode"], "hybrid")
+        with self.assertRaises(ValueError):
+            AlignCommand.from_values(
+                "base", "output", rgb_registration=True,
+                rgb_registration_mode="radial", overwrite=False,
+                dry_run=False, keep_header=True, delete_intermediates=False,
+                compress_output=True, engine_profile="Stable", warp_engine="",
+                memory_budget_mb=512, workers=2, quality_gate=False,
+                quality_max_shift=1.5,
+            )
+
     def test_reference_change_command_uses_shared_runner_adapter(self):
         command = ReferenceChangeCommand.from_values("batch_001", "03.fits", "session")
         with patch("astroflow_logic.apply_reference_change", return_value={"status": "success"}) as apply:
