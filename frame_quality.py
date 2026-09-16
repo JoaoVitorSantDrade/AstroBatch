@@ -8,6 +8,7 @@ not run another source finder or alter the input image.
 from __future__ import annotations
 
 import numpy as np
+import math
 
 
 _MAX_SHAPE_STARS = 64
@@ -66,8 +67,8 @@ def _empty_measurement() -> dict[str, float | int | None]:
     }
 
 
-def _usable_star_shape(cutout: np.ndarray, radius: int) -> tuple[float, float, float] | None:
-    """Return roundness, geometric FWHM and elongation for one cutout.
+def _usable_star_shape(cutout: np.ndarray, radius: int) -> tuple[float, float, float, float, float] | None:
+    """Return shape, major-axis angle and excess length for one cutout.
 
     The detector coordinates are only approximate, so moments are taken from
     the complete local window and measured relative to the weighted centroid.
@@ -158,7 +159,18 @@ def _usable_star_shape(cutout: np.ndarray, radius: int) -> tuple[float, float, f
     # stable for mildly trailed stars and retains the existing detector FWHM
     # semantics as an independent quality metric.
     shape_fwhm = float(2.354820045 * np.sqrt(max(major_sigma * minor_sigma, 0.0)))
-    values = (roundness, shape_fwhm, elongation)
+    # Eigenvectors are sign-invariant for a stellar major axis.  Keeping the
+    # angle in radians here lets the caller calculate axial (180-degree)
+    # coherence without introducing a discontinuity at +/-90 degrees.
+    # For a symmetric 2x2 covariance matrix the major-axis angle has a
+    # closed form.  ``eigh`` used to be called here after ``eigvalsh`` had
+    # already solved the same matrix, doubling the LAPACK launch overhead for
+    # every detected star.  The axial representation below is sign
+    # invariant, so the equivalent angle in [-pi/2, pi/2] is sufficient and
+    # does not affect roundness/FWHM/elongation or the Stable stack product.
+    angle_rad = float(0.5 * np.arctan2(2.0 * cov_xy, var_x - var_y))
+    trail_excess = float(2.354820045 * max(0.0, major_sigma - minor_sigma))
+    values = (roundness, shape_fwhm, elongation, angle_rad, trail_excess)
     if not all(np.isfinite(value) for value in values):
         return None
     return values
@@ -194,7 +206,7 @@ def measure_star_shapes(
     except (TypeError, ValueError, OverflowError):
         bounded_radius = _MAX_RADIUS
     height, width = image.shape
-    usable: list[tuple[float, float, float]] = []
+    usable: list[tuple[float, float, float, float, float, float, float]] = []
     # Coordinates from the detector are priority ordered.  Taking the first
     # bounded sample preserves that priority and makes the operation stable.
     for x, y in coordinates[:_MAX_SHAPE_STARS]:
@@ -214,7 +226,7 @@ def measure_star_shapes(
         ]
         shape = _usable_star_shape(cutout, bounded_radius)
         if shape is not None:
-            usable.append(shape)
+            usable.append((*shape, float(cx), float(cy)))
 
     if not usable:
         return result
@@ -223,5 +235,19 @@ def measure_star_shapes(
     result["shape_star_count"] = int(len(usable))
     result["shape_fwhm"] = _median_finite(values[:, 1])
     result["elongation"] = float(max(1.0, _median_finite(values[:, 2])))
+    angles = values[:, 3]
+    axial = np.cos(2.0 * angles) + 1j * np.sin(2.0 * angles)
+    coherence = float(np.abs(np.mean(axial))) if axial.size else 0.0
+    result["trail_coherence"] = float(np.clip(coherence, 0.0, 1.0))
+    result["trail_angle_deg"] = float(np.degrees(np.angle(np.mean(axial)) * 0.5)) if axial.size else None
+    result["trail_excess_px"] = float(max(0.0, _median_finite(values[:, 4])))
+    centre_x = (width - 1.0) * 0.5
+    centre_y = (height - 1.0) * 0.5
+    radial = np.arctan2(values[:, 6] - centre_y, values[:, 5] - centre_x)
+    tangent = radial + math.pi * 0.5
+    tangential_vector = np.cos(2.0 * (values[:, 3] - tangent)) + 1j * np.sin(
+        2.0 * (values[:, 3] - tangent)
+    )
+    result["tangential_coherence"] = float(np.clip(np.abs(np.mean(tangential_vector)), 0.0, 1.0)) if tangential_vector.size else 0.0
     return result
 

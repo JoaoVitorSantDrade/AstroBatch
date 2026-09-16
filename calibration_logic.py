@@ -15,12 +15,26 @@ from astropy.utils.exceptions import AstropyWarning
 
 from cpu_kernels import calibrate_inplace
 from cpu_runtime import configure_worker_runtime, physical_core_count
+from image_io import (
+    IMAGE_SUFFIXES,
+    ImageFormat,
+    TIFF_SUFFIXES,
+    detect_format,
+    read_tiff,
+    read_tiff_header,
+    read_tiff_sidecar_arrays,
+    tiff_shape,
+    validate_single_format,
+    write_npz_sidecar,
+    write_sidecar_json,
+    write_tiff,
+)
 
 # Suprime avisos de verificação de cabeçalho do Astropy.
 warnings.simplefilter("ignore", category=AstropyWarning)
 
 
-FITS_SUFFIXES = {".fit", ".fits", ".fts"}
+FITS_SUFFIXES = IMAGE_SUFFIXES
 MAX_WORKERS = 16
 
 
@@ -42,17 +56,25 @@ def _sanitize_float_header(header: fits.Header | None) -> fits.Header:
 
 def load_fits_data(filepath: Path) -> tuple[np.ndarray, fits.Header]:
     """
-    Carrega a primeira imagem 2D encontrada como float32.
+    Carrega a primeira imagem mono/RGB encontrada como float32.
 
     Importante: nenhuma conversão para uint16 é feita aqui.
     """
+    if filepath.suffix.casefold() in TIFF_SUFFIXES:
+        data, header = read_tiff(filepath)
+        return np.asarray(data, dtype=np.float32), _sanitize_float_header(header)
     with fits.open(
         filepath,
         memmap=False,
         ignore_missing_end=True,
     ) as hdul:
         for hdu in hdul:
-            if hdu.is_image and hdu.name not in {"VALID_MASK", "SAT_MASK", "DISAGREE", "HDR_META"} and hdu.data is not None and hdu.data.ndim == 2:
+            if (
+                hdu.is_image
+                and hdu.name not in {"VALID_MASK", "SAT_MASK", "DISAGREE", "HDR_META"}
+                and hdu.data is not None
+                and hdu.data.ndim in (2, 3)
+            ):
                 data = np.asarray(
                     hdu.data,
                     dtype=np.float32,
@@ -60,7 +82,7 @@ def load_fits_data(filepath: Path) -> tuple[np.ndarray, fits.Header]:
                 header = _sanitize_float_header(hdu.header)
                 return data, header
 
-    raise ValueError(f"Imagem 2D não encontrada em {filepath.name}")
+    raise ValueError(f"Imagem mono/RGB não encontrada em {filepath.name}")
 
 
 def _read_for_master(
@@ -70,27 +92,56 @@ def _read_for_master(
     return load_fits_data(filepath)
 
 
-def _inspect_master_frame(filepath: Path) -> tuple[tuple[int, int], fits.Header, int]:
+def _inspect_master_frame(filepath: Path) -> tuple[tuple[int, ...], fits.Header, int]:
     """Read master geometry without retaining the image in RAM."""
+    if filepath.suffix.casefold() in TIFF_SUFFIXES:
+        shape = tiff_shape(filepath)
+        if len(shape) in (2, 3):
+            return tuple(shape), _sanitize_float_header(read_tiff_header(filepath)), 0
+        raise ValueError(f"Imagem mono/RGB não encontrada em {filepath.name}")
     with fits.open(filepath, memmap=True, ignore_missing_end=True) as hdul:
         for index, hdu in enumerate(hdul):
-            if hdu.is_image and hdu.name not in {"VALID_MASK", "SAT_MASK", "DISAGREE", "HDR_META"} and hdu.shape is not None and len(hdu.shape) == 2:
+            if hdu.is_image and hdu.name not in {"VALID_MASK", "SAT_MASK", "DISAGREE", "HDR_META"} and hdu.shape is not None and len(hdu.shape) in (2, 3):
                 return tuple(hdu.shape), _sanitize_float_header(hdu.header), index
-    raise ValueError(f"Imagem 2D não encontrada em {filepath.name}")
+    raise ValueError(f"Imagem mono/RGB não encontrada em {filepath.name}")
 
 
 def _read_master_band(filepath: Path, hdu_index: int, y1: int, y2: int) -> np.ndarray:
     """Load one scaled FITS row band as a compact float32 array."""
+    if filepath.suffix.casefold() in TIFF_SUFFIXES:
+        try:
+            import tifffile
+            data = tifffile.memmap(filepath)
+        except Exception:
+            data, _header = read_tiff(filepath)
+        source = np.asarray(data)
+        if source.ndim == 2:
+            band = source[y1:y2, :]
+        elif source.ndim == 3 and source.shape[-1] in (3, 4):
+            band = source[y1:y2, :, :]
+        elif source.ndim == 3 and source.shape[0] in (3, 4):
+            band = source[:, y1:y2, :]
+        else:
+            raise ValueError(f"Geometria RGB não reconhecida em {filepath.name}: {source.shape}")
+        return np.ascontiguousarray(band, dtype=np.float32)
     with fits.open(filepath, memmap=False, ignore_missing_end=True) as hdul:
-        section = hdul[hdu_index].section[y1:y2, :]
+        hdu = hdul[hdu_index]
+        if hdu.data is None or hdu.shape is None or len(hdu.shape) not in (2, 3):
+            raise ValueError(f"Imagem mono/RGB não encontrada em {filepath.name}")
+        if len(hdu.shape) == 2:
+            section = hdu.section[y1:y2, :]
+        elif hdu.shape[0] in (3, 4):
+            section = hdu.section[:, y1:y2, :]
+        else:
+            section = hdu.section[y1:y2, :, :]
         return np.ascontiguousarray(section, dtype=np.float32)
 
 
-def _master_band_rows(frame_count: int, width: int, height: int) -> int:
+def _master_band_rows(frame_count: int, width: int, height: int, channels: int = 1) -> int:
     """Choose a full-width band that consumes at most 25% of free RAM."""
     available = max(64 * 1024 * 1024, int(psutil.virtual_memory().available))
     budget = max(32 * 1024 * 1024, available // 4)
-    bytes_per_row = max(1, frame_count * width * np.dtype(np.float32).itemsize)
+    bytes_per_row = max(1, frame_count * width * max(1, channels) * np.dtype(np.float32).itemsize)
     return max(1, min(height, budget // bytes_per_row))
 
 
@@ -155,6 +206,41 @@ def save_uint16_fits(
     output_header["CALMIN"] = (float(data_min), "Calibration normalization minimum")
     output_header["CALMAX"] = (float(data_max), "Calibration normalization maximum")
 
+    if output_path.suffix.casefold() in TIFF_SUFFIXES:
+        write_tiff(
+            output_path,
+            output_data,
+            metadata={
+                "schema_version": 1,
+                "format": "TIFF",
+                "calnorm": True,
+                "calmin": float(data_min),
+                "calmax": float(data_max),
+                "linear": True,
+            },
+        )
+        arrays: dict[str, np.ndarray] = {}
+        if valid_mask is not None:
+            arrays["valid_mask"] = np.asarray(valid_mask, dtype=np.uint8)
+        if sat_mask is not None:
+            arrays["sat_mask"] = np.asarray(sat_mask, dtype=np.uint8)
+        sidecar_name = output_path.name + ".astrobatch.npz"
+        if arrays:
+            write_npz_sidecar(output_path.with_suffix(output_path.suffix + ".astrobatch.npz"), **arrays)
+        write_sidecar_json(
+            output_path.with_suffix(output_path.suffix + ".json"),
+            {
+                "schema_version": 1,
+                "format": "TIFF",
+                "calnorm": True,
+                "calmin": float(data_min),
+                "calmax": float(data_max),
+                "sidecar": sidecar_name if arrays else None,
+                "header": {str(k): str(v) for k, v in output_header.items()},
+            },
+        )
+        return
+
     # Astropy writes uint16 using the standard FITS unsigned scaling cards.
     hdu = fits.PrimaryHDU(
         data=output_data,
@@ -208,6 +294,12 @@ def make_master(
         app_print(f"Nenhum frame encontrado em {folder_path.name} para criar Master.\n")
         return None
 
+    # A single master cannot safely combine FITS and TIFF planes: their
+    # metadata/mask conventions differ and the resulting output family would
+    # be ambiguous. Keep the guard here as well as at the pipeline boundary
+    # so direct callers receive the same behavior.
+    validate_single_format(files)
+
     app_print(f"Inspecionando {len(files)} frames para gerar Master ({folder_path.name})...\n")
     reference_shape, base_header, hdu_index = _inspect_master_frame(files[0])
     incompatible = []
@@ -221,8 +313,16 @@ def make_master(
             f"Shape de referência={reference_shape}; índices incompatíveis={incompatible[:10]}"
         )
 
-    height, width = reference_shape
-    band_rows = _master_band_rows(len(files), width, height)
+    channels_first = len(reference_shape) == 3 and reference_shape[0] in (3, 4) and reference_shape[-1] not in (3, 4)
+    if len(reference_shape) == 2:
+        height, width, channels = reference_shape[0], reference_shape[1], 1
+    elif len(reference_shape) == 3 and not channels_first and reference_shape[-1] in (3, 4):
+        height, width, channels = reference_shape[0], reference_shape[1], reference_shape[2]
+    elif channels_first:
+        channels, height, width = reference_shape
+    else:
+        raise ValueError(f"Geometria mono/RGB não reconhecida: {reference_shape}")
+    band_rows = _master_band_rows(len(files), width, height, channels)
     app_print(
         f"Calculando Master em bandas de {band_rows} linhas; "
         f"buffer={len(files)}x{band_rows}x{width} float32.\n"
@@ -232,10 +332,19 @@ def make_master(
         if cancel_event.is_set():
             return None
         y2 = min(height, y1 + band_rows)
-        band_values = np.empty((len(files), y2 - y1, width), dtype=np.float32)
+        band_shape = (len(files), y2 - y1, width) if channels == 1 else (len(files), y2 - y1, width, channels)
+        # FITS RGB uses CHW; TIFF RGB uses HWC.  Preserve the source layout in
+        # the master so calibration remains shape-compatible with its lights.
+        if channels_first:
+            band_shape = (len(files), channels, y2 - y1, width)
+        band_values = np.empty(band_shape, dtype=np.float32)
         for index, filepath in enumerate(files):
             band_values[index] = _read_master_band(filepath, hdu_index, y1, y2)
-        master_data[y1:y2] = np.median(band_values, axis=0)
+        median_band = np.median(band_values, axis=0)
+        if channels_first:
+            master_data[:, y1:y2, :] = median_band
+        else:
+            master_data[y1:y2] = median_band
 
     if cancel_event.is_set():
         return None
@@ -302,13 +411,25 @@ def calibrate_single_frame(
 
     try:
         data, header = load_fits_data(light_path)
-        from app.infrastructure.fits_masks import read_science_masks
-        spatial_shape = data.shape[-2:] if data.ndim == 3 else data.shape
-        valid, saturated = read_science_masks(light_path, spatial_shape)
+        channels_first = data.ndim == 3 and data.shape[0] in (3, 4) and data.shape[-1] not in (3, 4)
+        channel_axis = 0 if channels_first else (-1 if data.ndim == 3 else None)
+        if light_path.suffix.casefold() in TIFF_SUFFIXES:
+            spatial_shape = data.shape[:2] if data.ndim == 3 else data.shape
+            side_arrays = read_tiff_sidecar_arrays(light_path)
+            valid = np.asarray(side_arrays.get("valid_mask", np.ones(spatial_shape)), dtype=bool)
+            saturated = np.asarray(side_arrays.get("sat_mask", np.zeros(spatial_shape)), dtype=bool)
+            if valid.shape != spatial_shape:
+                valid = np.ones(spatial_shape, dtype=bool)
+            if saturated.shape != spatial_shape:
+                saturated = np.zeros(spatial_shape, dtype=bool)
+        else:
+            from app.infrastructure.fits_masks import read_science_masks
+            spatial_shape = data.shape[-2:] if data.ndim == 3 else data.shape
+            valid, saturated = read_science_masks(light_path, spatial_shape)
         threshold = header.get("SATURATE", header.get("SATLEVEL"))
         if threshold is not None:
             clipped = data >= float(threshold)
-            saturated |= np.any(clipped, axis=0) if data.ndim == 3 else clipped
+            saturated |= np.any(clipped, axis=channel_axis) if data.ndim == 3 else clipped
             header["SATKNOWN"] = True
         # The calibrated plane will have a different encoding; preserve the
         # source classification in a mask, never reuse its numeric threshold.
@@ -336,7 +457,7 @@ def calibrate_single_frame(
         # escondidos nesta etapa do workflow.
 
         finite = np.isfinite(data)
-        valid &= np.all(finite, axis=0) if data.ndim == 3 else finite
+        valid &= np.all(finite, axis=channel_axis) if data.ndim == 3 else finite
         save_uint16_fits(data, header, out_path, *normalization_range, valid_mask=valid, sat_mask=saturated)
 
         return None
@@ -389,9 +510,50 @@ def run_calibration_pipeline(
     """
 
     input_dir = Path(config["input_dir"])
+    lights = sorted(
+        [
+            filepath
+            for filepath in input_dir.iterdir()
+            if filepath.is_file() and filepath.suffix.casefold() in IMAGE_SUFFIXES
+        ],
+        key=lambda p: p.name.casefold(),
+    )
+    if not lights:
+        app_print("Nenhum LIGHT encontrado na pasta de entrada.\n")
+        return
+    try:
+        source_format = validate_single_format(lights)
+    except ValueError as exc:
+        app_print(f"ERRO: {exc}\n")
+        return
+
+    def _validate_master_format(label: str, value: str | os.PathLike) -> None:
+        """Keep dark/flat masters in the same family as the LIGHT session."""
+        candidate = Path(value)
+        if candidate.is_file():
+            master_format = validate_single_format([candidate])
+        elif candidate.is_dir():
+            master_files = sorted(
+                (item for item in candidate.iterdir()
+                 if item.is_file() and item.suffix.casefold() in IMAGE_SUFFIXES),
+                key=lambda item: item.name.casefold(),
+            )
+            if not master_files:
+                return
+            master_format = validate_single_format(master_files)
+        else:
+            return
+        if master_format is not source_format:
+            raise ValueError(
+                f"{label} usa {master_format.value.upper()}, mas os LIGHTs usam "
+                f"{source_format.value.upper()}; misturar FIT/FITS e TIF/TIFF não é permitido."
+            )
+
     for enabled, key in (("apply_dark", "dark_path"), ("apply_flat", "flat_path")):
         if config.get(enabled) and (not config.get(key) or not Path(config[key]).exists()):
             raise ValueError(f"{key}: caminho de calibração obrigatório e válido")
+        if config.get(enabled) and config.get(key):
+            _validate_master_format("Master Dark" if key == "dark_path" else "Master Flat", config[key])
 
     output_dir = Path(config["output_dir"])
 
@@ -413,7 +575,7 @@ def run_calibration_pipeline(
             "create_master",
             False,
         ):
-            master_dark_path = input_dir.parent / "MasterDark.fits"
+            master_dark_path = input_dir.parent / f"MasterDark{source_format.default_suffix}"
 
             master_dark = make_master(
                 dark_path,
@@ -440,7 +602,7 @@ def run_calibration_pipeline(
             "create_master",
             False,
         ):
-            master_flat_path = input_dir.parent / "MasterFlat.fits"
+            master_flat_path = input_dir.parent / f"MasterFlat{source_format.default_suffix}"
 
             raw_master_flat = make_master(
                 flat_path,
@@ -484,20 +646,7 @@ def run_calibration_pipeline(
     # 2. LIGHTS
     # ========================================================
 
-    lights = sorted(
-        [
-            filepath
-            for filepath in input_dir.iterdir()
-            if (filepath.is_file() and filepath.suffix.lower() in FITS_SUFFIXES)
-        ],
-        key=lambda p: p.name.casefold(),
-    )
-
     total = len(lights)
-
-    if total == 0:
-        app_print("Nenhum LIGHT encontrado na pasta de entrada.\n")
-        return
 
     app_print("\nCalculando faixa global para normalização 16-bit...\n")
     normalization_range = _calibration_range(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
@@ -71,6 +72,43 @@ class FlowEngineTests(unittest.TestCase):
         direct = flow.detect_stars_dao(image, 4.0, 5.0, 20, stats_cache=None)
         np.testing.assert_array_equal(fallback[0], direct[0])
         self.assertEqual(fallback[1:], direct[1:])
+
+    def test_failed_frame_still_exposes_explicit_unknown_timestamp(self) -> None:
+        with patch.object(flow, "load_fits_data", side_effect=OSError("broken FITS")):
+            name, frame = flow._process_single_frame(
+                Path("broken.fits"),
+                4.0,
+                5.0,
+                150,
+                4,
+                "DAO",
+                "Stable",
+            )
+        self.assertEqual(name, "broken.fits")
+        self.assertEqual(frame["status"], "error")
+        self.assertEqual(frame["timestamp_state"], "unknown")
+        self.assertIsNone(frame["timestamp_normalized"])
+
+    def test_global_anchor_reuse_requires_untruncated_local_catalogue(self) -> None:
+        stars = np.arange(72, dtype=np.float32).reshape(36, 2)
+        info = {
+            "anchor_stars": stars,
+            "anchor_shape": (96, 96),
+            "fwhm": 4.0,
+            "anchor_detection": {
+                "fwhm": 4.0,
+                "sigma": 5.0,
+                "sigma_used": 5.0,
+                "max_stars": 150,
+                "catalog_truncated": False,
+                "engine": "DAO",
+                "engine_profile": "Stable",
+            },
+        }
+        reused = flow._cached_anchor_for_global(info, 4.0, 5.0, "DAO", "Stable")
+        self.assertIsNotNone(reused)
+        info["anchor_detection"]["catalog_truncated"] = True
+        self.assertIsNone(flow._cached_anchor_for_global(info, 4.0, 5.0, "DAO", "Stable"))
 
 
 if __name__ == "__main__":

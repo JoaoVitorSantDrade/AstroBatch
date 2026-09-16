@@ -18,11 +18,12 @@ from astropy.io import fits
 from astropy.utils.exceptions import AstropyWarning
 
 from cpu_runtime import configure_opencv_threads, configure_worker_runtime, physical_core_count
+from image_io import IMAGE_SUFFIXES, TIFF_SUFFIXES, read_tiff, validate_single_format
 
 # Suprime todos os avisos de verificação de cabeçalho do Astropy
 warnings.simplefilter("ignore", category=AstropyWarning)
 
-FITS_SUFFIXES = {".fit", ".fits", ".fts"}
+FITS_SUFFIXES = IMAGE_SUFFIXES
 
 # P0: cv2.resize no lugar de PIL
 RESAMPLE_MODES = {
@@ -52,7 +53,7 @@ class ProcessingConfig:
 
 
 def get_sequence_number(filename: str) -> tuple[int, int | str]:
-    match = re.search(r"_(\d+)\.(?:fit|fits|fts)$", filename, re.IGNORECASE)
+    match = re.search(r"_(\d+)\.(?:fit|fits|fts|tif|tiff)$", filename, re.IGNORECASE)
     if match:
         return (0, int(match.group(1)))
     return (1, filename.casefold())
@@ -76,18 +77,18 @@ def prepare_image(
     downsample_method: str,
     downsample_scale: float,
 ) -> np.ndarray:
-    if data.ndim != 2:
+    if data.ndim not in (2, 3) or (data.ndim == 3 and data.shape[-1] not in (3, 4)):
         raise ValueError(
-            f"A imagem precisa ser 2D; dimensões encontradas: {data.shape}"
+            f"A imagem precisa ser mono 2D ou RGB H×W×3/4; dimensões encontradas: {data.shape}"
         )
 
     # P0: Crop ANTES de converter para float32 (Economiza imensa CPU e RAM)
     if opt_method == "Crop":
-        h, w = data.shape
+        h, w = data.shape[:2]
         size = min(crop_size, h, w)
         y1 = (h - size) // 2
         x1 = (w - size) // 2
-        data = data[y1 : y1 + size, x1 : x1 + size]
+        data = data[y1 : y1 + size, x1 : x1 + size, ...]
 
     # Converte apenas a área útil para float32 para as análises matemáticas
     data_float = np.asarray(data, dtype=np.float32)
@@ -168,12 +169,24 @@ def prepare_fits_file(
     filepath: Path, config: ProcessingConfig
 ) -> tuple[Path, np.ndarray | None, str | None]:
     try:
+        if filepath.suffix.casefold() in TIFF_SUFFIXES:
+            data, _header = read_tiff(filepath)
+            if data.ndim == 3 and data.shape[0] in (3, 4) and data.shape[-1] not in (3, 4):
+                data = np.moveaxis(data, 0, -1)
+            prepared = prepare_image(
+                data,
+                config.opt_method,
+                config.crop_size,
+                config.downsample_method,
+                config.downsample_scale,
+            )
+            return filepath, prepared, None
         with fits.open(filepath, memmap=False) as hdul:
             data = None
             for hdu in hdul:
                 if not hdu.is_image:
                     continue
-                if hdu.data is None or hdu.data.ndim != 2:
+                if hdu.data is None or hdu.data.ndim not in (2, 3):
                     continue
                 data = hdu.data  # Lê o ponteiro bruto no formato nativo (ex: uint16)
                 break
@@ -185,6 +198,8 @@ def prepare_fits_file(
                     f"Aviso: nenhum HDU de imagem 2D em {filepath.name}",
                 )
 
+            if data.ndim == 3 and data.shape[0] in (3, 4) and data.shape[-1] not in (3, 4):
+                data = np.moveaxis(data, 0, -1)
             prepared = prepare_image(
                 data,
                 config.opt_method,
@@ -270,7 +285,12 @@ def process_fits_logic(
     files = find_fits_files(input_dir)
     total_files = len(files)
     if not files:
-        app_print("Nenhum arquivo FITS encontrado no diretório.\n")
+        app_print("Nenhum arquivo FITS/TIFF encontrado no diretório.\n")
+        return 0, 0
+    try:
+        validate_single_format(files)
+    except ValueError as exc:
+        app_print(f"ERRO: {exc}\n")
         return 0, 0
 
     app_progress(0, total_files, "Iniciando análise...")

@@ -9,6 +9,7 @@ readers.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 import math
 from pathlib import Path
 import re
@@ -17,12 +18,13 @@ from typing import Any, Iterable
 from astropy.io import fits
 
 from app.infrastructure.json_store import atomic_json_write
+from image_io import IMAGE_SUFFIXES, TIFF_SUFFIXES, read_tiff_header
 
 
 TIMESTAMP_SCHEMA_VERSION = 1
 DEFAULT_GAP_MINUTES = 15.0
 DEFAULT_SEEING_SIGMA = 3.0
-FITS_SUFFIXES = {".fit", ".fits", ".fts"}
+FITS_SUFFIXES = IMAGE_SUFFIXES
 
 
 def _natural_key(path_or_name: Path | str) -> tuple[Any, ...]:
@@ -141,6 +143,12 @@ def parse_date_obs(value: Any) -> dict[str, Any]:
 def read_fits_timestamp(path: Path) -> dict[str, Any]:
     """Read ``DATE-OBS``/``DATEOBS`` from any FITS header without pixels."""
 
+    if path.suffix.casefold() in TIFF_SUFFIXES:
+        try:
+            header = read_tiff_header(path)
+            return parse_date_obs(header.get("DATE-OBS", header.get("DATEOBS")))
+        except Exception:
+            return parse_date_obs(None)
     try:
         with fits.open(path, memmap=False, lazy_load_hdus=True) as hdul:
             value = None
@@ -276,7 +284,7 @@ def build_temporal_report(
         flow_frames = {}
     try:
         files = sorted(
-            [path for path in Path(batch_dir).iterdir() if path.is_file() and path.suffix.lower() in FITS_SUFFIXES],
+            [path for path in Path(batch_dir).iterdir() if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES],
             key=_natural_key,
         )
     except OSError:
@@ -653,6 +661,51 @@ def build_session_temporal_report(
     if not math.isfinite(session_sigma) or session_sigma <= 0:
         session_sigma = DEFAULT_SEEING_SIGMA
 
+    def load_local_flow_for_temporal(batch: Path) -> dict[str, Any] | None:
+        """Read the active immutable Flow snapshot, with legacy fallback.
+
+        Flow publishes a manifest before updating compatibility JSON files.
+        Temporal analysis must therefore use the same revision selected by
+        Align and Stack; otherwise a report could combine metrics from an old
+        local file with the new global transform.  Import lazily to keep this
+        metadata-only module free of an import cycle during Flow startup.
+        """
+
+        try:
+            from astroalign_logic import load_local_flow
+
+            value = load_local_flow(batch)
+            if isinstance(value, dict):
+                return value
+            return None
+        except Exception:
+            # Keep old standalone projects usable when the alignment module or
+            # its optional dependencies are unavailable.
+            flow_path = batch / "flow_local.json"
+            try:
+                value = json.loads(flow_path.read_text(encoding="utf-8")) if flow_path.exists() else None
+            except Exception:
+                value = None
+            return value if isinstance(value, dict) else None
+
+    def load_global_flow_for_temporal(root: Path) -> dict[str, Any] | None:
+        """Read the active global Flow snapshot, preserving legacy projects."""
+
+        try:
+            from astroalign_logic import load_global_flow
+
+            value = load_global_flow(root)
+            if isinstance(value, dict):
+                return value
+            return None
+        except Exception:
+            global_path = root / "global_flow.json"
+            try:
+                value = json.loads(global_path.read_text(encoding="utf-8")) if global_path.exists() else None
+            except Exception:
+                value = None
+            return value if isinstance(value, dict) else None
+
     reports: list[dict[str, Any]] = []
     try:
         batches = sorted(
@@ -662,13 +715,7 @@ def build_session_temporal_report(
     except OSError:
         batches = []
     for batch in batches:
-        flow_path = batch / "flow_local.json"
-        try:
-            import json
-
-            flow_data = json.loads(flow_path.read_text(encoding="utf-8")) if flow_path.exists() else None
-        except Exception:
-            flow_data = None
+        flow_data = load_local_flow_for_temporal(batch)
         reports.append(build_temporal_report(batch, flow_data, session_gap, session_sigma))
     session_view = _flatten_session_reports(reports, session_gap, session_sigma)
     # The global Flow transform is the authoritative between-batch derotation
@@ -676,10 +723,7 @@ def build_session_temporal_report(
     # a weight or an exclusion rule.
     batch_rotations: list[dict[str, Any]] = []
     try:
-        import json
-
-        global_path = Path(base_dir) / "global_flow.json"
-        global_data = json.loads(global_path.read_text(encoding="utf-8")) if global_path.exists() else {}
+        global_data = load_global_flow_for_temporal(Path(base_dir)) or {}
         for batch_name, entry in (global_data.get("batches", {}) or {}).items():
             if not isinstance(entry, dict):
                 continue

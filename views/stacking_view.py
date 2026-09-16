@@ -123,6 +123,24 @@ class StackingView(BaseAstroView):
             dirs_frame, text="Onde a imagem empilhada será salva", style="Muted.TLabel"
         ).grid(row=3, column=0, columnspan=4, sticky="w", pady=(0, 0))
 
+        ttk.Label(dirs_frame, text="Perfil de features:").grid(
+            row=4, column=0, sticky="w", pady=(8, 0)
+        )
+        ttk.Combobox(
+            dirs_frame,
+            textvariable=self.model.stack_feature_profile_var,
+            values=["Intelligent", "Legacy"],
+            state="readonly",
+            width=16,
+        ).grid(row=4, column=1, sticky="w", padx=8, pady=(8, 0))
+        ttk.Label(
+            dirs_frame,
+            text="Intelligent usa seleção explicável, trailing conservador e RAM limitada; Legacy preserva o fluxo anterior.",
+            style="Muted.TLabel",
+            wraplength=520,
+            justify="left",
+        ).grid(row=4, column=2, columnspan=2, sticky="w", padx=(8, 0), pady=(8, 0))
+
         # ============================================================
         # 2. Seleção de Frames
         # ============================================================
@@ -138,7 +156,7 @@ class StackingView(BaseAstroView):
         self.selection_mode_combo = ttk.Combobox(
             selection_frame,
             textvariable=self.model.stack_selection_mode_var,
-            values=["All", "BestPercentage"],
+            values=["All", "BestPercentage", "MultiMetric"],
             state="readonly",
             width=16,
         )
@@ -146,7 +164,7 @@ class StackingView(BaseAstroView):
 
         ttk.Label(
             selection_frame,
-            text="'All' usa todos | 'BestPercentage' usa os melhores X%",
+            text="'All' usa todos | 'BestPercentage' usa métrica única | 'MultiMetric' usa score robusto",
             style="Muted.TLabel",
         ).grid(row=0, column=2, sticky="w", padx=(8, 0))
 
@@ -171,6 +189,54 @@ class StackingView(BaseAstroView):
             text="'quality' = estrelas / FWHM | 'roundness' = b/a",
             style="Muted.TLabel",
         ).grid(row=1, column=2, sticky="w", padx=(8, 0), pady=(8, 0))
+
+        ttk.Label(selection_frame, text="Perfil de seleção:").grid(
+            row=7, column=0, sticky="w", pady=(10, 0)
+        )
+        ttk.Combobox(
+            selection_frame,
+            textvariable=self.model.stack_selection_profile_var,
+            values=["Sharpness", "Balanced", "Signal", "Custom"],
+            state="readonly",
+            width=16,
+        ).grid(row=7, column=1, sticky="w", padx=8, pady=(10, 0))
+        ttk.Label(
+            selection_frame,
+            text="Pesos robustos normalizados por percentis; Custom usa o campo abaixo.",
+            style="Muted.TLabel",
+        ).grid(row=7, column=2, sticky="w", padx=(8, 0), pady=(10, 0))
+
+        ttk.Label(selection_frame, text="Pesos avançados:").grid(
+            row=8, column=0, sticky="w", pady=(8, 0)
+        )
+        ttk.Entry(
+            selection_frame,
+            textvariable=self.model.stack_selection_weights_var,
+            width=36,
+        ).grid(row=8, column=1, sticky="ew", padx=8, pady=(8, 0))
+        ttk.Label(
+            selection_frame,
+            text="Ex.: fwhm=0.4,roundness=0.3,snr=0.3 (aplica-se ao perfil Custom).",
+            style="Muted.TLabel",
+        ).grid(row=8, column=2, sticky="w", padx=(8, 0), pady=(8, 0))
+
+        ttk.Label(selection_frame, text="Política de trailing:").grid(
+            row=9, column=0, sticky="w", pady=(8, 0)
+        )
+        ttk.Combobox(
+            selection_frame,
+            textvariable=self.model.stack_trail_policy_var,
+            values=["exclude_severe", "weight_only", "report", "off"],
+            state="readonly",
+            width=16,
+        ).grid(row=9, column=1, sticky="w", padx=8, pady=(8, 0))
+        ttk.Label(
+            selection_frame,
+            text="Somente casos graves e confiáveis são excluídos automaticamente; os moderados recebem penalidade.",
+            style="Muted.TLabel",
+            wraplength=520,
+            justify="left",
+        ).grid(row=9, column=2, sticky="w", padx=(8, 0), pady=(8, 0))
 
         # Triagem opcional de frames sem guiagem
         ttk.Checkbutton(
@@ -274,7 +340,7 @@ class StackingView(BaseAstroView):
         ttk.Combobox(
             combine_frame,
             textvariable=self.model.stack_method_var,
-            values=["Median", "Mean", "Sum", "Maximum", "Minimum"],
+            values=["Median", "Mean", "QualityWeightedMean", "Sum", "Maximum", "Minimum"],
             state="readonly",
             width=14,
         ).grid(row=0, column=1, sticky="w", padx=8)
@@ -418,7 +484,7 @@ class StackingView(BaseAstroView):
 
         ttk.Label(
             output_frame,
-            text="Saída FIT padrão e única: 16-bit",
+            text="Saída preserva FIT/TIFF da sessão: 16-bit",
             style="Muted.TLabel",
         ).grid(row=1, column=2, sticky="w", padx=(8, 0), pady=(8, 0))
 
@@ -433,6 +499,52 @@ class StackingView(BaseAstroView):
             text="Recomendado para reduzir o tamanho do arquivo",
             style="Muted.TLabel",
         ).grid(row=2, column=2, sticky="w", padx=(8, 0), pady=(8, 0))
+
+        ttk.Label(output_frame, text="Armazenamento da redução:").grid(
+            row=4, column=0, sticky="w", pady=(10, 0)
+        )
+        ttk.Combobox(
+            output_frame,
+            textvariable=self.model.stack_reduction_storage_var,
+            values=["ram", "disk_legacy", "ram_spill"],
+            state="readonly",
+            width=16,
+        ).grid(row=4, column=1, sticky="w", padx=8, pady=(10, 0))
+        ttk.Label(
+            output_frame,
+            text="RAM é o padrão Intelligent; spill é opt-in e requer pasta/limite explícitos.",
+            style="Muted.TLabel",
+        ).grid(row=4, column=2, sticky="w", padx=(8, 0), pady=(10, 0))
+
+        ttk.Label(output_frame, text="Pasta de spill (opcional):").grid(
+            row=5, column=0, sticky="w", pady=(8, 0)
+        )
+        ttk.Entry(
+            output_frame,
+            textvariable=self.model.stack_spill_directory_var,
+        ).grid(row=5, column=1, sticky="ew", padx=8, pady=(8, 0))
+        ttk.Button(
+            output_frame,
+            text="Selecionar",
+            command=lambda: self.model.browse_dir(self.model.stack_spill_directory_var),
+        ).grid(row=5, column=2, sticky="w", pady=(8, 0))
+
+        ttk.Label(output_frame, text="Limite spill (MiB):").grid(
+            row=6, column=0, sticky="w", pady=(8, 0)
+        )
+        ttk.Spinbox(
+            output_frame,
+            from_=256,
+            to=1048576,
+            increment=256,
+            textvariable=self.model.stack_spill_limit_var,
+            width=12,
+        ).grid(row=6, column=1, sticky="w", padx=8, pady=(8, 0))
+        ttk.Label(
+            output_frame,
+            text="Nenhum arquivo de spill é criado no modo RAM puro.",
+            style="Muted.TLabel",
+        ).grid(row=6, column=2, sticky="w", padx=(8, 0), pady=(8, 0))
 
         # ============================================================
         # 8. Ações

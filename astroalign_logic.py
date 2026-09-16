@@ -1,12 +1,15 @@
 import hashlib
 import json
+import math
 import os
 import shutil
 import tempfile
 import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from collections.abc import Iterable, Mapping, Sequence
+from typing import Any
 from collections import OrderedDict
 from functools import partial
 from pathlib import Path
@@ -21,11 +24,23 @@ from skimage.transform import AffineTransform, warp
 from app.engines import EngineProfile, ExecutionBudget, registry
 from app.engines.align import register_align_engines
 from cpu_runtime import configure_opencv_threads, configure_worker_runtime, physical_core_count
+from image_io import (
+    IMAGE_SUFFIXES,
+    TIFF_SUFFIXES,
+    ImageFormat,
+    detect_format,
+    read_tiff,
+    read_tiff_sidecar_arrays,
+    validate_single_format,
+    write_npz_sidecar,
+    write_sidecar_json,
+    write_tiff,
+)
 
 # Suprime todos os avisos de verificação de cabeçalho do Astropy
 warnings.simplefilter("ignore", category=AstropyWarning)
 
-FITS_SUFFIXES = {".fit", ".fits", ".fts"}
+FITS_SUFFIXES = IMAGE_SUFFIXES
 
 INTERPOLATION_MODES = {
     "Nearest": "nearest",
@@ -97,6 +112,18 @@ class AlignConfig:
     # similarity fit for B.  Both alternatives are opt-in and leave the
     # default Stable output unchanged.
     rgb_registration_mode: str = "translation"
+    # Populated only for ``session-auto`` after a bounded training pass.
+    # Legacy callers can leave it unset and retain their exact behavior.
+    rgb_session_model: dict | None = None
+    # Compact mode integrates aligned frames directly into one master per
+    # acquisition batch.  ``individual`` remains available for legacy and
+    # diagnostic runs.
+    aligned_storage: str = "batch_compact"
+    keep_aligned_frames: bool = False
+    batch_stack_method: str = "Mean"
+    batch_rejection_method: str = "None"
+    batch_rejection_low: float = 3.0
+    batch_rejection_high: float = 3.0
 
 
 def _build_align_config(
@@ -114,8 +141,13 @@ def _build_align_config(
         rgb_registration_mode=(
             str(config_dict.get("rgb_registration_mode", "translation")).strip().lower()
             if str(config_dict.get("rgb_registration_mode", "translation")).strip().lower()
-            in {"translation", "similarity", "hybrid"}
+            in {"translation", "similarity", "hybrid", "session-auto"}
             else "translation"
+        ),
+        rgb_session_model=(
+            config_dict.get("rgb_session_model")
+            if isinstance(config_dict.get("rgb_session_model"), dict)
+            else None
         ),
         overwrite=bool(config_dict.get("overwrite", False)),
         dry_run=bool(config_dict.get("dry_run", False)),
@@ -133,6 +165,27 @@ def _build_align_config(
         workers=max(0, int(config_dict.get("workers", 0))),
         memory_budget_mb=max(0, int(config_dict.get("memory_budget_mb", 0))),
         writer_workers=max(0, int(config_dict.get("writer_workers", 0))),
+        aligned_storage=(
+            str(config_dict.get("aligned_storage", "batch_compact")).strip()
+            if str(config_dict.get("aligned_storage", "batch_compact")).strip()
+            in {"batch_compact", "individual"}
+            else "batch_compact"
+        ),
+        keep_aligned_frames=bool(config_dict.get("keep_aligned_frames", False)),
+        batch_stack_method=(
+            str(config_dict.get("batch_stack_method", "Mean")).strip()
+            if str(config_dict.get("batch_stack_method", "Mean")).strip()
+            in {"Mean", "Sum", "QualityWeightedMean", "Maximum", "Minimum", "Median"}
+            else "Mean"
+        ),
+        batch_rejection_method=(
+            str(config_dict.get("batch_rejection_method", "None")).strip()
+            if str(config_dict.get("batch_rejection_method", "None")).strip()
+            in {"None", "SigmaClip", "Winsorized", "MAD"}
+            else "None"
+        ),
+        batch_rejection_low=float(config_dict.get("batch_rejection_low", 3.0)),
+        batch_rejection_high=float(config_dict.get("batch_rejection_high", 3.0)),
     )
 
 
@@ -305,6 +358,21 @@ def _load_fits_data_and_optional_masks(
     giving the hot alignment worker one header/data/mask read.
     """
 
+    if filepath.suffix.casefold() in TIFF_SUFFIXES:
+        data, header = read_tiff(filepath)
+        data = np.asarray(data, dtype=np.float32)
+        if data.ndim == 3 and data.shape[0] in (3, 4) and data.shape[-1] not in (3, 4):
+            data = np.moveaxis(data, 0, -1)
+        spatial_shape = data.shape[:2]
+        arrays = read_tiff_sidecar_arrays(filepath) if include_masks else {}
+        valid = np.asarray(arrays.get("valid_mask", np.ones(spatial_shape)), dtype=bool)
+        sat = np.asarray(arrays.get("sat_mask", np.zeros(spatial_shape)), dtype=bool)
+        if valid.shape != spatial_shape:
+            valid = np.ones(spatial_shape, dtype=bool)
+        if sat.shape != spatial_shape:
+            sat = np.zeros(spatial_shape, dtype=bool)
+        return data, header, valid, sat
+
     from app.infrastructure.fits_masks import read_science_masks_from_hdul
 
     with fits.open(
@@ -370,6 +438,16 @@ def load_fits_data_and_masks(
 
 def load_fits_masks(filepath: Path, shape: tuple[int, int]) -> tuple[np.ndarray, np.ndarray]:
     """Read optional validity/saturation masks without FITS memmapping."""
+    if filepath.suffix.casefold() in TIFF_SUFFIXES:
+        spatial = tuple(shape[:2])
+        arrays = read_tiff_sidecar_arrays(filepath)
+        valid = np.asarray(arrays.get("valid_mask", np.ones(spatial)), dtype=bool)
+        sat = np.asarray(arrays.get("sat_mask", np.zeros(spatial)), dtype=bool)
+        if valid.shape != spatial:
+            valid = np.ones(spatial, dtype=bool)
+        if sat.shape != spatial:
+            sat = np.zeros(spatial, dtype=bool)
+        return valid, sat
     from app.infrastructure.fits_masks import read_science_masks
     return read_science_masks(filepath, shape[:2])
 
@@ -665,6 +743,117 @@ def _estimate_rgb_similarity_warp(
     return np.asarray(matrix, dtype=np.float32), confidence
 
 
+def _session_rgb_matrix(
+    model: Mapping[str, object] | None,
+    channel: int,
+    shape: tuple[int, int],
+    max_shift: float,
+) -> tuple[np.ndarray, float] | None:
+    """Validate one persisted session model before applying it to a frame."""
+
+    if not isinstance(model, Mapping) or not bool(model.get("accepted", False)):
+        return None
+    channels = model.get("channels")
+    if not isinstance(channels, Mapping):
+        return None
+    entry = channels.get(str(channel), channels.get(channel))
+    if not isinstance(entry, Mapping):
+        return None
+    try:
+        matrix = np.asarray(entry.get("matrix"), dtype=np.float32)
+        confidence = float(entry.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        return None
+    if matrix.shape != (2, 3) or not np.all(np.isfinite(matrix)):
+        return None
+    if not math.isfinite(confidence) or confidence < 0.15:
+        return None
+    height, width = shape
+    corners = np.asarray(
+        [[0.0, 0.0], [width - 1.0, 0.0], [0.0, height - 1.0],
+         [width - 1.0, height - 1.0]], dtype=np.float32
+    )
+    transformed = cv2.transform(corners.reshape(-1, 1, 2), matrix).reshape(-1, 2)
+    if not np.all(np.isfinite(transformed)):
+        return None
+    if float(np.max(np.linalg.norm(transformed - corners, axis=1))) > max_shift:
+        return None
+    return matrix, confidence
+
+
+def fit_chromatic_session_model(
+    samples: Iterable[tuple[np.ndarray, np.ndarray, np.ndarray]],
+    *,
+    max_shift: float = 2.0,
+    min_samples: int = 3,
+) -> dict[str, object] | None:
+    """Fit a robust global RGB correction from ``(G, R, B)`` samples.
+
+    The function never mutates the supplied arrays.  Each sample is fitted
+    independently with the existing bounded similarity estimator and the
+    resulting affine coefficients are aggregated by a component-wise median.
+    A MAD/footprint validation rejects unstable sessions; callers can then
+    fall back to the conservative per-frame hybrid path.
+    """
+
+    if not samples:
+        return None
+    channel_fits: dict[int, list[tuple[np.ndarray, float]]] = {0: [], 2: []}
+    for reference, red, blue in samples:
+        ref = np.asarray(reference, dtype=np.float32)
+        if ref.ndim != 2:
+            continue
+        for channel, candidate in ((0, red), (2, blue)):
+            fit = _estimate_rgb_similarity_warp(
+                ref,
+                np.asarray(candidate, dtype=np.float32),
+                max_shift=max_shift,
+            )
+            if fit is None:
+                dx, dy, confidence = rgb_registration_shift(ref, np.asarray(candidate, dtype=np.float32))
+                if not np.isfinite(dx + dy) or confidence < 0.15 or np.hypot(dx, dy) > max_shift:
+                    continue
+                matrix = np.asarray([[1.0, 0.0, dx], [0.0, 1.0, dy]], dtype=np.float32)
+                fit = (matrix, float(confidence))
+            channel_fits[channel].append(fit)
+    if any(len(channel_fits[channel]) < max(1, int(min_samples)) for channel in (0, 2)):
+        return None
+
+    channels: dict[str, dict[str, object]] = {}
+    dispersion: dict[str, float] = {}
+    for channel in (0, 2):
+        fits = channel_fits[channel]
+        matrices = np.stack([matrix for matrix, _confidence in fits]).astype(np.float64)
+        confidence_values = np.asarray([confidence for _matrix, confidence in fits], dtype=np.float64)
+        median_matrix = np.median(matrices, axis=0)
+        mad_matrix = np.median(np.abs(matrices - median_matrix), axis=0)
+        max_mad = float(np.max(mad_matrix))
+        median_confidence = float(np.median(confidence_values))
+        # A broad per-frame spread is evidence that one fixed model would be
+        # worse than the current hybrid estimator.  Keep the acceptance gate
+        # intentionally conservative and deterministic.
+        if max_mad > 0.35 or not np.isfinite(median_confidence) or median_confidence < 0.15:
+            return None
+        # The actual footprint check is performed by _session_rgb_matrix per
+        # frame; retain a compact dispersion metric for the report here.
+        channels[str(channel)] = {
+            "matrix": np.asarray(median_matrix, dtype=np.float64).tolist(),
+            "confidence": median_confidence,
+            "sample_count": len(fits),
+            "mad_max": max_mad,
+        }
+        dispersion[str(channel)] = max_mad
+    del dispersion
+    return {
+        "schema_version": 1,
+        "accepted": True,
+        "method": "median_similarity",
+        "sample_count": min(len(channel_fits[0]), len(channel_fits[2])),
+        "max_shift": float(max_shift),
+        "channels": channels,
+    }
+
+
 def warp_frame(
     data: np.ndarray,
     final_matrix: np.ndarray,
@@ -675,6 +864,7 @@ def warp_frame(
     diagnostics: dict | None = None,
     rgb_max_shift: float = 2.0,
     rgb_registration_mode: str = "translation",
+    rgb_session_model: Mapping[str, object] | None = None,
 ) -> np.ndarray:
     """
     Aplica a transformação afim global e, opcionalmente, executa
@@ -719,12 +909,37 @@ def warp_frame(
         # 2. Nível 1: Micro-Registro RGB pós-warp
         if rgb_registration and data.shape[2] >= 3:
             registration_mode = str(rgb_registration_mode or "translation").strip().lower()
-            if registration_mode not in {"translation", "similarity", "hybrid"}:
+            if registration_mode not in {"translation", "similarity", "hybrid", "session-auto"}:
                 registration_mode = "translation"
+            session_model = rgb_session_model if registration_mode == "session-auto" else None
+            if registration_mode == "session-auto" and not isinstance(session_model, Mapping):
+                # A missing or failed validation pass is explicitly safe: use
+                # the already validated conservative hybrid estimator.
+                registration_mode = "hybrid"
             if profile is EngineProfile.FAST:
                 reference = output[:, :, 1]
                 height, width = reference.shape
                 for channel in (0, 2):
+                    if registration_mode == "session-auto":
+                        session_fit = _session_rgb_matrix(
+                            session_model, channel, (height, width), rgb_max_shift
+                        )
+                        if session_fit is not None:
+                            matrix, confidence = session_fit
+                            tx, ty = float(matrix[0, 2]), float(matrix[1, 2])
+                            if diagnostics is not None:
+                                diagnostics.setdefault("rgb_models", {})[channel] = {
+                                    "matrix": np.asarray(matrix, dtype=np.float64).tolist(),
+                                    "confidence": confidence,
+                                    "source": "session",
+                                }
+                                diagnostics.setdefault("rgb_shifts", {})[channel] = (tx, ty, confidence)
+                            output[:, :, channel] = cv2.warpAffine(
+                                output[:, :, channel], matrix, (width, height),
+                                flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,
+                                borderValue=0.0,
+                            )
+                            continue
                     if registration_mode == "similarity" or (
                         registration_mode == "hybrid" and channel == 2
                     ):
@@ -773,6 +988,27 @@ def warp_frame(
             ref_channel = output[:, :, 1]
 
             for c in [0, 2]:  # Processa o Vermelho (0) e o Azul (2)
+                if registration_mode == "session-auto":
+                    session_fit = _session_rgb_matrix(
+                        session_model, c, ref_channel.shape, rgb_max_shift
+                    )
+                    if session_fit is not None:
+                        matrix, confidence = session_fit
+                        tx, ty = float(matrix[0, 2]), float(matrix[1, 2])
+                        if diagnostics is not None:
+                            diagnostics.setdefault("rgb_models", {})[c] = {
+                                "matrix": np.asarray(matrix, dtype=np.float64).tolist(),
+                                "confidence": confidence,
+                                "source": "session",
+                            }
+                            diagnostics.setdefault("rgb_shifts", {})[c] = (tx, ty, confidence)
+                        output[:, :, c] = cv2.warpAffine(
+                            output[:, :, c], matrix,
+                            (output.shape[1], output.shape[0]),
+                            flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,
+                            borderValue=0.0,
+                        )
+                        continue
                 if registration_mode == "similarity" or (
                     registration_mode == "hybrid" and c == 2
                 ):
@@ -1000,8 +1236,9 @@ def _alignment_transform_revision(
             f"{frame_info.get('_local_transform_revision', '')}|"
             f"{frame_info.get('_global_transform_revision', '')}"
         )
+    model_revision = str(frame_info.get("_rgb_session_model_revision", ""))
     return hashlib.sha256(
-        f"{source}|{interpolation_mode or ''}|{rgb_registration_mode or 'translation'}".encode("utf-8")
+        f"{source}|{interpolation_mode or ''}|{rgb_registration_mode or 'translation'}|{model_revision}".encode("utf-8")
     ).hexdigest()[:16]
 
 
@@ -1139,6 +1376,67 @@ def save_aligned_fits(
             pass
 
 
+def save_aligned_image(
+    data: np.ndarray,
+    mask: np.ndarray,
+    header: fits.Header | None,
+    output_path: Path,
+    compress_output: bool = True,
+    metadata: dict[str, float | str] | None = None,
+    cancel_event: threading.Event | None = None,
+    sat_mask: np.ndarray | None = None,
+) -> None:
+    """Persist an aligned product in the format selected by its suffix."""
+
+    if output_path.suffix.casefold() not in TIFF_SUFFIXES:
+        save_aligned_fits(
+            data, mask, header, output_path, compress_output, metadata,
+            cancel_event, sat_mask,
+        )
+        return
+    if cancel_event is not None and cancel_event.is_set():
+        raise InterruptedError("Alignment cancelled before writing")
+    payload = {str(key): str(value) for key, value in (metadata or {}).items()}
+    payload.update({"schema_version": 1, "format": "TIFF", "linear": True})
+    write_tiff(output_path, np.clip(data, 0, 65535).astype(np.uint16, copy=False), metadata=payload)
+    arrays = {"valid_mask": np.asarray(mask, dtype=np.uint8)}
+    if sat_mask is not None:
+        arrays["sat_mask"] = np.asarray(sat_mask, dtype=np.uint8)
+    write_npz_sidecar(output_path.with_suffix(output_path.suffix + ".astrobatch.npz"), **arrays)
+    write_sidecar_json(
+        output_path.with_suffix(output_path.suffix + ".json"),
+        {
+            "schema_version": 1,
+            "format": "TIFF",
+            "linear": True,
+            "science_sidecar": output_path.name + ".astrobatch.npz",
+            "header": {str(key): str(value) for key, value in (header or fits.Header()).items()},
+            "metadata": payload,
+        },
+    )
+
+
+# ============================================================
+# Compact stack sample conversion
+# ============================================================
+
+
+def _aligned_uint16_for_compact_stack(data: np.ndarray) -> np.ndarray:
+    """Use the same persisted sample values as the individual Align path."""
+
+    # Individual FITS/TIFF outputs are published as linear uint16. Compact
+    # Align must feed that quantized plane to its accumulator as well;
+    # accumulating the pre-publication float32 warp would make the default
+    # path scientifically different from the legacy individual path.
+    finite = np.nan_to_num(
+        np.asarray(data),
+        nan=0.0,
+        posinf=65535.0,
+        neginf=0.0,
+    )
+    return np.clip(finite, 0, 65535).astype(np.uint16, copy=False)
+
+
 # ============================================================
 # Frame individual
 # ============================================================
@@ -1157,6 +1455,8 @@ def _process_single_alignment(
     writer_executor: ThreadPoolExecutor | None = None,
     reference_previews: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
     reference_preview_sources: dict[str, tuple[str, str]] | None = None,
+    batch_accumulator: Any | None = None,
+    batch_sequence: int | None = None,
 ) -> tuple[str, str | None]:
 
     try:
@@ -1175,8 +1475,10 @@ def _process_single_alignment(
             )
 
         output_path = output_dir / frame_name
+        # Individual mode preserves the source family.  Compact mode does
+        # not use this per-frame path unless the explicit audit toggle is on.
 
-        if output_path.exists() and not config.overwrite:
+        if (batch_accumulator is None or config.keep_aligned_frames) and output_path.exists() and not config.overwrite:
             sidecar_path = output_path.with_suffix(output_path.suffix + ".align.json")
             try:
                 if sidecar_path.exists():
@@ -1282,6 +1584,7 @@ def _process_single_alignment(
             warp_engine=config.warp_engine,
             diagnostics=warp_diagnostics,
             rgb_registration_mode=config.rgb_registration_mode,
+            rgb_session_model=config.rgb_session_model,
         )
 
         # ----------------------------------------------------
@@ -1437,11 +1740,6 @@ def _process_single_alignment(
         # Escrita
         # ----------------------------------------------------
 
-        output_dir.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
         output_header = updated_header if config.keep_header else fits.Header()
         if not config.keep_header:
             # Retain calibration and exposure semantics needed to decode the
@@ -1465,25 +1763,48 @@ def _process_single_alignment(
                       "ALNREV": alignment_revision}, cancel_event, source_sat)
         if cancel_event is not None and cancel_event.is_set():
             return frame_name, "CANCELLED"
-        if writer_executor is None:
-            save_aligned_fits(*save_args)
-        else:
-            # Keep this frame's payload alive until the single writer commits.
-            writer_executor.submit(save_aligned_fits, *save_args).result()
-        try:
-            from app.infrastructure.json_store import atomic_json_write
-            safe_quality = {k: v if np.isfinite(v) else None for k,v in quality.items()}
-            atomic_json_write(output_path.with_suffix(output_path.suffix + ".align.json"),
-                              {"frame": frame_name, "decision": decision,
-                               "quality": safe_quality, "quality_reference": best_label,
-                               "rgb_registration_mode": config.rgb_registration_mode,
-                               "rgb_models": warp_diagnostics.get("rgb_models", {}),
-                               "alignment_revision": alignment_revision,
-                               "local_transform_revision": frame_info.get("_local_transform_revision"),
-                               "global_transform_revision": frame_info.get("_global_transform_revision"),
-                               "source_matrix_revision": frame_info.get("_local_transform_revision")})
-        except OSError as exc:
-            return frame_name, f"Science FITS saved; quality sidecar failed: {exc}"
+        if batch_accumulator is None or config.keep_aligned_frames:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            if writer_executor is None:
+                save_aligned_image(*save_args)
+            else:
+                # Keep this frame's payload alive until the single writer commits.
+                writer_executor.submit(save_aligned_image, *save_args).result()
+        # Compact mode persists frame quality in the batch manifest.  Writing
+        # one sidecar per source here would both defeat the disk-saving goal
+        # and fail because the per-frame destination is intentionally not
+        # created.  Keep the historical sidecar only for individual output
+        # or when the user explicitly asks to retain aligned frames.
+        if batch_accumulator is None or config.keep_aligned_frames:
+            try:
+                from app.infrastructure.json_store import atomic_json_write
+                safe_quality = {k: v if np.isfinite(v) else None for k,v in quality.items()}
+                atomic_json_write(output_path.with_suffix(output_path.suffix + ".align.json"),
+                                  {"frame": frame_name, "decision": decision,
+                                   "quality": safe_quality, "quality_reference": best_label,
+                                   "rgb_registration_mode": config.rgb_registration_mode,
+                                   "rgb_models": warp_diagnostics.get("rgb_models", {}),
+                                   "alignment_revision": alignment_revision,
+                                   "local_transform_revision": frame_info.get("_local_transform_revision"),
+                                   "global_transform_revision": frame_info.get("_global_transform_revision"),
+                                   "source_matrix_revision": frame_info.get("_local_transform_revision")})
+            except OSError as exc:
+                return frame_name, f"Science image saved; quality sidecar failed: {exc}"
+
+        if batch_accumulator is not None:
+            batch_accumulator.submit(
+                int(batch_sequence or 0),
+                _aligned_uint16_for_compact_stack(warped_data),
+                mask,
+                source_sat,
+                {
+                    "source": str(filepath),
+                    "frame": frame_name,
+                    "weight": float(frame_info.get("stack_weight", frame_info.get("quality", 1.0)) or 1.0),
+                    "decision": decision,
+                    "quality": {key: float(value) for key, value in quality.items() if np.isscalar(value) and np.isfinite(value)},
+                },
+            )
 
         return (
             frame_name,
@@ -1683,6 +2004,96 @@ def process_batch_alignment(
 # ============================================================
 
 
+def _iter_session_rgb_samples(
+    tasks: Sequence[tuple[Path, str, dict, np.ndarray, Path, str]],
+    config: AlignConfig,
+    max_samples: int = 12,
+) -> Iterable[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """Yield bounded, one-frame-at-a-time RGB probes for session fitting."""
+
+    ordered = sorted(tasks, key=lambda item: (str(item[0]).casefold(), item[1].casefold()))
+    if len(ordered) > max_samples:
+        indexes = np.linspace(0, len(ordered) - 1, max_samples, dtype=int)
+        ordered = [ordered[int(index)] for index in indexes]
+    for batch_folder, frame_name, _frame_info, global_matrix, _output_dir, interpolation_mode in ordered:
+        filepath = batch_folder / frame_name
+        raw_data = raw_header = source_valid = source_sat = None
+        rgb_data = warped_data = None
+        try:
+            raw_data, raw_header, source_valid, source_sat = load_fits_data_and_masks(filepath)
+            if np.asarray(raw_data).ndim != 3:
+                pattern = get_bayer_pattern(raw_header) if config.debayer_pattern == "Auto" else (
+                    None if config.debayer_pattern == "Nenhum" else config.debayer_pattern
+                )
+                rgb_data, _ = process_in_memory_debayer(
+                    np.nan_to_num(raw_data, nan=0.0, posinf=0.0, neginf=0.0),
+                    raw_header,
+                    pattern,
+                    config.debayer_method,
+                )
+            else:
+                rgb_data = np.asarray(raw_data, dtype=np.float32)
+            if rgb_data is None or rgb_data.ndim != 3 or rgb_data.shape[2] < 3:
+                continue
+            final_matrix = compute_final_matrix(_frame_info["matrix"], global_matrix)
+            warped_data = warp_frame(
+                rgb_data,
+                final_matrix,
+                interpolation_mode,
+                rgb_registration=False,
+                engine_profile=config.engine_profile,
+                warp_engine=config.warp_engine,
+            )
+            if warped_data.ndim != 3 or warped_data.shape[2] < 3:
+                continue
+            yield (
+                np.asarray(warped_data[:, :, 1], dtype=np.float32),
+                np.asarray(warped_data[:, :, 0], dtype=np.float32),
+                np.asarray(warped_data[:, :, 2], dtype=np.float32),
+            )
+        except Exception:
+            # A single malformed sample must not abort the full Align run;
+            # the caller records a rejected model and uses the hybrid fallback.
+            continue
+        finally:
+            del raw_data, raw_header, source_valid, source_sat, rgb_data, warped_data
+
+
+def _train_session_chromatic_model(
+    tasks: Sequence[tuple[Path, str, dict, np.ndarray, Path, str]],
+    config: AlignConfig,
+    app_print,
+) -> tuple[dict[str, object], str]:
+    """Fit, validate and persist the optional session RGB model."""
+
+    model = fit_chromatic_session_model(_iter_session_rgb_samples(tasks, config), max_shift=2.0)
+    if model is None:
+        model = {
+            "schema_version": 1,
+            "accepted": False,
+            "method": "hybrid_fallback",
+            "sample_count": 0,
+            "reason": "insufficient_or_inconsistent_chromatic_samples",
+            "channels": {},
+        }
+        app_print("[Align] Modelo cromático global não validado; fallback hybrid por frame.\n")
+    else:
+        app_print(
+            f"[Align] Modelo cromático global validado com {model.get('sample_count', 0)} amostras.\n"
+        )
+    try:
+        from app.infrastructure.json_store import atomic_json_write
+
+        model_path = config.output_dir / "chromatic_session_model.json"
+        atomic_json_write(model_path, model)
+    except OSError as exc:
+        app_print(f"[Align] Aviso: sidecar cromático não foi salvo: {exc}\n")
+    revision = hashlib.sha256(
+        json.dumps(model, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    ).hexdigest()[:16]
+    return model, revision
+
+
 def process_all_alignments(
     base_dir: Path,
     output_dir: Path,
@@ -1835,8 +2246,9 @@ def process_all_alignments(
         interpolation_mode = INTERPOLATION_MODES.get(align_config.interpolation, "lanczos")
         task_counts[batch_folder] = len(valid_frames)
         batch_failures[batch_folder] = 0
-        for fname, finfo in valid_frames.items():
+        for sequence, (fname, finfo) in enumerate(valid_frames.items()):
             task_info = dict(finfo)
+            task_info["_batch_sequence"] = sequence
             task_info["_local_transform_revision"] = local_revision
             task_info["_global_transform_revision"] = global_flow.get("transform_revision")
             task_info["_geometry_revision"] = (
@@ -1864,7 +2276,58 @@ def process_all_alignments(
         app_print("Nenhum frame valido para alinhamento.\n")
         return (0, preflight_failed)
 
+    # A compact run has one output family by design.  Reject mixed sessions
+    # before allocating workers or training the optional RGB model.
+    try:
+        source_format = validate_single_format([batch / name for batch, name, *_ in tasks])
+    except ValueError as exc:
+        app_print(f"[Align] ERRO: {exc}\n")
+        return (0, len(tasks) + preflight_failed)
+
+    chromatic_model_revision = ""
+    if align_config.rgb_registration and align_config.rgb_registration_mode == "session-auto":
+        if align_config.dry_run:
+            app_print("[Align] Dry-run: treinamento cromático global ignorado.\n")
+        else:
+            session_model, chromatic_model_revision = _train_session_chromatic_model(
+                tasks, align_config, app_print
+            )
+            align_config = replace(align_config, rgb_session_model=session_model)
+    for _batch_folder, _fname, task_info, _global_matrix, _output_dir, _interpolation in tasks:
+        if chromatic_model_revision:
+            task_info["_rgb_session_model_revision"] = chromatic_model_revision
+
     total_failed = preflight_failed
+
+    # Compact mode owns one accumulator at a time.  A float64 accumulator is
+    # intentionally kept in RAM for scientific determinism, but retaining one
+    # for every batch would multiply the peak RSS by the number of batches.
+    # The grouped scheduler below drains and finalizes each batch before the
+    # next one allocates its state.  Individual mode keeps the historical
+    # cross-batch demand-driven scheduler.
+    compact_mode = not align_config.dry_run and align_config.aligned_storage == "batch_compact"
+    compact_accumulators: dict[Path, Any] = {}
+    BatchAccumulator = None
+    compact_config_snapshot: dict[str, Any] = {
+        "aligned_storage": align_config.aligned_storage,
+        "batch_stack_method": align_config.batch_stack_method,
+        "batch_rejection_method": align_config.batch_rejection_method,
+        "batch_rejection_low": align_config.batch_rejection_low,
+        "batch_rejection_high": align_config.batch_rejection_high,
+        "memory_budget_mb": align_config.memory_budget_mb,
+        "interpolation": align_config.interpolation,
+        "debayer_pattern": align_config.debayer_pattern,
+        "debayer_method": align_config.debayer_method,
+    }
+    if compact_mode:
+        from batch_compaction import BatchAccumulator as _BatchAccumulator
+
+        BatchAccumulator = _BatchAccumulator
+        if align_config.batch_rejection_method != "None":
+            app_print(
+                "[Align] Aviso: rejeição do pré-stack será aplicada de forma hierárquica "
+                "sobre os masters no Stack; nenhum frame será descartado automaticamente.\n"
+            )
 
     # Build a bounded, demand-driven cache of graph reference previews in the
     # same output coordinate system used by Align. Workers prefer their own
@@ -1958,56 +2421,150 @@ def process_all_alignments(
     # writers to measure whether storage/compression can overlap productively.
     writer_workers = max(1, min(worker_count, 4, align_config.writer_workers or 1))
     configure_opencv_threads(1 if worker_count > 1 else physical_core_count())
+    compact_failures = 0
+
+    def _new_compact_accumulator(batch_folder: Path):
+        if BatchAccumulator is None:
+            return None
+        return BatchAccumulator(
+            batch_name=batch_folder.name,
+            output_dir=align_config.output_dir / batch_folder.name,
+            image_format=source_format,
+            method=align_config.batch_stack_method,
+            rejection_method=align_config.batch_rejection_method,
+            rejection_low=align_config.batch_rejection_low,
+            rejection_high=align_config.batch_rejection_high,
+            config_snapshot=compact_config_snapshot,
+            memory_budget_mb=(align_config.memory_budget_mb or 512),
+            expected_frames=task_counts.get(batch_folder),
+        )
+
+    def _finalize_compact_accumulator(batch_folder: Path, accumulator: Any) -> int:
+        if accumulator.frame_count == 0:
+            app_print(f"[{batch_folder.name}] Nenhum frame aceito para o pré-stack compacto.\n")
+            return 1
+        target = align_config.output_dir / batch_folder.name / f"batch_stack{source_format.default_suffix}"
+        if target.exists() and not align_config.overwrite:
+            app_print(
+                f"[{batch_folder.name}] ERRO: pré-stack já existe e overwrite está desativado: {target.name}\n"
+            )
+            return 1
+        try:
+            first_frame = accumulator.accepted[0].get("frame")
+            header = None
+            if first_frame:
+                _data, header, _valid, _sat = load_fits_data_and_masks(batch_folder / str(first_frame))
+            bundle = accumulator.finalize(header)
+            app_print(
+                f"[{batch_folder.name}] Pré-stack compacto salvo: "
+                f"{bundle['image'].name} ({accumulator.frame_count} frames).\n"
+            )
+            return 0
+        except Exception as exc:
+            app_print(f"[{batch_folder.name}] Falha ao gravar pré-stack compacto: {exc}\n")
+            return 1
+
+    def _handle_done(done_set: set, futures: dict, active_accumulator: Any | None = None) -> bool:
+        """Consume completed frame futures and return whether cancellation won."""
+        nonlocal total_processed, total_failed
+        for future in done_set:
+            if cancel_event.is_set():
+                for pending in futures:
+                    pending.cancel()
+                return True
+            batch_folder, batch_sequence = futures.pop(future)
+            try:
+                frame_name, error = future.result()
+            except Exception as exc:
+                frame_name, error = "unknown", f"Erro inesperado: {exc}"
+            progress_state["done"] += 1
+            if error:
+                accumulator = active_accumulator or compact_accumulators.get(batch_folder)
+                if accumulator is not None:
+                    accumulator.skip(batch_sequence, error)
+                batch_failures[batch_folder] += 1
+                total_failed += 1
+                app_print(f"  [{frame_name}] {error}\n")
+            else:
+                total_processed += 1
+            done = progress_state["done"]
+            if done % 10 == 0 or done == progress_state["total"]:
+                app_progress(done, progress_state["total"], f"Alinhando frames ({done}/{progress_state['total']})...")
+        return False
+
     with ThreadPoolExecutor(max_workers=writer_workers,
                             thread_name_prefix="astroalign-writer",
                             initializer=partial(configure_worker_runtime, 1)) as writer_executor, \
          ThreadPoolExecutor(max_workers=worker_count,
                             thread_name_prefix="astroalign-v2",
                             initializer=partial(configure_worker_runtime, budget.kernel_threads)) as executor:
-        iterator = iter(tasks)
-        futures = {}
         canceled = False
-        while futures or not cancel_event.is_set():
-            while not cancel_event.is_set() and len(futures) < limit:
-                try:
-                    batch_folder, fname, finfo, global_matrix, output_dir, interpolation_mode = next(iterator)
-                except StopIteration:
-                    break
-                future = executor.submit(_process_single_alignment, fname, finfo, batch_folder, output_dir,
-                                         global_matrix, interpolation_mode, align_config, cancel_event,
-                                         None, writer_executor, reference_previews, preview_sources)
-                futures[future] = batch_folder
-            if not futures:
-                break
-            done_set, _ = wait(futures, return_when=FIRST_COMPLETED)
-            for future in done_set:
+        if compact_mode:
+            grouped_tasks: dict[Path, list[tuple[Path, str, dict, np.ndarray, Path, str]]] = {}
+            for task in tasks:
+                grouped_tasks.setdefault(task[0], []).append(task)
+            for batch_folder, batch_tasks in grouped_tasks.items():
                 if cancel_event.is_set():
-                    for pending in futures:
-                        pending.cancel()
                     canceled = True
                     break
-                batch_folder = futures.pop(future)
-                try:
-                    frame_name, error = future.result()
-                except Exception as exc:
-                    frame_name, error = "unknown", f"Erro inesperado: {exc}"
-                progress_state["done"] += 1
-                if error:
-                    batch_failures[batch_folder] += 1
-                    total_failed += 1
-                    app_print(f"  [{frame_name}] {error}\n")
-                else:
-                    total_processed += 1
-                done = progress_state["done"]
-                if done % 10 == 0 or done == progress_state["total"]:
-                    app_progress(done, progress_state["total"], f"Alinhando frames ({done}/{progress_state['total']})...")
-            if canceled:
-                # Futures that did not start are discarded; running workers
-                # observe cancel_event and return before writing.
-                futures.clear()
-                break
+                accumulator = _new_compact_accumulator(batch_folder)
+                compact_accumulators[batch_folder] = accumulator
+                iterator = iter(batch_tasks)
+                futures = {}
+                while futures or not cancel_event.is_set():
+                    while not cancel_event.is_set() and len(futures) < limit:
+                        try:
+                            _batch, fname, finfo, global_matrix, output_dir, interpolation_mode = next(iterator)
+                        except StopIteration:
+                            break
+                        future = executor.submit(
+                            _process_single_alignment, fname, finfo, batch_folder, output_dir,
+                            global_matrix, interpolation_mode, align_config, cancel_event,
+                            None, writer_executor, reference_previews, preview_sources,
+                            accumulator, finfo.get("_batch_sequence"),
+                        )
+                        futures[future] = (batch_folder, int(finfo.get("_batch_sequence", 0)))
+                    if not futures:
+                        break
+                    done_set, _ = wait(futures, return_when=FIRST_COMPLETED)
+                    if _handle_done(done_set, futures, accumulator):
+                        canceled = True
+                        futures.clear()
+                        break
+                if canceled:
+                    compact_accumulators.clear()
+                    break
+                compact_failures += _finalize_compact_accumulator(batch_folder, accumulator)
+                # Release the large float64 state before allocating the next
+                # batch.  ``del`` is intentional: CPython drops the ndarray
+                # references immediately and the allocator can reuse arenas.
+                compact_accumulators.pop(batch_folder, None)
+                del accumulator
+        else:
+            iterator = iter(tasks)
+            futures = {}
+            while futures or not cancel_event.is_set():
+                while not cancel_event.is_set() and len(futures) < limit:
+                    try:
+                        batch_folder, fname, finfo, global_matrix, output_dir, interpolation_mode = next(iterator)
+                    except StopIteration:
+                        break
+                    future = executor.submit(
+                        _process_single_alignment, fname, finfo, batch_folder, output_dir,
+                        global_matrix, interpolation_mode, align_config, cancel_event,
+                        None, writer_executor, reference_previews, preview_sources,
+                        None, finfo.get("_batch_sequence"),
+                    )
+                    futures[future] = (batch_folder, int(finfo.get("_batch_sequence", 0)))
+                if not futures:
+                    break
+                done_set, _ = wait(futures, return_when=FIRST_COMPLETED)
+                if _handle_done(done_set, futures):
+                    canceled = True
+                    futures.clear()
+                    break
 
-    if align_config.delete_intermediates and not align_config.dry_run and not cancel_event.is_set():
+    if align_config.delete_intermediates and align_config.aligned_storage == "individual" and not align_config.dry_run and not cancel_event.is_set():
         for batch_folder, failed in batch_failures.items():
             if failed == 0:
                 try:
@@ -2015,6 +2572,8 @@ def process_all_alignments(
                     app_print(f"[{batch_folder.name}] Batch original limpo com sucesso.\n")
                 except Exception as exc:
                     app_print(f"[{batch_folder.name}] Erro ao apagar intermediarios: {exc}\n")
+
+    total_failed += compact_failures
 
     if not cancel_event.is_set():
         app_progress(total_frames, total_frames, "Concluido.")

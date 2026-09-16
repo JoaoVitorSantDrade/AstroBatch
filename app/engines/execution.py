@@ -11,6 +11,32 @@ from cpu_runtime import physical_core_count, recommended_numba_threads
 
 def science_frame_bytes(path: Path) -> int:
     """Float32 science-plane size, inspecting headers without decoding pixels."""
+    from image_io import TIFF_SUFFIXES, read_tiff, tiff_shape
+
+    is_tiff = path.suffix.casefold() in TIFF_SUFFIXES
+    if not is_tiff:
+        # Some capture tools export files without a reliable suffix.  TIFF
+        # signatures are stable (little/big endian magic at byte 0), so a
+        # four-byte probe avoids sending them to Astropy's FITS parser.
+        try:
+            with path.open("rb") as stream:
+                is_tiff = stream.read(4) in {b"II*\x00", b"MM\x00*", b"II+\x00", b"MM\x00+"}
+        except OSError:
+            pass
+
+    if is_tiff:
+        # tifffile can inspect the shape through a memory map without copying
+        # the dedicated-camera frame.  Compressed TIFFs use the small fallback
+        # adapter, preserving compatibility when tifffile is unavailable.
+        try:
+            shape = tiff_shape(path)
+        except Exception:
+            data, _header = read_tiff(path)
+            shape = tuple(data.shape)
+        if len(shape) not in (2, 3):
+            raise ValueError(f"No science image: {path}")
+        return math.prod(shape) * 4
+
     from astropy.io import fits
     with fits.open(path, memmap=False, lazy_load_hdus=True) as hdul:
         for hdu in hdul:

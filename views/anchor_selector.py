@@ -19,7 +19,7 @@ from views.preview_service import PreviewService
 class AnchorSelectionController:
     """Own the reference selector window and its asynchronous preview state."""
 
-    FITS_SUFFIXES = {".fit", ".fits", ".fts"}
+    FITS_SUFFIXES = {".fit", ".fits", ".fts", ".tif", ".tiff"}
 
     def __init__(
         self,

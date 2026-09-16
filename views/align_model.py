@@ -28,3 +28,11 @@ class AlignViewModel:
     browse_dir: Callable | None = None
     start_align_processing: Callable | None = None
     cancel_processing: Callable | None = None
+    # Compact Align -> Stack controls.  Optional fields keep compatibility
+    # with integrations that still construct the legacy positional model.
+    align_storage_var: Any = None
+    align_keep_aligned_frames_var: Any = None
+    align_batch_method_var: Any = None
+    align_batch_rejection_var: Any = None
+    align_batch_rejection_low_var: Any = None
+    align_batch_rejection_high_var: Any = None

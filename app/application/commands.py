@@ -3,6 +3,8 @@ from dataclasses import dataclass
 from pathlib import Path
 import math
 
+from stacking_features import parse_selection_weights
+
 
 @dataclass(frozen=True)
 class ResourceSettings:
@@ -260,11 +262,31 @@ class AlignCommand:
             if isinstance(config[name], bool) or not math.isfinite(value) or not value.is_integer() or value < minimum:
                 raise ValueError(f"{name}: informe um inteiro maior ou igual a {minimum}.")
             config[name] = int(value)
-        for name in ("overwrite", "dry_run", "keep_header", "delete_intermediates", "compress_output", "quality_gate"):
-            config[name] = cls._as_bool(name, config[name])
+        for name in (
+            "overwrite", "dry_run", "keep_header", "delete_intermediates",
+            "compress_output", "quality_gate", "keep_aligned_frames",
+        ):
+            config[name] = cls._as_bool(name, config.get(name, False))
+        storage = str(config.get("aligned_storage", "batch_compact")).strip()
+        if storage not in {"batch_compact", "individual"}:
+            raise ValueError("aligned_storage: escolha batch_compact ou individual.")
+        config["aligned_storage"] = storage
+        method = str(config.get("batch_stack_method", "Mean")).strip()
+        if method not in {"Mean", "Sum", "QualityWeightedMean", "Maximum", "Minimum", "Median"}:
+            raise ValueError("batch_stack_method: método de pré-stack inválido.")
+        config["batch_stack_method"] = method
+        rejection = str(config.get("batch_rejection_method", "None")).strip()
+        if rejection not in {"None", "SigmaClip", "Winsorized", "MAD"}:
+            raise ValueError("batch_rejection_method: rejeição inválida.")
+        config["batch_rejection_method"] = rejection
+        for name in ("batch_rejection_low", "batch_rejection_high"):
+            value = float(config.get(name, 3.0))
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name}: informe um número finito não negativo.")
+            config[name] = value
         mode = str(config.get("rgb_registration_mode", "translation")).strip().lower()
-        if mode not in {"translation", "similarity", "hybrid"}:
-            raise ValueError("rgb_registration_mode: escolha translation, similarity ou hybrid.")
+        if mode not in {"translation", "similarity", "hybrid", "session-auto"}:
+            raise ValueError("rgb_registration_mode: escolha translation, similarity, hybrid ou session-auto.")
         config["rgb_registration_mode"] = mode
         if config.get("engine_profile", "Stable") not in {"Stable", "Fast"}:
             raise ValueError("engine_profile: escolha Stable ou Fast.")
@@ -303,7 +325,7 @@ class StackCommand:
             raise ValueError("output_dir: selecione uma pasta de saída.")
         output_path = Path(output_text).expanduser().resolve()
         if not input_path.is_dir():
-            raise ValueError("input_dir: selecione uma pasta de FITS alinhados.")
+            raise ValueError("input_dir: selecione uma pasta de imagens alinhadas (FITS/TIFF).")
         if input_path == output_path:
             raise ValueError("A pasta de saída deve ser diferente da entrada.")
 
@@ -321,16 +343,78 @@ class StackCommand:
             values.get("min_roundness", .65), values.get("min_shape_stars", 5)
         )
         config = dict(values)
+        output_format = str(config.get("output_format", "auto")).strip().lower()
+        if output_format not in {"auto", "fits", "tiff"}:
+            raise ValueError("output_format: escolha auto, fits ou tiff.")
+        config["output_format"] = output_format
+        profile = str(config.get("feature_profile", "Legacy")).strip()
+        if profile not in {"Legacy", "Intelligent"}:
+            raise ValueError("feature_profile: escolha Legacy ou Intelligent.")
+        config["feature_profile"] = profile
+        default_mode = "MultiMetric" if profile == "Intelligent" else "BestPercentage"
+        mode = str(config.get("selection_mode", default_mode)).strip()
+        if mode not in {"All", "BestPercentage", "MultiMetric"}:
+            raise ValueError("selection_mode: escolha All, BestPercentage ou MultiMetric.")
+        config["selection_mode"] = mode
+        selection_profile = str(config.get("selection_profile", "Balanced")).strip()
+        if selection_profile not in {"Sharpness", "Balanced", "Signal", "Custom"}:
+            raise ValueError("selection_profile: escolha Sharpness, Balanced, Signal ou Custom.")
+        config["selection_profile"] = selection_profile
+        # Normalize mappings and compact strings at the command boundary so
+        # direct API callers receive the same validation as the native form.
+        # Custom scoring must contain at least one finite, positive metric;
+        # invalid extras are ignored by the parser by design.
+        config["selection_weights"] = parse_selection_weights(
+            config.get("selection_weights", {})
+        )
+        if selection_profile == "Custom" and not config["selection_weights"]:
+            raise ValueError(
+                "selection_weights: informe pelo menos um peso positivo e finito."
+            )
+        default_storage = "ram" if profile == "Intelligent" else "disk_legacy"
+        storage = str(config.get("reduction_storage", default_storage)).strip()
+        if storage not in {"disk_legacy", "ram", "ram_spill"}:
+            raise ValueError("reduction_storage: escolha disk_legacy, ram ou ram_spill.")
+        config["reduction_storage"] = storage
+        trail_policy = str(config.get("trail_policy", "exclude_severe" if profile == "Intelligent" else "off")).strip()
+        if trail_policy not in {"off", "exclude_severe", "weight_only", "report"}:
+            raise ValueError("trail_policy: escolha off, exclude_severe, weight_only ou report.")
+        config["trail_policy"] = trail_policy
+        method = str(config.get("method", "QualityWeightedMean" if profile == "Intelligent" else "Median")).strip()
+        if method not in {"Median", "Mean", "QualityWeightedMean", "Sum", "Maximum", "Minimum"}:
+            raise ValueError("method: método de stacking inválido.")
+        config["method"] = method
+        if storage == "ram_spill":
+            spill_text = str(config.get("spill_directory", "")).strip()
+            if not spill_text:
+                raise ValueError("spill_directory: escolha uma pasta para o spill.")
+            spill_limit = int(float(config.get("spill_limit_mb", 0)))
+            if spill_limit < 256:
+                raise ValueError("spill_limit_mb: use pelo menos 256 MiB.")
+            config["spill_directory"] = str(Path(spill_text).expanduser().resolve())
+            config["spill_limit_mb"] = spill_limit
+        else:
+            config["spill_directory"] = None
+            config["spill_limit_mb"] = max(0, int(float(config.get("spill_limit_mb", 0))))
+        selection_percentage = finite("selection_percentage", 80, 0, 100)
+        if selection_percentage <= 0:
+            raise ValueError("selection_percentage: informe um valor maior que zero.")
         config.update({
             "input_dir": str(input_path),
             "output_dir": str(output_path),
             "min_roundness": roundness,
             "min_shape_stars": int(shape),
-            "selection_percentage": finite("selection_percentage", 80, 0, 100),
+            "selection_percentage": selection_percentage,
             "rejection_low": finite("rejection_low", 3, 0),
             "rejection_high": finite("rejection_high", 3, 0),
             "output_bit_depth": "16-bit",
         })
+        for name, default, minimum in (("memory_budget_mb", 4096, 64), ("workers", 1, 1)):
+            raw = config.get(name, default)
+            number = float(raw)
+            if isinstance(raw, bool) or not math.isfinite(number) or not number.is_integer() or number < minimum:
+                raise ValueError(f"{name}: informe um inteiro maior ou igual a {minimum}.")
+            config[name] = int(number)
         boolean_defaults = {
             "trail_filter_enabled": False,
             "normalize": True,

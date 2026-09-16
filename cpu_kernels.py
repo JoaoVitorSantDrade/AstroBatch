@@ -50,6 +50,50 @@ def _calibrate_inplace(
             data[y, x] = value
 
 
+@njit(cache=True, nogil=True)
+def _calibrate_inplace_rgb_hwc(
+    data: np.ndarray,
+    dark: np.ndarray,
+    flat: np.ndarray,
+    use_dark: bool,
+    use_flat: bool,
+) -> None:
+    height, width, channels = data.shape
+    for y in range(height):
+        for x in range(width):
+            for channel in range(channels):
+                value = data[y, x, channel]
+                if use_dark:
+                    value = value - dark[y, x, channel]
+                if use_flat:
+                    flat_value = flat[y, x, channel]
+                    if np.isfinite(flat_value) and flat_value > np.float32(0.01):
+                        value = value / flat_value
+                data[y, x, channel] = value
+
+
+@njit(cache=True, nogil=True)
+def _calibrate_inplace_rgb_chw(
+    data: np.ndarray,
+    dark: np.ndarray,
+    flat: np.ndarray,
+    use_dark: bool,
+    use_flat: bool,
+) -> None:
+    channels, height, width = data.shape
+    for channel in range(channels):
+        for y in range(height):
+            for x in range(width):
+                value = data[channel, y, x]
+                if use_dark:
+                    value = value - dark[channel, y, x]
+                if use_flat:
+                    flat_value = flat[channel, y, x]
+                    if np.isfinite(flat_value) and flat_value > np.float32(0.01):
+                        value = value / flat_value
+                data[channel, y, x] = value
+
+
 def calibrate_inplace(
     data: np.ndarray,
     master_dark: np.ndarray | None,
@@ -61,14 +105,25 @@ def calibrate_inplace(
     dark = (
         as_c_float32(master_dark)
         if master_dark is not None
-        else np.empty((0, 0), dtype=np.float32)
+        else np.empty((0,) * data.ndim, dtype=np.float32)
     )
     flat = (
         as_c_float32(master_flat)
         if master_flat is not None
-        else np.empty((0, 0), dtype=np.float32)
+        else np.empty((0,) * data.ndim, dtype=np.float32)
     )
-    _calibrate_inplace(data, dark, flat, master_dark is not None, master_flat is not None)
+    use_dark = master_dark is not None
+    use_flat = master_flat is not None
+    if data.ndim == 2:
+        _calibrate_inplace(data, dark, flat, use_dark, use_flat)
+    elif data.ndim == 3:
+        channels_first = data.shape[0] in (3, 4) and data.shape[-1] not in (3, 4)
+        if channels_first:
+            _calibrate_inplace_rgb_chw(data, dark, flat, use_dark, use_flat)
+        else:
+            _calibrate_inplace_rgb_hwc(data, dark, flat, use_dark, use_flat)
+    else:
+        raise ValueError("calibration data must be mono 2D or RGB 3D")
     return data
 
 

@@ -23,7 +23,7 @@ from concurrent.futures import (
     as_completed,
     wait,
 )
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import partial
 from pathlib import Path
 from typing import Any, Literal
@@ -37,6 +37,26 @@ from photutils.background import Background2D, MedianBackground
 from app.engines import EngineDescriptor, EngineProfile, ExecutionBudget, registry
 from cpu_kernels import apply_scale_and_mask_inplace, masked_extrema, masked_sum_count, weighted_merge
 from cpu_runtime import configure_opencv_threads, configure_worker_runtime, physical_core_count
+from stacking_features import (
+    FrameScore,
+    SELECTION_PROFILES,
+    annotate_trailing,
+    build_quality_scores,
+    frame_key,
+    parse_selection_weights,
+    score_to_weight,
+)
+from image_io import (
+    IMAGE_SUFFIXES,
+    TIFF_SUFFIXES,
+    read_tiff,
+    read_tiff_sidecar_arrays,
+    tiff_shape,
+    write_npz_sidecar,
+    write_sidecar_json,
+    write_tiff,
+    validate_single_format,
+)
 
 try:
     from pyinstrument import Profiler
@@ -47,7 +67,7 @@ except ImportError:
 
 warnings.simplefilter("ignore", category=AstropyWarning)
 
-FITS_SUFFIXES = {".fits", ".fit", ".fts"}
+FITS_SUFFIXES = IMAGE_SUFFIXES
 FITS_CACHE_DIR_NAME = ".astrostack_fits_cache"
 FITS_CACHE_FORMAT_VERSION = 1
 DEFAULT_CHUNK_SIZE = 2048
@@ -76,14 +96,17 @@ class StackingConfig:
     input_dir: Path = field(default_factory=Path)
     output_dir: Path = field(default_factory=Path)
 
-    selection_mode: Literal["All", "BestPercentage"] = "BestPercentage"
+    # Keep the historical positional fields first.  New feature controls are
+    # appended below so third-party callers constructing this dataclass
+    # positionally retain the original argument mapping.
+    selection_mode: Literal["All", "BestPercentage", "MultiMetric"] = "BestPercentage"
     selection_percentage: float = 80.0
     selection_metric: Literal["quality", "fwhm", "star_count", "snr", "roundness"] = "quality"
     trail_filter_enabled: bool = False
     min_roundness: float = 0.65
     min_shape_stars: int = 5
 
-    method: Literal["Median", "Mean", "Sum", "Maximum", "Minimum"] = "Median"
+    method: Literal["Median", "Mean", "QualityWeightedMean", "Sum", "Maximum", "Minimum"] = "Median"
 
     rejection_method: Literal["None", "SigmaClip", "Winsorized", "MAD"] = "SigmaClip"
     rejection_low: float = 3.0
@@ -95,6 +118,7 @@ class StackingConfig:
     remove_background: bool = False
 
     output_name: str = "stacked_image.fits"
+    output_format: Literal["auto", "fits", "tiff"] = "auto"
     # Final presentation/output defaults to the acquisition-compatible 16-bit
     # FITS format. Internal calibration and stack math remain float32.
     output_bit_depth: Literal["16-bit"] = "16-bit"
@@ -108,6 +132,17 @@ class StackingConfig:
     cache_decompressed_fits: bool = True
     engine_profile: str = "Stable"
     reducer_engine: str | None = None
+
+    # New feature controls are intentionally appended after the legacy
+    # positional fields; keyword callers can opt into them without affecting
+    # existing integrations.
+    feature_profile: Literal["Legacy", "Intelligent"] = "Legacy"
+    selection_profile: Literal["Sharpness", "Balanced", "Signal", "Custom"] = "Balanced"
+    selection_weights: dict[str, float] = field(default_factory=dict)
+    trail_policy: Literal["off", "exclude_severe", "weight_only", "report"] = "off"
+    reduction_storage: Literal["disk_legacy", "ram", "ram_spill"] = "disk_legacy"
+    spill_directory: Path | None = None
+    spill_limit_mb: int = 0
 
     @property
     def worker_count(self) -> int:
@@ -339,6 +374,32 @@ def _classify_shape(
 
 
 def inspect_fits(filepath: Path) -> FrameGeometry:
+    if filepath.suffix.casefold() in TIFF_SUFFIXES:
+        try:
+            shape = tiff_shape(filepath)
+        except Exception:
+            data, _header = read_tiff(filepath)
+            shape = tuple(np.asarray(data).shape)
+        if len(shape) == 3 and shape[-1] in (3, 4):
+            image_kind, channels = "RGB", int(shape[-1])
+        else:
+            image_kind, channels = _classify_shape(shape, fits.Header())
+        if image_kind == "Mono":
+            height, width = shape
+        elif shape[0] in (3, 4) and shape[-1] not in (3, 4):
+            _, height, width = shape
+        else:
+            height, width, _ = shape
+        sidecars = read_tiff_sidecar_arrays(filepath)
+        mask_index = -1 if "valid_mask" in sidecars or "sat_mask" in sidecars else None
+        return FrameGeometry(
+            height=int(height), width=int(width), image_kind=image_kind,
+            channels=channels, hdu_index=0, mask_hdu_index=mask_index,
+            science_compressed=False, requires_scaling=False,
+            source_bscale=1.0, source_bzero=0.0, source_blank=None,
+            cache_raw_storage=False, cache_bscale=1.0, cache_bzero=0.0,
+            cache_blank=None,
+        )
     with (
         fits.open(
             filepath,
@@ -535,18 +596,127 @@ def trail_exclusion_reason(frame: FrameInfo, config: StackingConfig) -> str | No
     return None
 
 
+def _feature_trail_exclusion_reason(frame: FrameInfo, config: StackingConfig) -> str | None:
+    """Apply the Intelligent policy without changing the Legacy filter."""
+
+    if config.feature_profile != "Intelligent":
+        return trail_exclusion_reason(frame, config)
+    if config.trail_policy == "exclude_severe":
+        classification = str(frame.metrics.get("trail_class", "unreliable"))
+        confidence = _safe_float(frame.metrics.get("trail_confidence"), 0.0)
+        if classification == "severe" and confidence >= 0.80:
+            return "severe_trailing"
+    if config.trail_filter_enabled:
+        return trail_exclusion_reason(frame, config)
+    return None
+
+
+def _annotate_scores(
+    frames: list[FrameInfo],
+    config: StackingConfig,
+) -> dict[str, FrameScore]:
+    if config.feature_profile == "Intelligent":
+        annotate_trailing(frames)
+    if config.selection_mode != "MultiMetric" and config.method != "QualityWeightedMean":
+        return {}
+    scores = build_quality_scores(
+        frames,
+        config.selection_profile,
+        config.selection_weights,
+    )
+    for frame in frames:
+        score = scores.get(frame_key(frame))
+        if score is None:
+            continue
+        frame.metrics["quality_score"] = score.score
+        frame.metrics["quality_score_components"] = dict(score.components)
+        frame.metrics["quality_score_missing"] = list(score.missing)
+        frame.metrics["quality_score_available_weight"] = score.available_weight
+        frame.metrics["quality_score_eligible"] = score.eligible
+    return scores
+
+
+def compute_quality_weights(
+    all_frames: list[FrameInfo],
+    selected_frames: list[FrameInfo],
+    config: StackingConfig,
+    scores: dict[str, FrameScore] | None = None,
+) -> list[float]:
+    """Return bounded, explainable scalar weights in selected-frame order."""
+
+    if config.method != "QualityWeightedMean" and config.feature_profile != "Intelligent":
+        return [1.0] * len(selected_frames)
+    # Selection and weighting are consecutive consumers of the same feature
+    # snapshot.  Accepting it from the caller avoids rerunning the bounded
+    # trailing classifier and percentile ranks (which used to happen up to
+    # three times for an Intelligent/QWM stack).  Direct callers retain the
+    # old behavior by omitting the optional argument.
+    if scores is None:
+        scores = _annotate_scores(all_frames, config)
+    raw: list[float] = []
+    for frame in selected_frames:
+        assessment = str(frame.metrics.get("trail_class", "unreliable"))
+        value = score_to_weight(scores.get(frame_key(frame)), assessment)
+        if config.trail_policy == "weight_only" and assessment == "severe":
+            value = max(0.05, value)
+        elif config.trail_policy in {"off", "report"} and assessment == "severe":
+            value = max(0.25, value)
+        raw.append(float(value))
+    finite = [value for value in raw if math.isfinite(value) and value > 0]
+    median = float(np.median(np.asarray(finite, dtype=np.float64))) if finite else 1.0
+    if not math.isfinite(median) or median <= 0:
+        median = 1.0
+    normalized: list[float] = []
+    for frame, value in zip(selected_frames, raw, strict=True):
+        weight = float(np.clip(value / median, 0.25, 2.0))
+        frame.metrics["stack_weight"] = weight
+        normalized.append(weight)
+    return normalized
+
+
 def select_frames(
     all_frames: list[FrameInfo],
     config: StackingConfig,
+    scores: dict[str, FrameScore] | None = None,
 ) -> list[FrameInfo]:
     if not all_frames:
         return []
 
-    all_frames = [frame for frame in all_frames if trail_exclusion_reason(frame, config) is None]
+    if scores is None:
+        scores = _annotate_scores(all_frames, config)
+    all_frames = [
+        frame for frame in all_frames
+        if _feature_trail_exclusion_reason(frame, config) is None
+    ]
     # Metadata inspection completes out of order; ties must be reproducible.
     all_frames = sorted(all_frames, key=lambda frame: (str(frame.path).casefold(), str(frame.path)))
     if config.selection_mode == "All":
         return list(all_frames)
+
+    if config.selection_mode == "MultiMetric":
+        if scores is None:
+            scores = _annotate_scores(all_frames, config)
+        ranked = [
+            frame for frame in all_frames
+            if scores.get(frame_key(frame), FrameScore(None, {}, (), 0.0, False)).eligible
+        ]
+        ranked.sort(
+            key=lambda frame: (
+                -(scores[frame_key(frame)].score or 0.0),
+                str(frame.path).casefold(),
+                str(frame.path),
+            )
+        )
+        if not ranked:
+            # An old Flow report may not have any of the Intelligent metrics.
+            # Keep the session usable and make the fallback explicit in its
+            # selection report instead of silently rejecting every frame.
+            for frame in all_frames:
+                frame.metrics["quality_score_fallback"] = "legacy_quality"
+            ranked = list(all_frames)
+        percentage = max(1.0, min(100.0, float(config.selection_percentage)))
+        n_select = max(min(3, len(ranked)), int(len(ranked) * percentage / 100.0))
+        return ranked[: min(n_select, len(ranked))]
 
     metric_name = config.selection_metric
 
@@ -608,7 +778,7 @@ def write_selection_report(
     selected = {frame.path for frame in selected_frames}
     entries = []
     for frame in sorted(all_frames, key=lambda frame: str(frame.path)):
-        reason = trail_exclusion_reason(frame, config)
+        reason = _feature_trail_exclusion_reason(frame, config)
         if frame.path in selected:
             reason = "selected"
         elif reason is None:
@@ -620,15 +790,29 @@ def write_selection_report(
             "shape_star_count": _safe_float(frame.metrics.get("shape_star_count"), 0),
             "fwhm": _safe_float(frame.fwhm, None),
             "quality": _safe_float(frame.quality, None),
+            "trail_class": frame.metrics.get("trail_class"),
+            "trail_cause": frame.metrics.get("trail_cause"),
+            "trail_confidence": _safe_float(frame.metrics.get("trail_confidence"), None),
+            "quality_score": frame.metrics.get("quality_score"),
+            "quality_score_components": frame.metrics.get("quality_score_components", {}),
+            "quality_score_missing": frame.metrics.get("quality_score_missing", []),
+            "quality_score_available_weight": frame.metrics.get("quality_score_available_weight"),
+            "stack_weight": frame.metrics.get("stack_weight", 1.0),
         })
     report = {
         "schema_version": 1, "stage": "selection_before_stacking",
         "total_frames": len(all_frames), "selected_frames": len(selected_frames),
         "settings": {"trail_filter_enabled": config.trail_filter_enabled,
+                     "feature_profile": config.feature_profile,
                      "min_roundness": config.min_roundness,
                      "min_shape_stars": config.min_shape_stars,
                      "selection_mode": config.selection_mode,
                      "selection_metric": config.selection_metric,
+                     "selection_profile": config.selection_profile,
+                     "selection_weights": parse_selection_weights(config.selection_weights),
+                     "trail_policy": config.trail_policy,
+                     "method": config.method,
+                     "reduction_storage": config.reduction_storage,
                      "selection_percentage": config.selection_percentage},
         "frames": entries,
     }
@@ -684,6 +868,14 @@ def _load_full_valid_mask(
     geometry: FrameGeometry,
 ) -> np.ndarray | None:
     """Load a frame mask once so block reads do not decompress it repeatedly."""
+    if frame.path.suffix.casefold() in TIFF_SUFFIXES:
+        arrays = read_tiff_sidecar_arrays(frame.path)
+        values = arrays.get("valid_mask")
+        if values is None:
+            return None
+        mask = np.asarray(values, dtype=bool)
+        expected_shape = (geometry.height, geometry.width)
+        return mask if mask.shape == expected_shape else None
     if geometry.mask_hdu_index is None:
         return None
 
@@ -1038,6 +1230,55 @@ def read_frame_block(
     dst_x1 = valid_src_x1 - src_x1
     dst_x2 = dst_x1 + (valid_src_x2 - valid_src_x1)
 
+    # TIFF inputs are accepted as a compatibility path.  Prefer tifffile's
+    # memory map for uncompressed captures so a full frame is never copied;
+    # compressed TIFFs fall back to the bounded reader in image_io.
+    if frame.path.suffix.casefold() in TIFF_SUFFIXES:
+        try:
+            import tifffile
+            source = tifffile.memmap(frame.path)
+        except Exception:
+            source, _ = read_tiff(frame.path)
+        source = np.asarray(source)
+        if geometry.image_kind == "Mono":
+            raw_data = np.asarray(
+                source[valid_src_y1:valid_src_y2, valid_src_x1:valid_src_x2],
+                dtype=np.float32,
+            )
+        elif source.ndim == 3 and source.shape[0] == geometry.channels and source.shape[-1] != geometry.channels:
+            if channel is None:
+                raise ValueError("Canal não informado para imagem RGB.")
+            raw_data = np.asarray(
+                source[channel, valid_src_y1:valid_src_y2, valid_src_x1:valid_src_x2],
+                dtype=np.float32,
+            )
+        else:
+            if channel is None:
+                raise ValueError("Canal não informado para imagem RGB.")
+            raw_data = np.asarray(
+                source[valid_src_y1:valid_src_y2, valid_src_x1:valid_src_x2, channel],
+                dtype=np.float32,
+            )
+        if normalization_factor != 1.0:
+            raw_data *= np.float32(normalization_factor)
+        finite = np.isfinite(raw_data)
+        raw_mask = finite
+        if frame.valid_mask is not None:
+            raw_mask &= frame.valid_mask[valid_src_y1:valid_src_y2, valid_src_x1:valid_src_x2]
+        else:
+            arrays = read_tiff_sidecar_arrays(frame.path)
+            valid_sidecar = arrays.get("valid_mask")
+            sat_sidecar = arrays.get("sat_mask")
+            if valid_sidecar is not None:
+                raw_mask &= np.asarray(valid_sidecar[valid_src_y1:valid_src_y2, valid_src_x1:valid_src_x2], dtype=bool)
+            if sat_sidecar is not None:
+                raw_mask &= ~np.asarray(sat_sidecar[valid_src_y1:valid_src_y2, valid_src_x1:valid_src_x2], dtype=bool)
+        if not finite.all():
+            raw_data = np.where(finite, raw_data, 0.0).astype(np.float32, copy=False)
+        data_out[dst_y1:dst_y2, dst_x1:dst_x2] = raw_data
+        mask_out[dst_y1:dst_y2, dst_x1:dst_x2] = raw_mask
+        return BlockRead(data=data_out, mask=np.asarray(mask_out, dtype=bool))
+
     with fits.open(
         frame.path,
         memmap=False,
@@ -1051,7 +1292,7 @@ def read_frame_block(
                 image_hdu,
                 (slice(valid_src_y1, valid_src_y2), slice(valid_src_x1, valid_src_x2)),
             )
-        elif image_hdu.shape[0] in (3, 4):
+        elif image_hdu.shape[0] == geometry.channels:
             if channel is None:
                 raise ValueError("Canal não informado para imagem RGB.")
 
@@ -1122,6 +1363,31 @@ def load_normalization_sample(
     geometry: FrameGeometry,
     max_samples: int,
 ) -> tuple[np.ndarray, np.ndarray | None]:
+    if frame.path.suffix.casefold() in TIFF_SUFFIXES:
+        try:
+            import tifffile
+            source = np.asarray(tifffile.memmap(frame.path))
+        except Exception:
+            source, _ = read_tiff(frame.path)
+            source = np.asarray(source)
+        height, width = geometry.height, geometry.width
+        pixels = max(1, height * width)
+        spatial_step = max(1, int(math.sqrt(pixels / max(1, max_samples))))
+        if geometry.image_kind == "Mono":
+            sample = source[0:height:spatial_step, 0:width:spatial_step]
+        elif source.ndim == 3 and source.shape[-1] in (3, 4):
+            sample = np.moveaxis(source[0:height:spatial_step, 0:width:spatial_step, :], -1, 0)
+        else:
+            sample = source[:, 0:height:spatial_step, 0:width:spatial_step]
+        arrays = read_tiff_sidecar_arrays(frame.path)
+        mask = arrays.get("valid_mask")
+        sat = arrays.get("sat_mask")
+        if mask is not None:
+            mask = np.asarray(mask[0:height:spatial_step, 0:width:spatial_step], dtype=bool)
+        if sat is not None:
+            sat_mask = np.asarray(sat[0:height:spatial_step, 0:width:spatial_step], dtype=bool)
+            mask = ~sat_mask if mask is None else mask & ~sat_mask
+        return np.asarray(sample, dtype=np.float32), mask
     with fits.open(
         frame.path,
         memmap=False,
@@ -1148,7 +1414,7 @@ def load_normalization_sample(
                 image_hdu,
                 (y_slice, x_slice),
             )
-        elif shape[0] in (3, 4):
+        elif shape[0] == geometry.channels:
             sample = _read_hdu_section(
                 image_hdu,
                 (slice(None), y_slice, x_slice),
@@ -1534,6 +1800,153 @@ def _reject_cpu(
         )
 
 
+def _weighted_rejection_values(
+    values: np.ndarray,
+    masks: np.ndarray,
+    method: str,
+    low: float,
+    high: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return values and an acceptance mask for ``QualityWeightedMean``.
+
+    The center/dispersion calculation intentionally ignores quality weights;
+    otherwise one high-weight artifact could influence the rejection boundary
+    that is supposed to protect the stack.  Weighted accumulation happens
+    only after this deterministic Stable mask has been computed.
+    """
+
+    values = np.asarray(values, dtype=np.float32)
+    masked = values.astype(np.float32, copy=True)
+    valid_input = np.asarray(masks, dtype=bool) & ~np.isnan(masked)
+    masked[~valid_input] = np.nan
+    if method == "None" or values.shape[0] <= 3:
+        return masked, valid_input
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        if method == "SigmaClip":
+            center = _nanmedian_axis0_no_warning(masked)
+            spread = np.nanstd(masked, axis=0)
+            lower = center - np.float32(low) * spread
+            upper = center + np.float32(high) * spread
+            accepted = (masked >= lower) & (masked <= upper)
+            accepted |= ~(np.isfinite(spread) & (spread > 1e-10))
+        elif method == "MAD":
+            center = _nanmedian_axis0_no_warning(masked)
+            mad = _nanmedian_axis0_no_warning(np.abs(masked - center))
+            spread = np.float32(1.4826) * mad
+            lower = center - np.float32(low) * spread
+            upper = center + np.float32(high) * spread
+            accepted = (masked >= lower) & (masked <= upper)
+            accepted |= ~(np.isfinite(mad) & (mad > 1e-10))
+        elif method == "Winsorized":
+            p_low = _nanpercentile_axis0(masked, min(49.0, max(0.0, low * 10.0)))
+            p_high = _nanpercentile_axis0(masked, max(51.0, min(100.0, 100.0 - high * 10.0)))
+            valid_range = np.isfinite(p_low) & np.isfinite(p_high) & (p_high >= p_low)
+            clipped = np.where(valid_range, np.clip(masked, p_low, p_high), masked)
+            return clipped, valid_input
+        else:
+            raise ValueError(f"Unsupported rejection method: {method}")
+    accepted &= valid_input
+    masked[~accepted] = np.nan
+    return masked, accepted
+
+
+def _quality_weighted_mean(
+    values: np.ndarray,
+    masks: np.ndarray,
+    rejection_method: str,
+    low: float,
+    high: float,
+    frame_weights: np.ndarray,
+) -> np.ndarray:
+    result, _denominator = _quality_weighted_reduce(
+        values,
+        masks,
+        rejection_method,
+        low,
+        high,
+        frame_weights,
+    )
+    return result
+
+
+def _quality_weighted_reduce(
+    values: np.ndarray,
+    masks: np.ndarray,
+    rejection_method: str,
+    low: float,
+    high: float,
+    frame_weights: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return a weighted mean and its per-pixel effective weight sum."""
+
+    if values.ndim != 3 or masks.shape != values.shape:
+        raise ValueError("Bloco inválido para média ponderada.")
+    weights = np.asarray(frame_weights, dtype=np.float32).reshape(-1)
+    if weights.size != values.shape[0]:
+        raise ValueError("Número de pesos incompatível com o bloco.")
+    weights = np.clip(np.nan_to_num(weights, nan=0.0, posinf=2.0, neginf=0.0), 0.0, 2.0)
+    reduced, accepted = _weighted_rejection_values(
+        values,
+        masks,
+        rejection_method,
+        low,
+        high,
+    )
+    finite = accepted & ~np.isnan(reduced)
+    expanded_weights = weights[:, None, None]
+    weighted = np.where(finite, reduced, np.float32(0.0)) * expanded_weights
+    denominator = np.sum(np.where(finite, expanded_weights, np.float32(0.0)), axis=0, dtype=np.float32)
+    numerator = np.sum(weighted, axis=0, dtype=np.float32)
+    result = np.divide(
+        numerator,
+        denominator,
+        out=np.zeros_like(numerator, dtype=np.float32),
+        where=denominator > 0,
+    ).astype(np.float32, copy=False)
+    return result, denominator.astype(np.float32, copy=False)
+
+
+def _quality_weighted_merge(
+    values: np.ndarray,
+    masks: np.ndarray,
+    weight_sums: np.ndarray,
+    rejection_method: str,
+    low: float,
+    high: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Merge weighted child nodes while retaining deterministic rejection."""
+
+    if values.ndim != 3 or masks.shape != values.shape or weight_sums.shape != values.shape:
+        raise ValueError("Nós incompatíveis para média ponderada.")
+    reduced, accepted = _weighted_rejection_values(
+        values,
+        masks,
+        rejection_method,
+        low,
+        high,
+    )
+    finite = accepted & ~np.isnan(reduced)
+    effective = np.where(
+        finite,
+        np.asarray(weight_sums, dtype=np.float32),
+        np.float32(0.0),
+    )
+    numerator = np.sum(
+        np.where(finite, reduced * effective, np.float32(0.0)),
+        axis=0,
+        dtype=np.float32,
+    )
+    denominator = np.sum(effective, axis=0, dtype=np.float32)
+    result = np.divide(
+        numerator,
+        denominator,
+        out=np.zeros_like(numerator, dtype=np.float32),
+        where=denominator > 0,
+    )
+    return result.astype(np.float32, copy=False), denominator.astype(np.float32, copy=False)
+
+
 def reject_and_combine_block(
     values: np.ndarray,
     masks: np.ndarray,
@@ -1545,11 +1958,24 @@ def reject_and_combine_block(
     engine_profile: str = "Stable",
     reducer_engine: str | None = None,
     kernel_parallel: bool = False,
+    frame_weights: np.ndarray | list[float] | tuple[float, ...] | None = None,
 ) -> np.ndarray:
     check_cancel(cancel_event)
 
     if values.ndim != 3 or masks.shape != values.shape:
         raise ValueError("Bloco inválido para rejeição.")
+
+    if combine_method == "QualityWeightedMean":
+        if frame_weights is None:
+            frame_weights = np.ones(values.shape[0], dtype=np.float32)
+        return _quality_weighted_mean(
+            values,
+            masks,
+            rejection_method if rejection_method != "None" else "None",
+            low,
+            high,
+            np.asarray(frame_weights, dtype=np.float32),
+        )
 
     if rejection_method == "None" or values.shape[0] <= 3:
         rejection_method = "None"
@@ -1630,6 +2056,14 @@ def _open_streaming_fits(
     ``requires_scaling`` flag.  The probe remains as a compatibility fallback
     for callers that do not have geometry available.
     """
+    if path.suffix.casefold() in TIFF_SUFFIXES:
+        try:
+            import tifffile
+            data = tifffile.memmap(path)
+        except Exception:
+            data, _ = read_tiff(path)
+        return fits.HDUList([fits.PrimaryHDU(data=np.asarray(data))])
+
     if geometry is None:
         with fits.open(
             path,
@@ -1668,6 +2102,7 @@ def _process_substack(
     cancel_event: threading.Event | None,
     leaf_index: int = 0,
     progress_queue: queue.SimpleQueue[tuple[int, int, str]] | None = None,
+    frame_weights: list[float] | None = None,
 ) -> SubstackInfo:
     """Create one leaf using wide row bands and a bounded number of files."""
     group_size = len(frames)
@@ -1676,6 +2111,10 @@ def _process_substack(
     shape = (height, width) if channels == 1 else (channels, height, width)
     result = np.zeros(shape, dtype=np.float32)
     counts = np.zeros((height, width), dtype=np.uint32)
+    weight_sums = np.zeros(shape, dtype=np.float32) if config.method == "QualityWeightedMean" else None
+    local_weights = np.asarray(frame_weights if frame_weights is not None else [1.0] * group_size, dtype=np.float32)
+    if local_weights.size != group_size:
+        raise ValueError("Número de pesos incompatível com a folha.")
 
     def report(increment: int, message: str) -> None:
         if progress_queue is not None:
@@ -1763,7 +2202,8 @@ def _process_substack(
                         last_frame_report = now
                     geometry = geometries[frame.path]
                     hdu = hdul[geometry.hdu_index]
-                    if hdu.shape[0] in (3, 4):
+                    channels_first = frame.path.suffix.casefold() not in TIFF_SUFFIXES
+                    if channels_first:
                         raw = _read_hdu_section(
                             hdu,
                             (
@@ -1802,18 +2242,29 @@ def _process_substack(
                     f"Leaf {leaf_index + 1}: combining band {band_index}/{total_bands}",
                 )
                 for channel in range(channels):
-                    combined = reject_and_combine_block(
-                        values[:, channel],
-                        masks[:, channel],
-                        config.method,
-                        config.rejection_method,
-                        config.rejection_low,
-                        config.rejection_high,
-                        cancel_event,
-                        config.engine_profile,
-                        config.reducer_engine,
-                        ExecutionBudget.for_pipeline(config.worker_count).kernel_parallel,
-                    )
+                    if config.method == "QualityWeightedMean":
+                        combined, effective = _quality_weighted_reduce(
+                            values[:, channel],
+                            masks[:, channel],
+                            config.rejection_method,
+                            config.rejection_low,
+                            config.rejection_high,
+                            local_weights,
+                        )
+                        weight_sums[channel, y1:y2] = effective
+                    else:
+                        combined = reject_and_combine_block(
+                            values[:, channel],
+                            masks[:, channel],
+                            config.method,
+                            config.rejection_method,
+                            config.rejection_low,
+                            config.rejection_high,
+                            cancel_event,
+                            config.engine_profile,
+                            config.reducer_engine,
+                            ExecutionBudget.for_pipeline(config.worker_count).kernel_parallel,
+                        )
                     result[channel, y1:y2] = combined
                 counts[y1:y2] = masks[:, 0].sum(axis=0, dtype=np.uint32)
             else:
@@ -1853,24 +2304,26 @@ def _process_substack(
                         hdu = hdul[geometry.hdu_index]
                         if geometry.image_kind == "Mono":
                             raw = _read_hdu_section(hdu, (slice(y1, y2), slice(0, width)))
-                        elif hdu.shape[0] in (3, 4):
-                            raw = _read_hdu_section(
-                                hdu,
-                                (
-                                    slice(channel, channel + 1),
-                                    slice(y1, y2),
-                                    slice(0, width),
-                                ),
-                            )[0]
                         else:
-                            raw = _read_hdu_section(
-                                hdu,
-                                (
-                                    slice(y1, y2),
-                                    slice(0, width),
-                                    slice(channel, channel + 1),
-                                ),
-                            )[:, :, 0]
+                            channels_first = frame.path.suffix.casefold() not in TIFF_SUFFIXES
+                            if channels_first:
+                                raw = _read_hdu_section(
+                                    hdu,
+                                    (
+                                        slice(channel, channel + 1),
+                                        slice(y1, y2),
+                                        slice(0, width),
+                                    ),
+                                )[0]
+                            else:
+                                raw = _read_hdu_section(
+                                    hdu,
+                                    (
+                                        slice(y1, y2),
+                                        slice(0, width),
+                                        slice(channel, channel + 1),
+                                    ),
+                                )[:, :, 0]
                         raw = _restore_streaming_physical_values(raw, geometry)
                         mask = np.isfinite(raw)
                         if band_masks is not None and band_masks[index] is not None:
@@ -1889,18 +2342,32 @@ def _process_substack(
                         0,
                         f"Leaf {leaf_index + 1}: combining band {band_index}/{total_bands}",
                     )
-                    combined = reject_and_combine_block(
-                        values,
-                        masks,
-                        config.method,
-                        config.rejection_method,
-                        config.rejection_low,
-                        config.rejection_high,
-                        cancel_event,
-                        config.engine_profile,
-                        config.reducer_engine,
-                        ExecutionBudget.for_pipeline(config.worker_count).kernel_parallel,
-                    )
+                    if config.method == "QualityWeightedMean":
+                        combined, effective = _quality_weighted_reduce(
+                            values,
+                            masks,
+                            config.rejection_method,
+                            config.rejection_low,
+                            config.rejection_high,
+                            local_weights,
+                        )
+                        if channels == 1:
+                            weight_sums[y1:y2] = effective
+                        else:
+                            weight_sums[channel, y1:y2] = effective
+                    else:
+                        combined = reject_and_combine_block(
+                            values,
+                            masks,
+                            config.method,
+                            config.rejection_method,
+                            config.rejection_low,
+                            config.rejection_high,
+                            cancel_event,
+                            config.engine_profile,
+                            config.reducer_engine,
+                            ExecutionBudget.for_pipeline(config.worker_count).kernel_parallel,
+                        )
                     if channels == 1:
                         result[y1:y2] = combined
                     else:
@@ -1916,13 +2383,14 @@ def _process_substack(
             handle.close()
 
     mask = counts > 0
-    fits.HDUList(
-        [
-            fits.PrimaryHDU(result),
-            fits.ImageHDU(mask.astype(np.uint8), name="VALID_MASK"),
-            fits.ImageHDU(counts, name="SUB_COUNT"),
-        ]
-    ).writeto(output_path, overwrite=True)
+    hdus = [
+        fits.PrimaryHDU(result),
+        fits.ImageHDU(mask.astype(np.uint8), name="VALID_MASK"),
+        fits.ImageHDU(counts, name="SUB_COUNT"),
+    ]
+    if weight_sums is not None:
+        hdus.append(fits.ImageHDU(np.asarray(weight_sums, dtype=np.float32), name="SUB_WEIGHT"))
+    fits.HDUList(hdus).writeto(output_path, overwrite=True)
     return SubstackInfo(output_path, group_size)
 
 
@@ -1931,10 +2399,12 @@ def _combine_substacks(
     config: StackingConfig,
     total_frames: int,
     cancel_event: threading.Event | None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    return_weight: bool = False,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     data_list: list[np.ndarray] = []
     masks: list[np.ndarray] = []
     counts: list[np.ndarray] = []
+    weights_list: list[np.ndarray] = []
     for substack in substacks:
         check_cancel(cancel_event)
         # This reducer already materializes every child in memory. Avoid mmap
@@ -1943,6 +2413,15 @@ def _combine_substacks(
             data_list.append(np.array(hdul[0].data, dtype=np.float32, copy=True))
             masks.append(np.array(hdul["VALID_MASK"].data, dtype=bool, copy=True))
             counts.append(np.array(hdul["SUB_COUNT"].data, dtype=np.uint32, copy=True))
+            if config.method == "QualityWeightedMean":
+                if "SUB_WEIGHT" in hdul:
+                    weights_list.append(np.array(hdul["SUB_WEIGHT"].data, dtype=np.float32, copy=True))
+                else:
+                    child_data = data_list[-1]
+                    child_count = counts[-1].astype(np.float32)
+                    if child_data.ndim == 3:
+                        child_count = np.broadcast_to(child_count[None, :, :], child_data.shape)
+                    weights_list.append(np.array(child_count, dtype=np.float32, copy=True))
 
     # Materialize each child exactly once.  The previous reducer called
     # ``np.stack(counts)`` repeatedly for coverage and weighted merge, keeping
@@ -1951,6 +2430,7 @@ def _combine_substacks(
     masks_stack = np.stack(masks)
     counts_stack = np.stack(counts)
     del data_list, masks, counts
+    weights_stack = np.stack(weights_list) if weights_list else None
 
     # Se a saída for RGB (4D: [N_substacks, Canais, Altura, Largura])
     # a máscara e a contagem que estão em 3D [N_substacks, Altura, Largura] precisam se expandir.
@@ -1967,7 +2447,31 @@ def _combine_substacks(
     threshold = max(1, math.ceil(total_frames * 0.70))
     final_mask = coverage >= threshold
 
-    if config.method == "Mean" and config.rejection_method == "None":
+    if config.method == "QualityWeightedMean":
+        if weights_stack is None:
+            raise ValueError("SUB_WEIGHT ausente na média ponderada.")
+        if values.ndim == 3:
+            result, result_weights = _quality_weighted_merge(
+                values,
+                valid,
+                weights_stack,
+                config.rejection_method,
+                config.rejection_low,
+                config.rejection_high,
+            )
+        else:
+            result = np.empty(values.shape[1:], dtype=np.float32)
+            result_weights = np.empty(values.shape[1:], dtype=np.float32)
+            for channel in range(values.shape[1]):
+                result[channel], result_weights[channel] = _quality_weighted_merge(
+                    values[:, channel],
+                    valid[:, channel],
+                    weights_stack[:, channel],
+                    config.rejection_method,
+                    config.rejection_low,
+                    config.rejection_high,
+                )
+    elif config.method == "Mean" and config.rejection_method == "None":
         if EngineProfile.coerce(config.engine_profile) is EngineProfile.FAST:
             result = weighted_merge(values, counts_stack)
         else:
@@ -2009,7 +2513,14 @@ def _combine_substacks(
                     config.reducer_engine,
                     ExecutionBudget.for_pipeline(config.worker_count).kernel_parallel,
                 )
-    return np.asarray(result, dtype=np.float32), final_mask, coverage
+    result_tuple = (
+        np.asarray(result, dtype=np.float32),
+        final_mask,
+        coverage,
+    )
+    if config.method == "QualityWeightedMean" and return_weight:
+        return result_tuple + (np.asarray(result_weights, dtype=np.float32),)
+    return result_tuple
 
 
 def _write_substack(
@@ -2017,14 +2528,16 @@ def _write_substack(
     data: np.ndarray,
     valid_mask: np.ndarray,
     coverage: np.ndarray,
+    weight_sums: np.ndarray | None = None,
 ) -> None:
-    fits.HDUList(
-        [
-            fits.PrimaryHDU(np.asarray(data, dtype=np.float32)),
-            fits.ImageHDU(np.asarray(valid_mask, dtype=np.uint8), name="VALID_MASK"),
-            fits.ImageHDU(np.asarray(coverage, dtype=np.uint32), name="SUB_COUNT"),
-        ]
-    ).writeto(path, overwrite=True)
+    hdus = [
+        fits.PrimaryHDU(np.asarray(data, dtype=np.float32)),
+        fits.ImageHDU(np.asarray(valid_mask, dtype=np.uint8), name="VALID_MASK"),
+        fits.ImageHDU(np.asarray(coverage, dtype=np.uint32), name="SUB_COUNT"),
+    ]
+    if weight_sums is not None:
+        hdus.append(fits.ImageHDU(np.asarray(weight_sums, dtype=np.float32), name="SUB_WEIGHT"))
+    fits.HDUList(hdus).writeto(path, overwrite=True)
 
 
 def _process_branch(
@@ -2034,13 +2547,19 @@ def _process_branch(
     cancel_event: threading.Event | None,
 ) -> SubstackInfo:
     total_frames = sum(child.frame_count for child in children)
-    data, valid_mask, coverage = _combine_substacks(
+    combined = _combine_substacks(
         children,
         config,
         total_frames,
         cancel_event,
+        return_weight=config.method == "QualityWeightedMean",
     )
-    _write_substack(output_path, data, valid_mask, coverage)
+    if config.method == "QualityWeightedMean":
+        data, valid_mask, coverage, weight_sums = combined
+    else:
+        data, valid_mask, coverage = combined
+        weight_sums = None
+    _write_substack(output_path, data, valid_mask, coverage, weight_sums)
     return SubstackInfo(output_path, total_frames)
 
 
@@ -2112,6 +2631,7 @@ def _create_substacks(
     progress_callback: Callable[[int, int, str], None] | None,
     status_callback: Callable[[str], None] | None,
     cancel_event: threading.Event | None,
+    frame_weights: list[float] | None = None,
 ) -> list[SubstackInfo]:
 
     workers = _hierarchical_worker_count(config, len(selected_frames))
@@ -2119,6 +2639,7 @@ def _create_substacks(
     groups = _partition_frames(selected_frames, leaf_count)
     factor_groups = _partition_frames(normalization_factors, leaf_count)
     shift_groups = _partition_frames(dither_shifts, leaf_count)
+    weight_groups = _partition_frames(frame_weights or [1.0] * len(selected_frames), leaf_count)
     results: list[SubstackInfo] = []
     progress_queue: queue.SimpleQueue[tuple[int, int, str]] = queue.SimpleQueue()
     band_totals = [
@@ -2152,9 +2673,10 @@ def _create_substacks(
                 cancel_event,
                 index,
                 progress_queue,
+                weights,
             ): index
-            for index, (group, factors, shifts) in enumerate(
-                zip(groups, factor_groups, shift_groups, strict=True)
+            for index, (group, factors, shifts, weights) in enumerate(
+                zip(groups, factor_groups, shift_groups, weight_groups, strict=True)
             )
         }
         pending = set(futures)
@@ -2395,6 +2917,18 @@ def prepare_output_header(
             config.selection_metric,
             "Selection metric",
         ),
+        "STACK_PROF": (
+            config.feature_profile,
+            "Feature policy profile",
+        ),
+        "STACK_STOR": (
+            config.reduction_storage,
+            "Reduction storage policy",
+        ),
+        "STACK_WGTP": (
+            config.selection_profile,
+            "Quality weight profile",
+        ),
         "STACK_REJ": (
             config.rejection_method if config.rejection_method != "None" else "NONE",
             "Outlier rejection",
@@ -2537,6 +3071,39 @@ def write_stack_output(
         exist_ok=True,
     )
 
+    if output_path.suffix.casefold() in TIFF_SUFFIXES:
+        # TIFF has no FITS extension HDUs.  Keep the visible product Siril-
+        # compatible and publish the validity plane as a compact sidecar.
+        tiff_data = np.asarray(data_to_save)
+        if tiff_data.ndim == 3 and tiff_data.shape[0] in (3, 4) and tiff_data.shape[-1] not in (3, 4):
+            tiff_data = np.moveaxis(tiff_data, 0, -1)
+        write_tiff(
+            output_path,
+            tiff_data,
+            metadata={
+                "schema_version": 1,
+                "format": "TIFF",
+                "bit_depth": 16,
+                "linear": True,
+            },
+        )
+        write_npz_sidecar(
+            output_path.with_suffix(output_path.suffix + ".astrobatch.npz"),
+            valid_mask=np.asarray(mask, dtype=np.uint8),
+        )
+        write_sidecar_json(
+            output_path.with_suffix(output_path.suffix + ".json"),
+            {
+                "schema_version": 1,
+                "format": "TIFF",
+                "bit_depth": 16,
+                "linear": True,
+                "valid_mask_sidecar": output_path.name + ".astrobatch.npz",
+                "header": {str(k): str(v) for k, v in header.items()},
+            },
+        )
+        return
+
     temporary = output_path.with_name(output_path.name + ".tmp")
 
     if temporary.exists():
@@ -2594,6 +3161,9 @@ def write_stack_output(
 
 
 def load_source_header(filepath: Path) -> fits.Header:
+    if filepath.suffix.casefold() in TIFF_SUFFIXES:
+        _data, header = read_tiff(filepath)
+        return header.copy()
     with fits.open(
         filepath,
         memmap=False,
@@ -2608,9 +3178,12 @@ def _validate_config(config: StackingConfig) -> None:
         raise ValueError("A circularidade mínima deve estar entre 0 e 1.")
     if not isinstance(config.min_shape_stars, int) or not 1 <= config.min_shape_stars <= 64:
         raise ValueError("O mínimo de estrelas medidas deve ser um inteiro entre 1 e 64.")
+    if config.feature_profile not in {"Legacy", "Intelligent"}:
+        raise ValueError(f"Perfil de features inválido: {config.feature_profile}")
     if config.method not in {
         "Median",
         "Mean",
+        "QualityWeightedMean",
         "Sum",
         "Maximum",
         "Minimum",
@@ -2628,17 +3201,42 @@ def _validate_config(config: StackingConfig) -> None:
     if config.selection_mode not in {
         "All",
         "BestPercentage",
+        "MultiMetric",
     }:
         raise ValueError(f"Modo de seleção inválido: {config.selection_mode}")
+    if config.selection_profile not in {"Sharpness", "Balanced", "Signal", "Custom"}:
+        raise ValueError(f"Perfil de seleção inválido: {config.selection_profile}")
+    parsed_weights = parse_selection_weights(config.selection_weights)
+    if config.selection_profile == "Custom" and not parsed_weights:
+        raise ValueError(
+            "selection_weights deve conter pelo menos um peso positivo e finito."
+        )
+    if config.trail_policy not in {"off", "exclude_severe", "weight_only", "report"}:
+        raise ValueError(f"Política de trailing inválida: {config.trail_policy}")
+    if config.reduction_storage not in {"disk_legacy", "ram", "ram_spill"}:
+        raise ValueError(f"Armazenamento de redução inválido: {config.reduction_storage}")
+    if config.reduction_storage == "ram_spill":
+        if config.spill_directory is None:
+            raise ValueError("spill_directory é obrigatório quando o spill está habilitado.")
+        if int(config.spill_limit_mb) < 256:
+            raise ValueError("spill_limit_mb deve ser pelo menos 256 MiB.")
+    elif int(config.spill_limit_mb) < 0:
+        raise ValueError("spill_limit_mb não pode ser negativo.")
 
     if config.output_bit_depth != "16-bit":
         raise ValueError(f"Profundidade inválida: {config.output_bit_depth}")
+    if config.output_format not in {"auto", "fits", "tiff"}:
+        raise ValueError(f"Formato de saída inválido: {config.output_format}")
 
     if config.selection_percentage <= 0:
         raise ValueError("selection_percentage deve ser > 0.")
 
     if config.chunk_size <= 0:
         raise ValueError("chunk_size deve ser > 0.")
+    if int(config.memory_budget_mb) < 64:
+        raise ValueError("memory_budget_mb deve ser pelo menos 64 MiB.")
+    if config.workers is not None and int(config.workers) < 1:
+        raise ValueError("workers deve ser pelo menos 1.")
 
 
 def process_stacking(
@@ -2704,18 +3302,53 @@ def process_stacking(
                 "reason": "input_dir_not_found",
             }
 
+        # Compact Align publishes one manifest per acquisition batch.  When
+        # present, consume those scientific states directly instead of
+        # treating each master as a single exposure.
+        from batch_compaction import combine_bundles, discover_batch_bundles
+
+        batch_manifests = discover_batch_bundles(config.input_dir)
+        if batch_manifests:
+            log(f"[Stack] {len(batch_manifests)} pré-stacks por batch encontrados.")
+            return combine_bundles(
+                batch_manifests,
+                method=config.method,
+                output_path=config.output_dir / config.output_name,
+                compress_output=config.compress_output,
+                rejection_method=config.rejection_method,
+                rejection_low=config.rejection_low,
+                rejection_high=config.rejection_high,
+                output_format=config.output_format,
+            )
+
         fits_files, batch_metadata = discover_aligned_frames(config.input_dir)
 
         check_cancel(cancel_event)
 
         if not fits_files:
-            log(f"❌ Nenhum arquivo FITS encontrado em: {config.input_dir}")
+            log(f"❌ Nenhum arquivo FITS/TIFF encontrado em: {config.input_dir}")
             return {
                 "status": "error",
                 "reason": "no_fits_files",
             }
 
-        log(f"📁 Total de {len(fits_files)} arquivos FITS encontrados.")
+        try:
+            source_format = validate_single_format(fits_files)
+        except ValueError as exc:
+            log(f"[Stack] ERRO: {exc}")
+            return {"status": "error", "reason": "mixed_input_format", "error": str(exc)}
+        if config.output_format != "auto" and config.output_format != source_format.value:
+            message = (
+                f"Formato de saída incompatível: a sessão usa {source_format.value.upper()}, "
+                f"mas foi solicitado {config.output_format.upper()}."
+            )
+            log(f"[Stack] ERRO: {message}")
+            return {"status": "error", "reason": "output_format_mismatch", "error": message}
+        expected_suffixes = {".fit", ".fits", ".fts"} if source_format.value == "fits" else {".tif", ".tiff"}
+        if Path(config.output_name).suffix.casefold() not in expected_suffixes:
+            config = replace(config, output_name=Path(config.output_name).with_suffix(source_format.default_suffix).name)
+
+        log(f"📁 Total de {len(fits_files)} arquivos FITS/TIFF encontrados.")
 
         flow_cache = load_flow_cache(
             config.base_dir,
@@ -2749,11 +3382,24 @@ def process_stacking(
                 "reason": "no_valid_frames",
             }
 
+        # Build the Intelligent feature snapshot once and share it between
+        # selection and weighting.  Both operations are pure policy over the
+        # inspected metadata; repeating the trailing/MAD pass here only adds
+        # latency and can create avoidable temporary mappings on large
+        # sessions.
+        feature_scores = _annotate_scores(all_frames, config)
         selected_frames = select_frames(
             all_frames,
             config,
+            scores=feature_scores,
         )
 
+        frame_weights = compute_quality_weights(
+            all_frames,
+            selected_frames,
+            config,
+            scores=feature_scores,
+        )
         report_path = write_selection_report(all_frames, selected_frames, config)
         log(f"[Stack] Relatório de seleção: {report_path}")
         if config.trail_filter_enabled:
@@ -2822,7 +3468,11 @@ def process_stacking(
 
             geometries[frame.path] = geometry
 
-        if config.cache_decompressed_fits:
+        # The Intelligent RAM reducer reads source FITS directly in bounded
+        # row bands. Building the legacy persistent decompression cache here
+        # would defeat the RAM-first contract and can consume tens of GiB on
+        # a dedicated-camera session, so it is disabled for in-memory modes.
+        if config.cache_decompressed_fits and config.reduction_storage == "disk_legacy":
             cache_dir = config.input_dir / FITS_CACHE_DIR_NAME
             cache_candidates = [
                 frame
@@ -2874,10 +3524,19 @@ def process_stacking(
             for frame in selected_frames
             if frame.has_valid_mask
         )
-        mask_budget = max(
-            16 * 1024 * 1024,
-            int(config.memory_budget_mb * 1024 * 1024 * 0.25),
-        )
+        # RAM-first reductions account for every resident allocation inside
+        # their own guard.  Do not pre-load a full VALID_MASK per frame in
+        # that path: even a seemingly small 25% slice of the configured
+        # budget can become a multi-gigabyte, untracked allocation on a long
+        # dedicated-camera session.  The bounded reducer reads mask bands
+        # from its already-open FITS handles instead.
+        if config.reduction_storage in {"ram", "ram_spill"}:
+            mask_budget = 0
+        else:
+            mask_budget = max(
+                16 * 1024 * 1024,
+                int(config.memory_budget_mb * 1024 * 1024 * 0.25),
+            )
         if mask_bytes <= mask_budget:
             for frame in selected_frames:
                 if not frame.has_valid_mask:
@@ -2941,6 +3600,32 @@ def process_stacking(
             log,
         )
 
+        if config.reduction_storage in {"ram", "ram_spill"}:
+            from ram_stack_logic import run_ram_stack
+
+            log(
+                "[Stack] Redução limitada pela RAM ativada; FITS de origem serão "
+                "somente leitura e nenhum substack FITS será criado."
+            )
+            return run_ram_stack(
+                selected_frames=selected_frames,
+                all_frames=all_frames,
+                geometries=geometries,
+                normalization_factors=normalization_factors,
+                dither_shifts=dither_shifts,
+                frame_weights=frame_weights,
+                config=config,
+                report_path=report_path,
+                total_frames=len(selected_frames),
+                n_batches=len(batch_metadata),
+                avg_quality=avg_quality,
+                avg_star_count=avg_star_count,
+                avg_fwhm=avg_fwhm,
+                progress_callback=progress,
+                status_callback=log,
+                cancel_event=cancel_event,
+            )
+
         leaf_workers = _hierarchical_worker_count(config, len(selected_frames))
         log(f"Hierarchical stacking: {leaf_workers} bounded leaf workers")
         config.output_dir.mkdir(parents=True, exist_ok=True)
@@ -2960,6 +3645,7 @@ def process_stacking(
                 progress,
                 log,
                 cancel_event,
+                frame_weights,
             )
             substacks = _reduce_substacks_tree(
                 substacks,
@@ -3031,6 +3717,12 @@ def process_stacking(
             "hierarchical": True,
             "background_removed": bool(config.remove_background),
             "dither_correction": bool(config.apply_dither_correction),
+            "feature_profile": config.feature_profile,
+            "reduction_storage": config.reduction_storage,
+            "quality_weighted": config.method == "QualityWeightedMean",
+            "weight_min": min(frame_weights) if frame_weights else 1.0,
+            "weight_median": float(np.median(frame_weights)) if frame_weights else 1.0,
+            "weight_max": max(frame_weights) if frame_weights else 1.0,
             "batches": {
                 name: meta["frame_count"] for name, meta in batch_metadata.items()
             },
@@ -3077,14 +3769,24 @@ def _build_config_from_dict(
         except (TypeError, ValueError):
             workers = None
 
+    feature_profile = str(config_dict.get("feature_profile", "Legacy"))
+    if feature_profile not in {"Legacy", "Intelligent"}:
+        feature_profile = "Legacy"
+    default_selection_mode = "MultiMetric" if feature_profile == "Intelligent" else "BestPercentage"
+    default_method = "QualityWeightedMean" if feature_profile == "Intelligent" else "Median"
+    default_storage = "ram" if feature_profile == "Intelligent" else "disk_legacy"
+    default_trail_policy = "exclude_severe" if feature_profile == "Intelligent" else "off"
+    spill_directory = config_dict.get("spill_directory")
+    spill_path = Path(spill_directory).expanduser().resolve() if spill_directory else None
+    raw_weights = config_dict.get("selection_weights", {})
+    selection_weights = parse_selection_weights(raw_weights)
+
     return StackingConfig(
         base_dir=Path(config_dict.get("base_dir", "")),
         input_dir=Path(input_dir),
         output_dir=Path(config_dict.get("output_dir", "")),
-        selection_mode=config_dict.get(
-            "selection_mode",
-            "BestPercentage",
-        ),
+        feature_profile=feature_profile,
+        selection_mode=config_dict.get("selection_mode", default_selection_mode),
         selection_percentage=float(
             config_dict.get(
                 "selection_percentage",
@@ -3095,13 +3797,13 @@ def _build_config_from_dict(
             "selection_metric",
             "quality",
         ),
+        selection_profile=config_dict.get("selection_profile", "Balanced"),
+        selection_weights=selection_weights,
         trail_filter_enabled=bool(config_dict.get("trail_filter_enabled", False)),
         min_roundness=float(config_dict.get("min_roundness", 0.65)),
         min_shape_stars=int(shape_count),
-        method=config_dict.get(
-            "method",
-            "Median",
-        ),
+        trail_policy=config_dict.get("trail_policy", default_trail_policy),
+        method=config_dict.get("method", default_method),
         rejection_method=config_dict.get(
             "rejection_method",
             "SigmaClip",
@@ -3144,6 +3846,7 @@ def _build_config_from_dict(
             "output_name",
             "stacked_image.fits",
         ),
+        output_format=str(config_dict.get("output_format", "auto")),
         output_bit_depth="16-bit",
         compress_output=bool(
             config_dict.get(
@@ -3177,6 +3880,9 @@ def _build_config_from_dict(
             )
         ),
         cache_decompressed_fits=bool(config_dict.get("cache_decompressed_fits", True)),
+        reduction_storage=config_dict.get("reduction_storage", default_storage),
+        spill_directory=spill_path,
+        spill_limit_mb=int(config_dict.get("spill_limit_mb", 0)),
         engine_profile=str(config_dict.get("engine_profile", "Stable")),
         reducer_engine=config_dict.get("reducer_engine") or None,
     )

@@ -148,6 +148,31 @@ class RunnerTests(unittest.TestCase):
                 engine_profile="Stable",
             )
             self.assertEqual(command.to_legacy_config()["output_bit_depth"], "16-bit")
+            custom = StackCommand.from_values(
+                input_dir,
+                root / "stacked_custom",
+                feature_profile="Intelligent",
+                selection_profile="Custom",
+                selection_weights="fwhm=0.4,snr=0.6",
+                min_roundness=.7,
+                min_shape_stars=5,
+                selection_percentage=80,
+                rejection_low=3,
+                rejection_high=3,
+                trail_filter_enabled=False,
+                normalize=True,
+                compress_output=True,
+                apply_dither_correction=False,
+                engine_profile="Stable",
+            )
+            self.assertEqual(custom.config["selection_weights"], {"fwhm": .4, "snr": .6})
+            with self.assertRaises(ValueError):
+                StackCommand.from_values(
+                    input_dir,
+                    root / "stacked_invalid_custom",
+                    selection_profile="Custom",
+                    selection_weights="fwhm=-1,snr=nan",
+                )
             with self.assertRaises(ValueError):
                 StackCommand.from_values(input_dir, root / "stacked", min_roundness=1.5)
 

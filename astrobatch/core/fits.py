@@ -3,8 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 
 from astropy.io import fits
+from image_io import IMAGE_SUFFIXES, read_tiff_header, tiff_shape
 
-FITS_SUFFIXES = {".fit", ".fits", ".fts"}
+FITS_SUFFIXES = IMAGE_SUFFIXES
 
 
 def discover_fits(directory: Path) -> list[Path]:
@@ -21,6 +22,8 @@ def discover_fits(directory: Path) -> list[Path]:
 
 
 def inspect_fits(path: Path) -> tuple[tuple[int, ...], fits.Header]:
+    if path.suffix.casefold() in {".tif", ".tiff"}:
+        return tiff_shape(path), read_tiff_header(path)
     with fits.open(path, memmap=False, ignore_missing_end=True) as hdul:
         for hdu in hdul:
             if hdu.is_image and hdu.data is not None:

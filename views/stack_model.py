@@ -38,3 +38,12 @@ class StackViewModel:
     use_align_output_for_stack: Callable | None = None
     start_stacking: Callable | None = None
     cancel_processing: Callable | None = None
+    # New feature controls are optional at the model boundary so third-party
+    # callers using the original positional constructor remain compatible.
+    stack_feature_profile_var: Any = None
+    stack_selection_profile_var: Any = None
+    stack_selection_weights_var: Any = None
+    stack_trail_policy_var: Any = None
+    stack_reduction_storage_var: Any = None
+    stack_spill_directory_var: Any = None
+    stack_spill_limit_var: Any = None

@@ -141,6 +141,12 @@ def _build_align_model(context: StageContext) -> AlignViewModel:
         lambda: browse(v("batch_dir")), lambda: browse(v("align_output_dir")),
         browse_dir=browse, start_align_processing=start,
         cancel_processing=cancel,
+        align_storage_var=v("align_storage"),
+        align_keep_aligned_frames_var=v("align_keep_aligned_frames"),
+        align_batch_method_var=v("align_batch_method"),
+        align_batch_rejection_var=v("align_batch_rejection"),
+        align_batch_rejection_low_var=v("align_batch_rejection_low"),
+        align_batch_rejection_high_var=v("align_batch_rejection_high"),
     )
 
 
@@ -165,6 +171,13 @@ def _build_stack_model(context: StageContext) -> StackViewModel:
         start, cancel, BG=context.background, browse_dir=browse,
         use_align_output_for_stack=c("use_align_output_for_stack"),
         start_stacking=start, cancel_processing=cancel,
+        stack_feature_profile_var=v("stack_feature_profile"),
+        stack_selection_profile_var=v("stack_selection_profile"),
+        stack_selection_weights_var=v("stack_selection_weights"),
+        stack_trail_policy_var=v("stack_trail_policy"),
+        stack_reduction_storage_var=v("stack_reduction_storage"),
+        stack_spill_directory_var=v("stack_spill_directory"),
+        stack_spill_limit_var=v("stack_spill_limit"),
     )
 
 

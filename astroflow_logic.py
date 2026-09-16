@@ -9,6 +9,7 @@ import tempfile
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import OrderedDict, deque
+from collections.abc import Mapping
 from functools import partial
 from pathlib import Path
 
@@ -187,12 +188,64 @@ from temporal_analysis import (
     parse_date_obs,
     write_temporal_report,
 )
+from image_io import IMAGE_SUFFIXES, TIFF_SUFFIXES, read_tiff
 
 warnings.simplefilter("ignore", category=AstropyWarning)
 
 
+def _sigma_clipped_stats_fast(
+    data: np.ndarray,
+    *,
+    sigma: float = 3.0,
+    maxiters: int = 5,
+) -> tuple[np.floating | float, np.floating | float, np.floating | float]:
+    """Compute the scalar Astropy sigma-clipped statistics contract.
+
+    Flow always requests the scalar, unmasked ``axis=None`` variant with the
+    default median/std functions.  Astropy's public helper constructs several
+    masked-array/statistics objects around that simple loop; reproducing its
+    clipping bounds directly avoids that per-frame Python overhead.  The
+    arithmetic and iteration order mirror ``SigmaClip._sigmaclip_noaxis`` so
+    float32 detector thresholds and the legacy catalog remain unchanged.
+    """
+
+    values = np.asanyarray(data).ravel()
+    # Flow's FITS loader supplies float32.  Preserve Astropy's exact public
+    # behaviour for unusual library callers using another dtype or a masked
+    # input rather than broadening the fast-path's numeric contract.
+    if values.dtype != np.dtype(np.float32) and not isinstance(values, np.ma.MaskedArray):
+        return sigma_clipped_stats(data, sigma=sigma)
+    if isinstance(values, np.ma.MaskedArray):
+        values = values.data[~np.ma.getmaskarray(values)]
+    finite = np.isfinite(values)
+    filtered = np.asarray(values[finite])
+    if filtered.size == 0:
+        return (np.nan, np.nan, np.nan)
+
+    iterations = max(0, int(maxiters))
+    for _ in range(iterations):
+        size = int(filtered.size)
+        center = np.median(filtered)
+        spread = np.std(filtered)
+        lower = center - float(sigma) * spread
+        upper = center + float(sigma) * spread
+        filtered = filtered[(filtered >= lower) & (filtered <= upper)]
+        if size - int(filtered.size) == 0:
+            break
+    return np.mean(filtered), np.median(filtered), np.std(filtered)
+
+
 def max_science_frame_bytes(filepath: Path) -> int:
     """Estimate science image bytes from FITS headers without loading pixels."""
+    if filepath.suffix.casefold() in TIFF_SUFFIXES:
+        try:
+            import tifffile
+
+            shape = tifffile.memmap(filepath).shape
+            return int(np.prod(shape, dtype=np.int64)) * 4
+        except Exception:
+            data, _ = read_tiff(filepath)
+            return int(data.size) * 4
     with fits.open(filepath, memmap=False, lazy_load_hdus=True) as hdul:
         for hdu in hdul:
             if getattr(hdu, "is_image", False) and getattr(hdu, "shape", None):
@@ -260,6 +313,9 @@ def extract_luminance(data: np.ndarray, header: fits.Header) -> np.ndarray:
 
 
 def load_fits_data(filepath: Path) -> tuple[np.ndarray, fits.Header]:
+    if filepath.suffix.casefold() in TIFF_SUFFIXES:
+        data, header = read_tiff(filepath)
+        return np.asarray(data, dtype=np.float32), header
     # Dedicated-camera uint16 FITS commonly use signed int16+BZERO.  Astropy
     # cannot memory-map the scaled ``.data`` property, so request raw storage
     # and restore the cards in-place in float32.  This keeps the large read
@@ -594,7 +650,7 @@ def detect_stars_dao(
             float(np.median(data)),
             float(np.std(data)),
         )
-        _, bkg_median, bkg_std = sigma_clipped_stats(data, sigma=3.0)
+        _, bkg_median, bkg_std = _sigma_clipped_stats_fast(data, sigma=3.0)
         cached_stats = (
             mean_val,
             median_val,
@@ -609,6 +665,8 @@ def detect_stars_dao(
     if not np.isfinite(bkg_std) or bkg_std <= 0:
         metrics = {
             "star_count": 0,
+            "detected_candidates": 0,
+            "catalog_truncated": False,
             "fwhm": 0.0,
             "mean": round(mean_val, 2),
             "median": round(median_val, 2),
@@ -632,6 +690,8 @@ def detect_stars_dao(
         daofind = DAOStarFinder(fwhm=fwhm, threshold=threshold)
         sources = daofind(data - bkg_median)
 
+    detected_candidates = 0
+    catalog_truncated = False
     if sources is not None and len(sources) > 0:
         if hasattr(sources, "sort_descending"):
             sources.sort_descending("flux")
@@ -664,6 +724,14 @@ def detect_stars_dao(
             else np.empty((0,), dtype=np.float32)
         )
         star_count = len(coords)
+        # Keep provenance for the optional Global-anchor reuse path.  A
+        # catalogue shorter than the local cap means the spatial filter
+        # exhausted all candidates; a catalogue exactly at the cap may have
+        # been truncated and must not be reused by Global's 250-star pass.
+        detected_candidates = int(len(raw_coords))
+        catalog_truncated = bool(
+            star_count >= max_stars and detected_candidates > max_stars
+        )
 
         current_fwhm = (
             float(np.median(raw_sharpness[accepted_idx]) * fwhm)
@@ -680,6 +748,8 @@ def detect_stars_dao(
     valid = bool(star_count > 10 and current_fwhm > 0 and current_fwhm < (fwhm * 2.0))
     metrics = {
         "star_count": star_count,
+        "detected_candidates": detected_candidates,
+        "catalog_truncated": catalog_truncated,
         "fwhm": round(current_fwhm, 2),
         "mean": round(mean_val, 2),
         "median": round(median_val, 2),
@@ -1057,6 +1127,10 @@ def _process_single_frame(
     engine_val: str,
     engine_profile: str = "Stable",
 ) -> tuple[str, dict | None]:
+    # Keep a complete temporal contract even when pixel loading/detection
+    # fails. The successful path replaces this explicit ``unknown`` value
+    # with DATE-OBS parsed from the header already opened for pixels.
+    timestamp_fields = _timestamp_fields_from_header(None)
     try:
         data, header = load_fits_data(filepath)
         timestamp_fields = _timestamp_fields_from_header(header)
@@ -1131,6 +1205,7 @@ def _process_single_frame(
                 "stars": np.empty((0, 2), dtype=np.float32),
                 "fwhm": 0.0,
                 "metrics": {},
+                **timestamp_fields,
             },
         )
 
@@ -1144,7 +1219,11 @@ def _shape_metrics_for_frame(frame: dict | None) -> dict:
         return {}
     return {
         key: metrics[key]
-        for key in ("roundness", "shape_star_count", "shape_fwhm", "elongation")
+        for key in (
+            "roundness", "shape_star_count", "shape_fwhm", "elongation",
+            "trail_coherence", "trail_angle_deg", "trail_excess_px",
+            "tangential_coherence",
+        )
         if key in metrics
     }
 
@@ -1210,6 +1289,9 @@ def _anchor_detection_metadata(
         "sigma": float(sigma),
         "sigma_used": float(anchor.get("sigma_used", sigma)),
         "max_stars": int(max_stars),
+        "catalog_truncated": bool(
+            (anchor.get("metrics") or {}).get("catalog_truncated", True)
+        ),
         "engine": str(engine),
         "engine_profile": str(engine_profile),
     }
@@ -1295,7 +1377,7 @@ def process_local_flow(batch_dir: Path, config: dict, app_print, cancellation_ev
         [
             p
             for p in batch_dir.iterdir()
-            if p.is_file() and p.suffix.lower() in {".fit", ".fits", ".fts"}
+            if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES
         ],
         key=_natural_frame_key,
     )
@@ -1889,11 +1971,30 @@ def _extract_asterism_database(
 
 
 def _match_quad_asterisms(
-    ref_stars: np.ndarray, tgt_stars: np.ndarray, tolerance: float = 0.02
+    ref_stars: np.ndarray,
+    tgt_stars: np.ndarray,
+    tolerance: float = 0.02,
+    *,
+    ref_database: tuple[list[tuple], list[list[int]]] | None = None,
+    tgt_database: tuple[list[tuple], list[list[int]]] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Pareia estrelas comparando as distâncias euclidianas no espaço de hash 4D."""
-    ref_hashes, ref_quads = _extract_asterism_database(ref_stars, max_stars=60)
-    tgt_hashes, tgt_quads = _extract_asterism_database(tgt_stars, max_stars=60)
+    # Building the bounded KNN/quad database is independent of the pair being
+    # matched.  Global Flow may compare one master against several batches
+    # (and then retry a neighbouring route), so callers can provide the
+    # already materialized databases and avoid repeating thousands of tiny
+    # Python combinations.  The fallback keeps this helper fully compatible
+    # with direct/legacy callers.
+    ref_hashes, ref_quads = (
+        ref_database
+        if ref_database is not None
+        else _extract_asterism_database(ref_stars, max_stars=60)
+    )
+    tgt_hashes, tgt_quads = (
+        tgt_database
+        if tgt_database is not None
+        else _extract_asterism_database(tgt_stars, max_stars=60)
+    )
 
     if not ref_hashes or not tgt_hashes:
         return np.empty((0, 2), dtype=np.float32), np.empty((0, 2), dtype=np.float32)
@@ -1951,6 +2052,7 @@ def _estimate_global_pair(
     matching_radius: float,
     ransac_thresh: float,
     limits: dict,
+    asterism_cache: Mapping[str, tuple[list[tuple], list[list[int]]]] | None = None,
 ):
     stars_ref = ref_info.get("anchor_stars")
     stars_tgt = target_info.get("anchor_stars")
@@ -1974,7 +2076,18 @@ def _estimate_global_pair(
         )
 
     # 1. Pareamento por Hashing de Quads Geométricos (Invariante a Rotação e Translação)
-    pts_ref, pts_tgt = _match_quad_asterisms(stars_ref, stars_tgt, tolerance=0.02)
+    ref_database = None
+    tgt_database = None
+    if asterism_cache is not None:
+        ref_database = asterism_cache.get(str(ref_info.get("batch_name", "")))
+        tgt_database = asterism_cache.get(str(target_info.get("batch_name", "")))
+    pts_ref, pts_tgt = _match_quad_asterisms(
+        stars_ref,
+        stars_tgt,
+        tolerance=0.02,
+        ref_database=ref_database,
+        tgt_database=tgt_database,
+    )
 
     # 2. Resolução Robusta com MAGSAC++
     matrix_2x3, metrics = _estimate_incremental_transform(
@@ -2056,7 +2169,21 @@ def _cached_anchor_for_global(
             return None
         if float(detection.get("sigma_used")) != float(base_sigma):
             return None
-        if int(detection.get("max_stars")) != 250:
+        local_max_stars = int(detection.get("max_stars"))
+        # Global uses a 250-star cap. A local Flow may use a smaller cap, but
+        # reuse remains exact only when its catalogue was not truncated.
+        # Older JSONs lack this provenance bit and intentionally take the
+        # conservative reread path.
+        if not 1 <= local_max_stars <= 250:
+            return None
+        # Legacy Flow files predate ``catalog_truncated``. When they already
+        # used Global's exact 250-star cap, the detector invocation and output
+        # limit are identical, so reuse remains bitwise-safe. Older files
+        # using a smaller local cap still take the conservative reread path.
+        catalog_truncated = detection.get("catalog_truncated")
+        if catalog_truncated is None:
+            catalog_truncated = local_max_stars != 250
+        if bool(catalog_truncated):
             return None
         if str(detection.get("engine")) != str(engine_val):
             return None
@@ -2064,6 +2191,8 @@ def _cached_anchor_for_global(
             return None
         stars = np.asarray(info.get("anchor_stars"), dtype=np.float32)
         if stars.ndim != 2 or stars.shape[1] != 2 or len(stars) < 35:
+            return None
+        if len(stars) >= local_max_stars:
             return None
         if not np.isfinite(stars).all():
             return None
@@ -2111,7 +2240,7 @@ def _local_flow_batch_plan(
             frame_estimates = [
                 max_science_frame_bytes(path) * 10
                 for path in batch.iterdir()
-                if path.is_file() and path.suffix.lower() in {".fit", ".fits", ".fts"}
+                if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
             ]
             if frame_estimates:
                 estimated_per_batch = max(estimated_per_batch, max(frame_estimates))
@@ -2380,6 +2509,24 @@ def process_all_flows(
     ransac_thresh = float(config.get("global_ransac", config.get("ransac", 5.0)))
     limits = _global_limits(config)
 
+    # The KNN/quad catalogue is a pure function of each batch anchor.  Build
+    # it once per anchor before launching pair workers; direct master matches
+    # and any neighbour-chain retries can then share the same immutable
+    # metadata without retaining another full-resolution image.
+    global_asterism_cache: dict[str, tuple[list[tuple], list[list[int]]]] = {}
+    for info in anchors_info:
+        stars = info.get("anchor_stars")
+        if stars is None:
+            continue
+        try:
+            global_asterism_cache[str(info["batch_name"])] = _extract_asterism_database(
+                np.asarray(stars, dtype=np.float32), max_stars=60
+            )
+        except (TypeError, ValueError):
+            # The pair estimator retains its existing missing-data rejection
+            # when an old/corrupt Flow catalogue cannot be cached.
+            continue
+
     global_flow = {
         "schema_version": 3,
         "mode": "global_neighbor_bfs",
@@ -2441,6 +2588,7 @@ def process_all_flows(
                 matching_radius,
                 ransac_thresh,
                 limits,
+                global_asterism_cache,
             ): target_info
             for target_info in targets_for_direct
         }
@@ -2508,7 +2656,12 @@ def process_all_flows(
                     continue
 
                 matrix, metrics = _estimate_global_pair(
-                    ref_info, target_info, matching_radius, ransac_thresh, limits
+                    ref_info,
+                    target_info,
+                    matching_radius,
+                    ransac_thresh,
+                    limits,
+                    global_asterism_cache,
                 )
                 if matrix is not None and metrics.get("status") == "accepted":
                     reference_matrix = ordered_global_matrices[ref_name]
@@ -2577,7 +2730,12 @@ def process_all_flows(
                     continue
 
                 matrix, metrics = _estimate_global_pair(
-                    ref_info, target_info, matching_radius, ransac_thresh, limits
+                    ref_info,
+                    target_info,
+                    matching_radius,
+                    ransac_thresh,
+                    limits,
+                    global_asterism_cache,
                 )
                 if matrix is not None and metrics.get("status") == "accepted":
                     reference_matrix = ordered_global_matrices[ref_name]
@@ -2798,7 +2956,7 @@ def _persisted_local_flow_is_current(batch_folder: Path, local_data: dict) -> bo
         [
             path
             for path in batch_folder.iterdir()
-            if path.is_file() and path.suffix.lower() in {".fit", ".fits", ".fts"}
+            if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
         ],
         key=_natural_frame_key,
     )
@@ -3739,7 +3897,7 @@ def preview_star_detection(
         [
             p
             for p in batch_dir.iterdir()
-            if p.is_file() and p.suffix.lower() in {".fit", ".fits", ".fts"}
+            if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES
         ],
         key=_natural_frame_key,
     )

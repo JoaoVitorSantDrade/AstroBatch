@@ -145,3 +145,50 @@ counts and AVX2 assembly probes. This revalidation is **below** the mandatory
 the preceding optimized variant, but is not promoted as the current-checkout
 throughput claim. The full-session real-capture gate remains intentionally
 pending because the source is user-owned and was only opened read-only.
+
+### Revalidação após os recursos inteligentes (2026-09-15)
+
+Após a inclusão da seleção multi-métrica, pesos, trailing e controles
+RAM-first, o benchmark oficial foi repetido no mesmo corpus versionado com
+sete execuções quentes por variante. A mediana `Stable` atual foi `2,1311 s`
+contra `2,4863 s` do baseline, redução de `14,28%` (`1,1666×`); o gate de
+`25%` não foi atingido nesta coleta. A saída continuou bit a bit idêntica,
+`uint16`, com máscaras/contagens iguais e probes AVX2/YMM confirmados. A
+variação em relação ao ensaio anterior é registrada, não convertida em uma
+afirmação de throughput. Evidência: [pipeline_benchmark_current_20260915_features.json](pipeline_benchmark_current_20260915_features.json).
+
+### Gate final após cache de asterismos e sigma clipping vetorizável (2026-09-15)
+
+O checkout foi medido novamente com sete execuções quentes, quatro workers,
+afinidade lógica `0–7` e o mesmo corpus versionado. O cache de metadados de
+asterismos por âncora, a reutilização segura de catálogos locais não truncados
+e o caminho escalar `float32` equivalente ao sigma clipping reduziram a mediana
+`Stable` para **1,8434 s**, contra **2,4863 s** do baseline: **25,86%** de
+redução (`1,3487×`), acima do gate obrigatório de 25%. A saída `Stable`,
+máscaras, contagens, metadados científicos e produto `uint16` permaneceram
+idênticos; RSS variou cerca de 1,3 MiB (sem regressão relevante) e os probes
+AVX2/YMM continuaram positivos. Evidência completa:
+[pipeline_benchmark_current_20260915_features.json](pipeline_benchmark_current_20260915_features.json).
+
+### Revalidação após o modo compacto FIT/TIFF (2026-09-16)
+
+O modo `batch_compact` passou a ser o padrão do Align. No mesmo corpus
+versionado, com sete execuções quentes por variante e quatro workers, a
+mediana `Stable` foi `1,8136 s` contra `2,4863 s` do baseline: redução de
+`27,05%` (`1,3709x`). A conversão para os mesmos valores `uint16` publicados
+no caminho individual preservou digest, máscaras, contagens e probes AVX2/YMM;
+o pico de RSS ficou em aproximadamente `326,8 MiB`. Assim, o gate de throughput
+de `25%` está **atingido** para a variante compacta. A medição fria/JIT e a
+importação ficaram separadas e fora do gate; o relatório foi escrito em
+`%TEMP%\\astrobatch_pipeline_current_quantized.json`.
+
+### Revalidação final do checkout (2026-09-15)
+
+Uma segunda coleta com o mesmo corpus, sete execuções quentes, quatro workers e
+afinidade `0–7` mediu `Stable` em **1,7356 s** (desvio-padrão `0,0279 s`) contra
+`2,4863 s` do baseline: **30,19%** de redução (`1,4325×`). O pico de RSS foi
+`339,87 MiB` contra `339,75 MiB` (variação `0,12 MiB`), com digests, máscaras,
+contagens, `uint16` e probes AVX2/YMM idênticos. O gate obrigatório permanece
+atingido; frio/JIT (`0,3942 s`) e importação (`2,7006 s`) ficaram registrados
+separadamente e fora do gate. Evidência:
+[pipeline_benchmark_current_20260915_features.json](pipeline_benchmark_current_20260915_features.json).

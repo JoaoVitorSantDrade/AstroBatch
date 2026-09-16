@@ -66,6 +66,10 @@ class AstroProcessManager(tk.Tk):
         self._closing = False
         self.custom_anchors = {}
         self._active_operation_stage = None
+        # Existing settings are a compatibility boundary.  A first launch
+        # (no settings file yet) starts with the new Intelligent defaults;
+        # loading an older file keeps the historical Legacy Stack choices.
+        self._settings_file_exists = self.CONFIG_FILE.exists()
 
         self._init_variables()
         self._configure_style()
@@ -175,6 +179,12 @@ class AstroProcessManager(tk.Tk):
         self.align_compress_output_var = tk.BooleanVar(value=True)
         self.align_profile_var = tk.StringVar(value="Stable")
         self.align_warp_engine_var = tk.StringVar(value="")
+        self.align_storage_var = tk.StringVar(value="batch_compact")
+        self.align_keep_aligned_frames_var = tk.BooleanVar(value=False)
+        self.align_batch_method_var = tk.StringVar(value="Mean")
+        self.align_batch_rejection_var = tk.StringVar(value="None")
+        self.align_batch_rejection_low_var = tk.DoubleVar(value=3.0)
+        self.align_batch_rejection_high_var = tk.DoubleVar(value=3.0)
         self.resource_memory_var = tk.IntVar(value=512)
         self.resource_workers_var = tk.IntVar(value=2)
         self.align_quality_gate_var = tk.BooleanVar(value=False)
@@ -186,16 +196,29 @@ class AstroProcessManager(tk.Tk):
         self.stack_input_dir_var = tk.StringVar(value="")
 
         # ---- Seleção de Frames ----
-        self.stack_selection_mode_var = tk.StringVar(value="BestPercentage")
+        intelligent_defaults = not getattr(self, "_settings_file_exists", False)
+        self.stack_feature_profile_var = tk.StringVar(
+            value="Intelligent" if intelligent_defaults else "Legacy"
+        )
+        self.stack_selection_mode_var = tk.StringVar(
+            value="MultiMetric" if intelligent_defaults else "BestPercentage"
+        )
         self.stack_selection_percentage_var = tk.DoubleVar(value=80.0)
         self.stack_selection_percentage_text_var = tk.StringVar(value="80%")
         self.stack_selection_metric_var = tk.StringVar(value="quality")
+        self.stack_selection_profile_var = tk.StringVar(value="Balanced")
+        self.stack_selection_weights_var = tk.StringVar(value="")
         self.stack_trail_filter_var = tk.BooleanVar(value=False)
         self.stack_min_roundness_var = tk.DoubleVar(value=0.65)
         self.stack_min_shape_stars_var = tk.IntVar(value=5)
+        self.stack_trail_policy_var = tk.StringVar(
+            value="exclude_severe" if intelligent_defaults else "off"
+        )
 
         # ---- Combinação ----
-        self.stack_method_var = tk.StringVar(value="Median")
+        self.stack_method_var = tk.StringVar(
+            value="QualityWeightedMean" if intelligent_defaults else "Median"
+        )
 
         # ---- Rejeição de Outliers ----
         self.stack_rejection_method_var = tk.StringVar(value="SigmaClip")
@@ -217,6 +240,11 @@ class AstroProcessManager(tk.Tk):
         self.stack_compress_var = tk.BooleanVar(value=True)
         self.stack_profile_var = tk.StringVar(value="Stable")
         self.stack_reducer_engine_var = tk.StringVar(value="")
+        self.stack_reduction_storage_var = tk.StringVar(
+            value="ram" if intelligent_defaults else "disk_legacy"
+        )
+        self.stack_spill_directory_var = tk.StringVar(value="")
+        self.stack_spill_limit_var = tk.IntVar(value=4096)
 
         # Registry atualizado
         self.config_registry = {
@@ -276,18 +304,28 @@ class AstroProcessManager(tk.Tk):
                 "compress_output": self.align_compress_output_var,
                 "engine_profile": self.align_profile_var,
                 "warp_engine": self.align_warp_engine_var,
+                "aligned_storage": self.align_storage_var,
+                "keep_aligned_frames": self.align_keep_aligned_frames_var,
+                "batch_stack_method": self.align_batch_method_var,
+                "batch_rejection_method": self.align_batch_rejection_var,
+                "batch_rejection_low": self.align_batch_rejection_low_var,
+                "batch_rejection_high": self.align_batch_rejection_high_var,
             },
             "AstroStack": {
                 # ---- Diretórios ----
                 "input_dir": self.stack_input_dir_var,
                 "output_dir": self.stack_output_dir_var,
                 # ---- Seleção de Frames ----
+                "feature_profile": self.stack_feature_profile_var,
                 "selection_mode": self.stack_selection_mode_var,
                 "selection_percentage": self.stack_selection_percentage_var,
                 "selection_metric": self.stack_selection_metric_var,
+                "selection_profile": self.stack_selection_profile_var,
+                "selection_weights": self.stack_selection_weights_var,
                 "trail_filter_enabled": self.stack_trail_filter_var,
                 "min_roundness": self.stack_min_roundness_var,
                 "min_shape_stars": self.stack_min_shape_stars_var,
+                "trail_policy": self.stack_trail_policy_var,
                 # ---- Combinação ----
                 "method": self.stack_method_var,
                 # ---- Rejeição de Outliers ----
@@ -305,6 +343,9 @@ class AstroProcessManager(tk.Tk):
                 "compress_output": self.stack_compress_var,
                 "engine_profile": self.stack_profile_var,
                 "reducer_engine": self.stack_reducer_engine_var,
+                "reduction_storage": self.stack_reduction_storage_var,
+                "spill_directory": self.stack_spill_directory_var,
+                "spill_limit_mb": self.stack_spill_limit_var,
             },
             "Resources": {"memory_mb": self.resource_memory_var, "workers": self.resource_workers_var},
             "AlignQuality": {"enabled": self.align_quality_gate_var, "max_shift": self.align_quality_shift_var},
@@ -547,17 +588,27 @@ class AstroProcessManager(tk.Tk):
             "align_compress_output": self.align_compress_output_var,
             "align_profile": self.align_profile_var,
             "align_warp_engine": self.align_warp_engine_var,
+            "align_storage": self.align_storage_var,
+            "align_keep_aligned_frames": self.align_keep_aligned_frames_var,
+            "align_batch_method": self.align_batch_method_var,
+            "align_batch_rejection": self.align_batch_rejection_var,
+            "align_batch_rejection_low": self.align_batch_rejection_low_var,
+            "align_batch_rejection_high": self.align_batch_rejection_high_var,
             "align_quality_gate": self.align_quality_gate_var,
             "align_quality_shift": self.align_quality_shift_var,
             "stack_input_dir": self.stack_input_dir_var,
             "stack_output_dir": self.stack_output_dir_var,
+            "stack_feature_profile": self.stack_feature_profile_var,
             "stack_selection_mode": self.stack_selection_mode_var,
             "stack_selection_percentage": self.stack_selection_percentage_var,
             "stack_selection_percentage_text": self.stack_selection_percentage_text_var,
             "stack_selection_metric": self.stack_selection_metric_var,
+            "stack_selection_profile": self.stack_selection_profile_var,
+            "stack_selection_weights": self.stack_selection_weights_var,
             "stack_trail_filter": self.stack_trail_filter_var,
             "stack_min_roundness": self.stack_min_roundness_var,
             "stack_min_shape_stars": self.stack_min_shape_stars_var,
+            "stack_trail_policy": self.stack_trail_policy_var,
             "stack_method": self.stack_method_var,
             "stack_rejection_method": self.stack_rejection_method_var,
             "stack_rejection_low": self.stack_rejection_low_var,
@@ -570,6 +621,9 @@ class AstroProcessManager(tk.Tk):
             "stack_compress": self.stack_compress_var,
             "stack_profile": self.stack_profile_var,
             "stack_reducer_engine": self.stack_reducer_engine_var,
+            "stack_reduction_storage": self.stack_reduction_storage_var,
+            "stack_spill_directory": self.stack_spill_directory_var,
+            "stack_spill_limit": self.stack_spill_limit_var,
             "hdr_input": self.hdr_input_var,
             "hdr_output": self.hdr_output_var,
             "hdr_saturation": self.hdr_saturation_var,
@@ -708,7 +762,7 @@ class AstroProcessManager(tk.Tk):
     def browse_file(self, var):
         path = filedialog.askopenfilename(
             parent=self,
-            filetypes=[("FITS", "*.fits *.fit *.fts"), ("Todos os arquivos", "*.*")],
+            filetypes=[("Imagens FITS/TIFF", "*.fits *.fit *.fts *.tif *.tiff"), ("Todos os arquivos", "*.*")],
         )
         if path:
             self.save_settings()
@@ -724,7 +778,7 @@ class AstroProcessManager(tk.Tk):
 
     def browse_save_file(self, variable):
         path = filedialog.asksaveasfilename(parent=self, defaultextension=".fits",
-                                          filetypes=[("FITS", "*.fits *.fit *.fts")])
+                                          filetypes=[("FITS/TIFF", "*.fits *.fit *.fts *.tif *.tiff")])
         if path:
             variable.set(path)
             self.save_settings()
@@ -757,6 +811,8 @@ class AstroProcessManager(tk.Tk):
                             value = module_data[key]
                             if module == "AstroStack" and key == "output_bit_depth":
                                 value = "16-bit"
+                            if module == "AstroStack" and key == "selection_weights" and isinstance(value, dict):
+                                value = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
                             variable.set(value)
                         except (tk.TclError, ValueError, TypeError):
                             pass
@@ -777,7 +833,14 @@ class AstroProcessManager(tk.Tk):
             data[module] = {}
             for key, variable in variables.items():
                 try:
-                    data[module][key] = variable.get()
+                    value = variable.get()
+                    if module == "AstroStack" and key == "selection_weights":
+                        # Keep the native StringVar readable while persisting
+                        # a portable JSON object for future sessions.
+                        from stacking_features import parse_selection_weights
+                        parsed = parse_selection_weights(value)
+                        value = json.dumps(parsed, ensure_ascii=False, separators=(",", ":")) if parsed else ""
+                    data[module][key] = value
                 except Exception:
                     pass
 
@@ -1108,6 +1171,12 @@ class AstroProcessManager(tk.Tk):
                 compress_output=self.align_compress_output_var.get(),
                 engine_profile=self.align_profile_var.get(),
                 warp_engine=self.align_warp_engine_var.get(),
+                aligned_storage=self.align_storage_var.get(),
+                keep_aligned_frames=self.align_keep_aligned_frames_var.get(),
+                batch_stack_method=self.align_batch_method_var.get(),
+                batch_rejection_method=self.align_batch_rejection_var.get(),
+                batch_rejection_low=self.align_batch_rejection_low_var.get(),
+                batch_rejection_high=self.align_batch_rejection_high_var.get(),
                 memory_budget_mb=self.resource_memory_var.get(),
                 workers=self.resource_workers_var.get(),
                 quality_gate=self.align_quality_gate_var.get(),
@@ -1130,14 +1199,14 @@ class AstroProcessManager(tk.Tk):
             folder_text = self.hdr_input_var.get().strip()
             folder = Path(folder_text)
             if not folder_text or not folder.is_dir():
-                raise ValueError("Selecione a pasta dos FITS já alinhados.")
+                raise ValueError("Selecione a pasta das imagens FIT/TIFF já alinhadas.")
             output_text = self.hdr_output_var.get().strip()
             if not output_text:
                 raise ValueError("Selecione o arquivo de saída.")
             output = Path(output_text).resolve()
-            paths = sorted(p for p in folder.iterdir() if p.suffix.lower() in {".fit", ".fits", ".fts"} and p.resolve() != output)
+            paths = sorted(p for p in folder.iterdir() if p.suffix.lower() in {".fit", ".fits", ".fts", ".tif", ".tiff"} and p.resolve() != output)
             if len(paths) < 2:
-                raise ValueError("São necessários pelo menos dois FITS alinhados.")
+                raise ValueError("São necessárias pelo menos duas imagens FIT/TIFF alinhadas.")
             config = {"input_paths": paths, "output_path": output_text,
                       "noise_floor": self.hdr_noise_var.get(), "row_band": self.hdr_rowband_var.get()}
             if self.hdr_saturation_var.get(): config["saturation"] = self.hdr_saturation_var.get()
@@ -1161,14 +1230,19 @@ class AstroProcessManager(tk.Tk):
             return
         try:
             input_dir = self.stack_input_dir_var.get()
+            from stacking_features import parse_selection_weights
             values = {
                 "base_dir": str(self.batch_dir_var.get()),
+                "feature_profile": self.stack_feature_profile_var.get(),
                 "selection_mode": self.stack_selection_mode_var.get(),
                 "selection_percentage": self.stack_selection_percentage_var.get(),
                 "selection_metric": self.stack_selection_metric_var.get(),
+                "selection_profile": self.stack_selection_profile_var.get(),
+                "selection_weights": parse_selection_weights(self.stack_selection_weights_var.get()),
                 "trail_filter_enabled": self.stack_trail_filter_var.get(),
                 "min_roundness": self.stack_min_roundness_var.get(),
                 "min_shape_stars": self.stack_min_shape_stars_var.get(),
+                "trail_policy": self.stack_trail_policy_var.get(),
                 "method": self.stack_method_var.get(),
                 "rejection_method": self.stack_rejection_method_var.get(),
                 "rejection_low": self.stack_rejection_low_var.get(),
@@ -1180,6 +1254,11 @@ class AstroProcessManager(tk.Tk):
                 "apply_dither_correction": self.stack_dither_correction_var.get(),
                 "engine_profile": self.stack_profile_var.get(),
                 "reducer_engine": self.stack_reducer_engine_var.get(),
+                "reduction_storage": self.stack_reduction_storage_var.get(),
+                "spill_directory": self.stack_spill_directory_var.get(),
+                "spill_limit_mb": self.stack_spill_limit_var.get(),
+                "memory_budget_mb": self.resource_memory_var.get(),
+                "workers": self.resource_workers_var.get(),
             }
             command = StackCommand.from_values(
                 input_dir, self.stack_output_dir_var.get(), **values
@@ -1229,6 +1308,12 @@ class AstroProcessManager(tk.Tk):
         self.stack_method_var.set("Mean")
         self.stack_rejection_method_var.set("SigmaClip")
         self.stack_profile_var.set("Stable")
+        if hasattr(self, "stack_feature_profile_var"):
+            self.stack_feature_profile_var.set("Intelligent")
+        if hasattr(self, "stack_trail_policy_var"):
+            self.stack_trail_policy_var.set("exclude_severe")
+        if hasattr(self, "stack_reduction_storage_var"):
+            self.stack_reduction_storage_var.set("ram")
         self.save_settings()
         message = (
             "Preset 'Subs sem guiagem' aplicado: filtro ativo, roundness 0.65, "

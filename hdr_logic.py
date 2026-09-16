@@ -9,7 +9,7 @@ import json
 import os
 import tempfile
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -18,6 +18,18 @@ from astropy.io import fits
 
 from calibration_logic import _restore_normalized_values, _sanitize_float_header
 from app.infrastructure.json_store import atomic_json_write
+from image_io import (
+    TIFF_SUFFIXES,
+    read_image,
+    read_tiff,
+    read_tiff_header,
+    read_tiff_sidecar_arrays,
+    tiff_shape,
+    validate_single_format,
+    write_npz_sidecar,
+    write_sidecar_json,
+    write_tiff,
+)
 
 
 @dataclass(frozen=True)
@@ -66,6 +78,28 @@ build_hdr_config = _config
 
 
 def _inspect(path: Path, override: float | None) -> tuple[tuple[int, ...], fits.Header, float, int]:
+    if path.suffix.casefold() in TIFF_SUFFIXES:
+        shape_raw = tiff_shape(path)
+        header = read_tiff_header(path)
+        if len(shape_raw) == 3 and shape_raw[-1] in (3, 4):
+            shape = (shape_raw[-1], shape_raw[0], shape_raw[1])
+        elif len(shape_raw) == 3 and shape_raw[0] in (3, 4):
+            shape = tuple(shape_raw)
+        else:
+            shape = tuple(shape_raw)
+        header = _sanitize_float_header(header)
+        aliases = [float(header[k]) for k in ("EXPTIME", "EXPOSURE") if k in header]
+        if override is None and len(aliases) == 2 and not np.isclose(*aliases, rtol=1e-6, atol=0):
+            raise ValueError(f"{path.name}: conflicting EXPTIME and EXPOSURE")
+        exposure = override if override is not None else (aliases[0] if aliases else None)
+        if exposure is None or not np.isfinite(float(exposure)) or float(exposure) <= 0:
+            raise ValueError(f"{path.name}: EXPTIME missing or invalid")
+        if header.get("CALNORM"):
+            lo, hi = float(header.get("CALMIN", np.nan)), float(header.get("CALMAX", np.nan))
+            if not np.isfinite(lo + hi) or hi <= lo:
+                raise ValueError(f"{path.name}: invalid calibration range")
+        header["EXPTIME"] = float(exposure)
+        return shape, header, float(exposure), 0
     with fits.open(path, memmap=False, ignore_missing_end=True) as hdul:
         for index, hdu in enumerate(hdul):
             if hdu.is_image and hdu.shape is not None and len(hdu.shape) in (2, 3) and hdu.name not in {"VALID_MASK", "SAT_MASK", "DISAGREE"}:
@@ -85,6 +119,25 @@ def _inspect(path: Path, override: float | None) -> tuple[tuple[int, ...], fits.
     raise ValueError(f"{path.name}: no image found")
 
 def _band(path: Path, index: int, y: int, y2: int, shape: tuple[int, ...], header: fits.Header | None = None, restore: bool = True) -> np.ndarray:
+    if path.suffix.casefold() in TIFF_SUFFIXES:
+        try:
+            import tifffile
+            source = tifffile.memmap(path)
+        except Exception:
+            source, _ = read_tiff(path)
+        source = np.asarray(source)
+        if len(shape) == 2:
+            raw = source[y:y2, :]
+        elif source.ndim == 3 and source.shape[0] in (3, 4) and source.shape[-1] not in (3, 4):
+            # Planar TIFF (C,H,W) is accepted alongside the interleaved
+            # camera convention (H,W,C).  HDR keeps its internal CHW layout.
+            raw = source[:, y:y2, :]
+        else:
+            raw = np.moveaxis(source[y:y2, :, :], -1, 0)
+        out = np.ascontiguousarray(raw, dtype=np.float32)
+        if restore and header is not None and bool(header.get("CALNORM", False)):
+            out = _restore_normalized_values(out, header)
+        return out
     with fits.open(path, memmap=False, ignore_missing_end=True) as hdul:
         section = hdul[index].section
         raw = section[y:y2, :] if len(shape) == 2 else section[:, y:y2, :]
@@ -94,6 +147,17 @@ def _band(path: Path, index: int, y: int, y2: int, shape: tuple[int, ...], heade
         return out
 
 def _mask_band(path: Path, y: int, y2: int, shape: tuple[int, ...]) -> np.ndarray | None:
+    if path.suffix.casefold() in TIFF_SUFFIXES:
+        arrays = read_tiff_sidecar_arrays(path)
+        valid = arrays.get("valid_mask")
+        sat = arrays.get("sat_mask")
+        result = None
+        if valid is not None:
+            result = np.asarray(valid[y:y2, :], dtype=bool)
+        if sat is not None:
+            pixels = ~np.asarray(sat[y:y2, :], dtype=bool)
+            result = pixels if result is None else result & pixels
+        return result
     valid = None
     with fits.open(path, memmap=False, ignore_missing_end=True) as hdul:
         for hdu in hdul:
@@ -127,6 +191,27 @@ def _atomic_write(data: np.ndarray, valid: np.ndarray, disagree: np.ndarray,
     h["BUNIT"] = unit
     for key in ("SATURATE", "SATLEVEL", "EXPOSURE"):
         h.remove(key, ignore_missing=True)
+    if output.suffix.casefold() in TIFF_SUFFIXES:
+        visible = np.moveaxis(encoded, 0, -1) if encoded.ndim == 3 else encoded
+        write_tiff(output, visible, metadata={"schema_version": 1, "format": "TIFF", "linear": True, "hdr": True})
+        write_npz_sidecar(
+            output.with_suffix(output.suffix + ".astrobatch.npz"),
+            valid_mask=np.asarray(valid, dtype=np.uint8),
+            disagreement=np.asarray(disagree, dtype=np.uint8),
+        )
+        write_sidecar_json(
+            output.with_suffix(output.suffix + ".json"),
+            {
+                "schema_version": 1,
+                "format": "TIFF",
+                "linear": True,
+                "hdr": True,
+                "valid_mask_sidecar": output.name + ".astrobatch.npz",
+                "header": {str(key): str(value) for key, value in h.items()},
+                "provenance": provenance,
+            },
+        )
+        return
     hdus = fits.HDUList([fits.PrimaryHDU(encoded, h), fits.ImageHDU(valid.astype(np.uint8), name="VALID_MASK"),
                          fits.ImageHDU(disagree.astype(np.uint8), name="DISAGREE")])
     if provenance is not None:
@@ -164,6 +249,10 @@ def run_hdr_pipeline(config: dict[str, Any] | HDRConfig, log: Callable[[str], No
         if len(paths) < 2: raise ValueError("HDR requires at least two distinct input paths")
         if cfg.output_path.resolve() in paths: raise ValueError("output_path cannot overwrite an input")
         if cfg.output_path.exists() and not cfg.overwrite: raise FileExistsError(str(cfg.output_path))
+        source_format = validate_single_format(list(paths))
+        expected = {".fit", ".fits", ".fts"} if source_format.value == "fits" else {".tif", ".tiff"}
+        if cfg.output_path.suffix.casefold() not in expected:
+            cfg = replace(cfg, output_path=cfg.output_path.with_suffix(".fits" if source_format.value == "fits" else ".tif"))
         meta = [_inspect(p, cfg.exposure_override) for p in paths]
         shape = meta[0][0]
         if any(x[0] != shape for x in meta): raise ValueError("incompatible image geometry")

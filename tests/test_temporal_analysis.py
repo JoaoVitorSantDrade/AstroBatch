@@ -150,6 +150,55 @@ class TemporalAnalysisTests(unittest.TestCase):
                 report = build_session_temporal_report(root)
             self.assertEqual(report["unknown_timestamp_frames"], ["batch_01/frame_001.fits"])
 
+    def test_session_report_reads_active_flow_revision_before_compatibility_copy(self):
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            batch = root / "batch_01"
+            batch.mkdir()
+            path = batch / "frame_001.fits"
+            fits.PrimaryHDU(np.ones((2, 2), dtype=np.uint16)).writeto(path)
+
+            # The mutable compatibility file deliberately contains stale
+            # timing data.  The manifest-selected immutable snapshot is the
+            # source that temporal analysis must consume.
+            stale = {
+                "frames": {
+                    "frame_001.fits": {
+                        "status": "accepted",
+                        "timestamp_state": "unknown",
+                        "timestamp_utc": None,
+                    }
+                }
+            }
+            (batch / "flow_local.json").write_text(json.dumps(stale), encoding="utf-8")
+            snapshot = root / ".flow_revisions" / "rev-2" / "batches" / "batch_01" / "flow_local.json"
+            snapshot.parent.mkdir(parents=True)
+            active = {
+                "frames": {
+                    "frame_001.fits": {
+                        "status": "accepted",
+                        "timestamp_state": "valid",
+                        "timestamp_utc": "2026-01-01T00:00:00.000000Z",
+                        "timestamp_normalized": "2026-01-01T00:00:00.000000Z",
+                        "epoch_s": 1767225600.0,
+                    }
+                }
+            }
+            snapshot.write_text(json.dumps(active), encoding="utf-8")
+            (root / "flow_revision.json").write_text(
+                json.dumps({
+                    "schema_version": 2,
+                    "active_revision": "rev-2",
+                    "local_flows": {"batch_01": str(snapshot.relative_to(root))},
+                }),
+                encoding="utf-8",
+            )
+
+            report = build_session_temporal_report(root)
+            self.assertEqual(report["unknown_timestamp_frames"], [])
+            self.assertEqual(report["groups"][0]["frames"], ["batch_01/frame_001.fits"])
+            self.assertEqual(report["frames"][0]["timestamp_state"], "valid")
+
     def test_session_view_groups_across_batches_without_touching_fits(self):
         with TemporaryDirectory() as td:
             root = Path(td)

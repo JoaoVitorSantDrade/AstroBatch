@@ -207,6 +207,17 @@ de `2,1%` contra quatro, então quatro segue como teto recomendado para a
 sessão real. Evidência:
 [io_concurrency_benchmark_lagoon_opt_20260915.json](io_concurrency_benchmark_lagoon_opt_20260915.json).
 
+### Gate sintético final (2026-09-15)
+
+Na revalidação final do checkout, o corpus versionado (mono/RGB, máscaras,
+alinhamento, rejeição e Stack) foi executado sete vezes por variante com quatro
+workers e afinidade `0–7`. A mediana `Stable` foi `1,7356 s` contra `2,4863 s`
+do baseline (`30,19%`, speedup `1,4325×`); o pico de RSS foi `339,87 MiB`
+contra `339,75 MiB`. Digests, máscaras, contagens, `uint16` e probes AVX2/YMM
+permaneceram idênticos. O gate de `25%` está atingido; frio/JIT e importação
+ficaram fora da medição quente. Evidência:
+[pipeline_benchmark_current_20260915_features.json](pipeline_benchmark_current_20260915_features.json).
+
 ## Próximas ações priorizadas
 
 1. **P0 — Flow:** medir separadamente leitura, detecção DAO, preparação do
@@ -296,4 +307,29 @@ quando recebe `--baseline-json`. Evidência:
 - O repositório do [ASTAP](https://github.com/CanardConfit/ASTAP) foi usado como
   referência de produto similar: ele separa detecção/registro interno do
   empilhamento e mantém filtragem de qualidade como etapa explícita, em vez de
-  misturar decisões de seleção na matemática do reducer Stable.
+misturar decisões de seleção na matemática do reducer Stable.
+
+### Revalidação preliminar após o modo compacto FIT/TIFF (2026-09-16)
+
+Com o novo padrão `batch_compact`, sete execuções quentes em quatro workers
+mediram `Stable` em `1,9844 s` contra `2,4863 s` do baseline (`20,19%`,
+`1,2529x`). O resultado permaneceu bit a bit estável, com `uint16`, máscaras,
+contagens e AVX2/YMM preservados; pico de RSS aproximadamente `324,9 MiB`.
+O gate de `25%` fica **não atingido** nesta variante, apesar da redução de
+arquivos intermediários. O benchmark de concorrência separado confirmou que
+Flow e Align são CPU-bound (razão CPU/parede acima de 1), enquanto o Stack
+compacto ficou abaixo de `0,1 s` e com espera/I/O dominante; quatro workers
+foram o melhor ponto observado e oito não trouxeram ganho adicional relevante.
+
+O resultado final após alinhar o acumulador aos mesmos valores `uint16` do
+caminho individual foi revalidado com sete execuções quentes em quatro
+workers: mediana `Stable` de `1,8136 s` contra `2,4863 s` (`27,05%`, speedup
+`1,3709x`), pico de RSS de `326,8 MiB`, digest/máscaras/contagens idênticos e
+gate de `25%` **atingido**. O relatório foi gravado em
+`%TEMP%\\astrobatch_pipeline_current_quantized.json`.
+
+Na matriz de concorrência curta após a mesma correção, as medianas totais
+foram `2,203 s` (1 worker), `2,037 s` (2), `1,595 s` (4) e `1,639 s` (8).
+Quatro workers continuaram sendo o melhor ponto; oito elevaram o pico de RSS
+para cerca de `324,7 MiB` sem ganho de parede. Flow e Align mantiveram razão
+CPU/parede acima de 1, enquanto o Stack ficou em cerca de `0,08 s`.

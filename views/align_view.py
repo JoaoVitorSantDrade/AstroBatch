@@ -57,7 +57,7 @@ class AlignView(BaseAstroView):
 
         ttk.Label(
             debayer,
-            text="Auto lê o padrão do Header FITS.",
+            text="Auto lê o padrão do Header FITS (ou sidecar TIFF).",
             style="Muted.TLabel",
         ).grid(row=0, column=2, sticky="w")
 
@@ -134,25 +134,25 @@ class AlignView(BaseAstroView):
         ttk.Combobox(
             params,
             textvariable=self.model.align_rgb_registration_mode_var,
-            values=["translation", "similarity", "hybrid"],
+            values=["translation", "similarity", "hybrid", "session-auto"],
             state="readonly",
             width=16,
         ).grid(row=2, column=3, sticky="w", padx=8, pady=(7, 0))
         ttk.Label(
             params,
-            text="similarity corrige escala/rotação; hybrid usa translação em R e similarity em B.",
+            text="session-auto valida um modelo global; se falhar, usa hybrid por frame.",
             style="Muted.TLabel",
         ).grid(row=3, column=2, columnspan=2, sticky="w", padx=(18, 0))
 
         ttk.Checkbutton(
             params,
-            text="Preservar Header FITS original",
+            text="Preservar metadados FITS/TIFF originais",
             variable=self.model.align_keep_header_var,
         ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(7, 0))
 
         ttk.Checkbutton(
             params,
-            text="Comprimir saída FITS (RICE_1)",
+            text="Comprimir saída (FITS RICE_1 / TIFF Deflate)",
             variable=self.model.align_compress_output_var,
         ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(7, 0))
 
@@ -162,23 +162,64 @@ class AlignView(BaseAstroView):
             style="Muted.TLabel",
         ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(0, 0))
 
+        ttk.Label(params, text="Intermediários:").grid(row=4, column=2, sticky="w", padx=(18, 0))
+        ttk.Combobox(
+            params,
+            textvariable=self.model.align_storage_var,
+            values=["batch_compact", "individual"],
+            state="readonly",
+            width=18,
+        ).grid(row=4, column=3, sticky="w", padx=8)
+        ttk.Label(
+            params,
+            text="Compacto integra cada batch em RAM e publica um único master.",
+            style="Muted.TLabel",
+        ).grid(row=5, column=2, columnspan=2, sticky="w", padx=(18, 0))
+
+        ttk.Checkbutton(
+            params,
+            text="Manter também frames alinhados (diagnóstico)",
+            variable=self.model.align_keep_aligned_frames_var,
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(7, 0))
+
+        ttk.Label(params, text="Método do pré-stack:").grid(row=6, column=2, sticky="w", padx=(18, 0), pady=(7, 0))
+        ttk.Combobox(
+            params,
+            textvariable=self.model.align_batch_method_var,
+            values=["Mean", "QualityWeightedMean", "Sum", "Maximum", "Minimum", "Median"],
+            state="readonly",
+            width=18,
+        ).grid(row=6, column=3, sticky="w", padx=8, pady=(7, 0))
+        ttk.Label(params, text="Median/rejeição serão hierárquicos no Stack.", style="Muted.TLabel").grid(
+            row=7, column=2, columnspan=2, sticky="w", padx=(18, 0)
+        )
+
+        ttk.Label(params, text="Rejeição no batch:").grid(row=8, column=2, sticky="w", padx=(18, 0), pady=(7, 0))
+        ttk.Combobox(
+            params,
+            textvariable=self.model.align_batch_rejection_var,
+            values=["None", "SigmaClip", "Winsorized", "MAD"],
+            state="readonly",
+            width=18,
+        ).grid(row=8, column=3, sticky="w", padx=8, pady=(7, 0))
+
         ttk.Checkbutton(
             params,
             text="Sobrescrever arquivos existentes no destino",
             variable=self.model.align_overwrite_var,
-        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(7, 0))
+        ).grid(row=9, column=0, columnspan=2, sticky="w", pady=(7, 0))
 
         ttk.Checkbutton(
             params,
             text="Apagar batches intermediários após alinhar (Limpeza de Disco)",
             variable=self.model.align_delete_intermediates_var,
-        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(7, 0))
+        ).grid(row=10, column=0, columnspan=2, sticky="w", pady=(7, 0))
 
         ttk.Checkbutton(
             params,
             text="Dry-Run (Simular processamento sem gravar no disco)",
             variable=self.model.align_dry_run_var,
-        ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(7, 0))
+        ).grid(row=11, column=0, columnspan=2, sticky="w", pady=(7, 0))
 
         # 4. Ações
         actions = ttk.Frame(self)

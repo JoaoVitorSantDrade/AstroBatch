@@ -37,6 +37,14 @@ class CPURuntimeTests(unittest.TestCase):
         self.assertIsInstance(features, dict)
         self.assertTrue(all(isinstance(key, str) and isinstance(value, bool) for key, value in features.items()))
 
+    def test_runtime_without_avx2_uses_safe_baseline_metadata(self):
+        from cpu_runtime import runtime_info
+
+        with patch("cpu_runtime.numpy_cpu_features", return_value={}):
+            info = runtime_info()
+        self.assertFalse(info.avx2)
+        self.assertEqual(info.simd_level, "baseline")
+
     def test_budget_diagnostics_make_oversubscription_policy_visible(self):
         budget = ExecutionBudget.for_pipeline(1)
         self.assertEqual(

@@ -531,6 +531,14 @@ def main(argv: list[str] | None = None) -> int:
             "numba_assembly": assembly,
             "warm_seconds": warm_seconds,
             "pipeline_import_seconds": import_seconds,
+            # Cold startup/JIT is recorded separately from the hot throughput
+            # gate.  The gate only consumes the medians below, after the
+            # representative kernels and complete pipeline have been loaded.
+            "cold_start": {
+                "numba_kernel_warmup_seconds": warm_seconds,
+                "pipeline_import_seconds": import_seconds,
+                "excluded_from_gate": True,
+            },
             "profiles": {profile: _median_runs(runs) for profile, runs in all_runs.items()},
             "comparison": {
                 "baseline": "Stable",
@@ -607,6 +615,9 @@ def main(argv: list[str] | None = None) -> int:
             "bitwise_output_match": summary["bitwise_output_match"],
             "status": "passed" if summary["bitwise_output_match"] and gate_speedup is not None and gate_speedup >= 4 / 3 else "not_reached",
         }
+        # With a historical baseline the throughput gate is Stable-vs-Stable;
+        # without one the diagnostic comparison remains Stable-vs-Fast.
+        summary["comparison"]["candidate"] = "Stable" if baseline_total is not None else "Fast"
         summary["affinity"] = {
             "requested_logical_cpus": applied_affinity,
             "pinned": bool(applied_affinity and original_affinity and set(applied_affinity) != set(original_affinity)),

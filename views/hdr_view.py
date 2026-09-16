@@ -10,13 +10,13 @@ class HDRView(ttk.Frame):
         box = ttk.LabelFrame(self, text="Fusão linear / HDR", padding=12)
         box.grid(row=0, column=0, sticky="ew")
         box.columnconfigure(1, weight=1)
-        ttk.Label(box, text="Use FITS calibrados e alinhados. Exposições iguais reduzem ruído; "
+        ttk.Label(box, text="Use FIT/TIFF calibrados e alinhados. Exposições iguais reduzem ruído; "
                   "detalhes saturados em todos os frames não podem ser recuperados.",
                   wraplength=780, style="Muted.TLabel").grid(row=0, column=0, columnspan=3, sticky="w", pady=(0,12))
         fields = (
             ("Pasta de entrada", model.input_folder, model.browse_input),
             ("Arquivo de saída", model.output_file, model.browse_output),
-            ("Saturação no FITS de entrada (opcional)", model.saturation, None),
+            ("Saturação no FIT/TIFF de entrada (opcional)", model.saturation, None),
             ("Ruído por frame (unidades calibradas)", model.noise, None),
             ("Linhas por faixa", model.row_band, None),
             ("Exposição em segundos (opcional)", model.exposure, None),

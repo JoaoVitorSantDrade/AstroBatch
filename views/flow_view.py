@@ -410,7 +410,7 @@ class FlowView(BaseAstroView):
 
     def _load_reference_thumbnail(self, filepath):
         """
-        Carrega uma imagem FITS e cria um thumbnail para o Grid.
+            Carrega uma imagem FIT/TIFF e cria um thumbnail para o Grid.
         O processamento pesado ocorre fora da thread da GUI.
         """
         from astroflow_logic import extract_luminance, load_fits_data
